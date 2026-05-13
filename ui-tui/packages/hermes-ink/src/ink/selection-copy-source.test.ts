@@ -403,4 +403,38 @@ describe('getSelectedText copy-source override', () => {
 
     expect(getSelectedText(sel, screen)).toBe('# hi heading')
   })
+
+  // ── Drag-to-scroll fallback ──
+  // captureScrolledRows caches scrolled rows as RENDERED text. If we
+  // also emit a region's source for the on-screen part, the result
+  // contains both the rendered scrolled-off rows AND the source string,
+  // duplicating the region's content. When scrolledOff buffers are
+  // non-empty, source substitution is suppressed entirely so the output
+  // matches what the user visually selected.
+  it('falls back to rendered cells when there are scrolled-off rows', () => {
+    const { screen } = screenWithCopySource('bold', '**bold**')
+
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 3, 0)
+
+    // Simulate a previous drag-scroll having captured some rows.
+    sel.scrolledOffAbove.push('previous block')
+    sel.scrolledOffAboveSW.push(false)
+
+    // No source substitution: gets "previous block" + the RENDERED row
+    // text, not "previous block" + "**bold**".
+    expect(getSelectedText(sel, screen)).toBe('previous block\nbold')
+  })
+
+  it('still substitutes source on a static (non-scrolled) selection', () => {
+    // Sanity: scrolledOff fallback is a no-op when the buffers are empty.
+    const { screen } = screenWithCopySource('bold', '**bold**')
+
+    const sel = createSelectionState()
+    startSelection(sel, 0, 0)
+    updateSelection(sel, 3, 0)
+
+    expect(getSelectedText(sel, screen)).toBe('**bold**')
+  })
 })

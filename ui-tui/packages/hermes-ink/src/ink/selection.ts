@@ -992,6 +992,22 @@ export function getSelectedText(s: SelectionState, screen: Screen): string {
     joinRows(lines, s.scrolledOffAbove[i]!, s.scrolledOffAboveSW[i])
   }
 
+  // Drag-to-scroll caches scrolled-off rows as RENDERED text (cell-by-cell
+  // from extractRowText). When a copy-source region's source string spans
+  // BOTH on-screen rows and rows that scrolled out of view, the on-screen
+  // emit path would write the full source string while the scrolled-off
+  // accumulator already holds the rendered version of the off-screen part
+  // — duplicating the region's content. Cells that scrolled out are gone
+  // from the screen buffer, so we can't tell from copySources whether a
+  // region extends past the viewport.
+  //
+  // Conservative fallback: when ANY scrolled-off rows are present, skip
+  // source substitution entirely and use the original cell-extraction
+  // path for the on-screen rows too. Drag-scroll selections lose the
+  // markdown round-trip in exchange for honest, non-duplicating output.
+  // Static (non-dragged) selections still get the full source treatment.
+  const hasScrolledOff = s.scrolledOffAbove.length > 0 || s.scrolledOffBelow.length > 0
+
   // Pre-scan: find every copy-source region the selection touches and
   // decide whether the selection FULLY covers it. A region is "fully
   // covered" when every cell on the screen carrying that ID is inside
@@ -1004,7 +1020,9 @@ export function getSelectedText(s: SelectionState, screen: Screen): string {
   // `coveredAll`: the un-filtered set, including shadowed ones — used
   //         by the row-segment loop to know "this segment's cells are
   //         already accounted for by an outer emission, skip".
-  const { emit, coveredAll } = computeFullyCoveredCopySources(screen, start, end)
+  const { emit, coveredAll } = hasScrolledOff
+    ? { coveredAll: new Set<number>(), emit: new Set<number>() }
+    : computeFullyCoveredCopySources(screen, start, end)
 
   // Track which copy-source IDs we've already emitted (one source string
   // covers many rows; we flush it once at the first row of the region in
