@@ -238,6 +238,16 @@ const HEADING_SIZES: Record<'h1' | 'h2' | 'h3' | 'h4', string> = {
 const MarkdownTextImpl = () => {
   const isStreaming = useAuiState(s => s.message.status?.type === 'running')
 
+  // Stable per-state plugin object. The previous inline `{ math: mathPlugin,
+  // ...(isStreaming ? {} : { code }) }` created a new object identity on every
+  // render, which churns Streamdown's outer memo + propagates new prop
+  // identities into every Block. The plugin set really only varies on
+  // `isStreaming`, so memoize on that.
+  const plugins = useMemo(
+    () => (isStreaming ? { math: mathPlugin } : { math: mathPlugin, code }),
+    [isStreaming]
+  )
+
   const components = useMemo(
     () =>
       ({
@@ -331,7 +341,7 @@ const MarkdownTextImpl = () => {
       // on the SyntaxHighlighter component, so we don't pay code-block
       // tokenization on every token even with this set.
       parseIncompleteMarkdown
-      plugins={{ math: mathPlugin, ...(isStreaming ? {} : { code }) }}
+      plugins={plugins}
       preprocess={preprocessMarkdown}
     />
   )
