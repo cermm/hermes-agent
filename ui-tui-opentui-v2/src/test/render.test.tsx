@@ -148,4 +148,26 @@ describe('App render (Phase 1, themed)', () => {
     expect(frame).toContain('Second chat')
     expect(frame).not.toContain('Type your message') // composer hidden while switcher open
   })
+
+  test('the composer shows a live slash-completions dropdown', async () => {
+    const store = createSessionStore()
+    store.apply({ type: 'gateway.ready' })
+    store.setCompletions([
+      { display: '/compact', meta: 'compress context', text: '/compact' },
+      { display: '/clear', meta: '', text: '/clear' }
+    ])
+
+    const frame = await captureFrame(
+      () => (
+        <ThemeProvider theme={() => store.state.theme}>
+          <App store={store} />
+        </ThemeProvider>
+      ),
+      { until: '/compact', width: 72, height: 18 }
+    )
+
+    expect(frame).toContain('/compact') // candidate
+    expect(frame).toContain('compress context') // its meta
+    expect(frame).toContain('Tab complete') // dropdown hint
+  })
 })

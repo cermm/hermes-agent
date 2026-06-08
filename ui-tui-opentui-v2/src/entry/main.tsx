@@ -28,7 +28,7 @@ import { getLog } from '../boundary/log.ts'
 import { acquireRenderer } from '../boundary/renderer.ts'
 import { makeAppLayer } from '../boundary/runtime.ts'
 import { mapResumeHistory, mapSessionList } from '../logic/resume.ts'
-import { dispatchSlash, type SlashContext } from '../logic/slash.ts'
+import { dispatchSlash, mapCompletions, type SlashContext } from '../logic/slash.ts'
 import { createSessionStore, type SessionStore } from '../logic/store.ts'
 import { App } from '../view/App.tsx'
 import { ThemeProvider } from '../view/theme.tsx'
@@ -194,6 +194,19 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
         else submitPrompt(text)
       }
 
+      // Live slash completions: query `complete.slash` while typing a `/command`
+      // name (no space yet); clear otherwise. Cheap local completer — fired per
+      // keystroke (a debounce is a polish item).
+      const onType = (text: string) => {
+        if (!text.startsWith('/') || text.includes(' ') || text.includes('\n')) {
+          store.clearCompletions()
+          return
+        }
+        Effect.runPromise(gateway.request('complete.slash', { text }))
+          .then(result => store.setCompletions(mapCompletions(result)))
+          .catch(() => store.clearCompletions())
+      }
+
       // Blocking-prompt replies (clarify/approval/sudo/secret `*.respond`). Same
       // detached-runFork pattern; failures logged, never thrown into the view.
       const respond = (method: string, params: Record<string, unknown>) => {
@@ -220,6 +233,7 @@ export const run = Effect.fn('Tui.run')(function* (input: TuiInput) {
               <App
                 store={store}
                 onSubmit={submit}
+                onType={onType}
                 onRespond={respond}
                 onResume={onResume}
                 sessionId={() => gateway.sessionId()}

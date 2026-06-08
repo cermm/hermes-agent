@@ -27,6 +27,7 @@ import { Transcript } from './transcript.tsx'
 export interface AppProps {
   readonly store: SessionStore
   readonly onSubmit?: (text: string) => void
+  readonly onType?: (text: string) => void
   readonly onRespond?: (method: string, params: Record<string, unknown>) => void
   readonly onResume?: (sessionId: string) => void
   readonly sessionId?: () => string | undefined
@@ -60,7 +61,16 @@ export function App(props: AppProps) {
         fallback={
           <>
             <Transcript store={props.store} />
-            <Switch fallback={<Composer onSubmit={props.onSubmit ?? NOOP} />}>
+            <Switch
+              fallback={
+                <Composer
+                  onSubmit={props.onSubmit ?? NOOP}
+                  onType={props.onType}
+                  completions={() => props.store.state.completions ?? []}
+                  onDismiss={() => props.store.clearCompletions()}
+                />
+              }
+            >
               <Match when={blocked()}>
                 <PromptOverlay
                   store={props.store}

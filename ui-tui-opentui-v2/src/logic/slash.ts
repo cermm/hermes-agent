@@ -11,7 +11,7 @@
  *      (exec/plugin → system · alias → re-dispatch · skill/send → submit a turn ·
  *       prefill → notice). Long output routes to the pager (Phase 5a).
  */
-import type { PickerItem, PickerState, SessionItem } from './store.ts'
+import type { CompletionItem, PickerItem, PickerState, SessionItem } from './store.ts'
 
 export interface ParsedSlash {
   name: string
@@ -58,6 +58,20 @@ function readStr(value: unknown, key: string): string | undefined {
 }
 
 const titleCase = (name: string) => name.charAt(0).toUpperCase() + name.slice(1)
+
+/** Map a `complete.slash` result ({items:[{text,display,meta}]}) into completion candidates. */
+export function mapCompletions(result: unknown): CompletionItem[] {
+  if (!result || typeof result !== 'object') return []
+  const items = (result as { items?: unknown }).items
+  if (!Array.isArray(items)) return []
+  const out: CompletionItem[] = []
+  for (const it of items) {
+    const text = readStr(it, 'text')
+    if (!text) continue
+    out.push({ display: readStr(it, 'display') ?? text, meta: readStr(it, 'meta') ?? '', text })
+  }
+  return out
+}
 
 /** Long output → the pager; short → a system line (Ink: >180 chars or >2 lines). */
 function present(ctx: SlashContext, title: string, text: string): void {

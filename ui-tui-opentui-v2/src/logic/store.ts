@@ -86,6 +86,13 @@ export interface PickerState {
   onPick: (value: string) => void
 }
 
+/** A slash-completion candidate (from `complete.slash`). */
+export interface CompletionItem {
+  text: string
+  display: string
+  meta: string
+}
+
 export interface StoreState {
   ready: boolean
   messages: Message[]
@@ -98,6 +105,8 @@ export interface StoreState {
   switcher: SessionItem[] | undefined
   /** The open generic picker (model/skills/…); undefined when none. */
   picker: PickerState | undefined
+  /** Live slash-completion candidates shown above the composer; undefined/empty when none. */
+  completions: CompletionItem[] | undefined
 }
 
 const LRU_LIMIT = 1000
@@ -116,7 +125,8 @@ export function createSessionStore() {
     prompt: undefined,
     pager: undefined,
     switcher: undefined,
-    picker: undefined
+    picker: undefined,
+    completions: undefined
   })
 
   // Monotonic part id (stable `key` per part so a new tool part below a streaming
@@ -238,6 +248,14 @@ export function createSessionStore() {
   /** Close the generic picker. */
   function closePicker() {
     setState('picker', undefined)
+  }
+
+  /** Set / clear the live slash-completion candidates (composer dropdown). */
+  function setCompletions(items: CompletionItem[]) {
+    setState('completions', items.length ? items : undefined)
+  }
+  function clearCompletions() {
+    setState('completions', undefined)
   }
 
   /** Reduce a decoded gateway event into the store. The sole boundary->Solid sink. */
@@ -408,6 +426,8 @@ export function createSessionStore() {
     closeSwitcher,
     openPicker,
     closePicker,
+    setCompletions,
+    clearCompletions,
     hydrate,
     beginBuffer,
     commitSnapshot,

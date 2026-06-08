@@ -4,10 +4,23 @@
  */
 import { describe, expect, test } from 'bun:test'
 
-import { dispatchSlash, parseSlash, type SlashContext } from '../logic/slash.ts'
+import { dispatchSlash, mapCompletions, parseSlash, type SlashContext } from '../logic/slash.ts'
 import type { PickerItem, SessionItem } from '../logic/store.ts'
 
 const FAKE_SESSIONS: SessionItem[] = [{ id: 's1', messageCount: 5, preview: 'hello there', title: 'First chat' }]
+
+describe('mapCompletions', () => {
+  test('maps complete.slash items → candidates (display/meta default)', () => {
+    expect(
+      mapCompletions({ items: [{ display: '/compact', meta: 'compress', text: '/compact' }, { text: '/details' }] })
+    ).toEqual([
+      { display: '/compact', meta: 'compress', text: '/compact' },
+      { display: '/details', meta: '', text: '/details' }
+    ])
+    expect(mapCompletions({ items: [] })).toEqual([])
+    expect(mapCompletions(null)).toEqual([])
+  })
+})
 
 describe('parseSlash', () => {
   test('splits name + arg; rejects non-slash / empty', () => {
