@@ -91,8 +91,15 @@ export function HomeHint(props: { store: SessionStore }) {
         <span style={{ fg: theme().color.muted }}>Nous Research · Messenger of the Digital Gods</span>
       </text>
 
+      {/* framed session panel (Ink SessionPanel parity) — the bordered box is the
+          key "this is a designed home screen, not log output" signal. */}
+      <box
+        style={{ flexDirection: 'column', marginTop: 1, paddingLeft: 1, paddingRight: 1 }}
+        border
+        borderColor={theme().color.border}
+      >
       {/* session info block: model · Nous Research / dir / Session id */}
-      <box style={{ flexDirection: 'column', marginTop: 1 }}>
+      <box style={{ flexDirection: 'column' }}>
         <Show when={info().model}>
           <text selectable={false}>
             <span style={{ fg: theme().color.accent }}>{shortModel(info().model!)}</span>
@@ -162,6 +169,8 @@ export function HomeHint(props: { store: SessionStore }) {
           </box>
         )}
       </Show>
+      </box>
+      {/* end framed session panel */}
 
       <box style={{ marginTop: 1 }}>
         <text selectable={false}>
