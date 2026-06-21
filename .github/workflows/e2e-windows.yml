@@ -200,8 +200,6 @@ jobs:
             $proc = Start-Process -FilePath $installer -PassThru -NoNewWindow
             $proc.Id | Out-File installer.pid
 
-            ls $env:INSTALL_DIR\e2e\windows\
-
             $ahkProc = Start-Process -FilePath ".\test-bins\autohotkey\AutoHotkey64.exe" `
               -ArgumentList "$env:INSTALL_DIR\e2e\windows\install-hermes-desktop.ahk", "$PWD\ahk.log" -PassThru -NoNewWindow
 
