@@ -38,6 +38,7 @@ from typing import Any, Dict, Iterator, List, Optional
 import httpx
 
 from agent import google_oauth
+from agent.bounded_response import read_streaming_error_body
 from agent.gemini_schema import sanitize_gemini_tool_parameters
 from agent.google_code_assist import (
     CODE_ASSIST_ENDPOINT,
@@ -750,8 +751,8 @@ class GeminiCloudCodeClient:
                 with self._http.stream("POST", url, json=wrapped, headers=stream_headers) as response:
                     if response.status_code != 200:
                         # Materialize error body for better diagnostics
-                        response.read()
-                        raise _gemini_http_error(response)
+                        body_text = read_streaming_error_body(response)
+                        raise _gemini_http_error(response, body_text=body_text)
                     tool_call_counter: List[int] = [0]
                     for event in _iter_sse_events(response):
                         for chunk in _translate_stream_event(event, model, tool_call_counter):
@@ -765,7 +766,9 @@ class GeminiCloudCodeClient:
         return _generator()
 
 
-def _gemini_http_error(response: httpx.Response) -> CodeAssistError:
+def _gemini_http_error(
+    response: httpx.Response, *, body_text: Optional[str] = None
+) -> CodeAssistError:
     """Translate an httpx response into a CodeAssistError with rich metadata.
 
     Parses Google's error envelope (``{"error": {"code", "message", "status",
@@ -785,12 +788,13 @@ def _gemini_http_error(response: httpx.Response) -> CodeAssistError:
     status = response.status_code
 
     # Parse the body once, surviving any weird encodings.
-    body_text = ""
     body_json: Dict[str, Any] = {}
-    try:
-        body_text = response.text
-    except Exception:
-        body_text = ""
+    if body_text is None:
+        try:
+            body_text = response.text
+        except Exception:
+            body_text = ""
+    body_text = body_text or ""
     if body_text:
         try:
             parsed = json.loads(body_text)

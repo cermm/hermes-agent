@@ -14,6 +14,7 @@ from agent.antigravity_code_assist import (
     build_headers,
     resolve_project_context,
 )
+from agent.bounded_response import read_streaming_error_body
 from agent.gemini_cloudcode_adapter import (
     GeminiCloudCodeClient,
     _GeminiStreamChunk,
@@ -149,8 +150,8 @@ class AntigravityCloudCodeClient(GeminiCloudCodeClient):
             try:
                 with self._http.stream("POST", url, json=wrapped, headers=stream_headers) as response:
                     if response.status_code != 200:
-                        response.read()
-                        raise _gemini_http_error(response)
+                        body_text = read_streaming_error_body(response)
+                        raise _gemini_http_error(response, body_text=body_text)
                     tool_call_counter: List[int] = [0]
                     for event in _iter_sse_events(response):
                         for chunk in _translate_stream_event(event, model, tool_call_counter):
