@@ -17,6 +17,7 @@ empty string rather than raising.
 """
 
 from __future__ import annotations
+from agent.pet.terminal import detect_terminal_graphics
 
 import base64
 import io
@@ -44,50 +45,6 @@ RENDER_MODES = ("auto", "kitty", "iterm", "sixel", "unicode", "off")
 # ─────────────────────────────────────────────────────────────────────────
 # Terminal capability detection
 # ─────────────────────────────────────────────────────────────────────────
-
-def detect_terminal_graphics() -> str:
-    """Best-effort detection of the richest graphics protocol available.
-
-    Env-based (non-blocking — we never issue a DA1/terminal query that could
-    hang a pipe).  Returns one of ``kitty`` / ``iterm`` / ``sixel`` /
-    ``unicode``.  Conservative: unknown terminals get ``unicode``, which works
-    anywhere with truecolor.
-    """
-    term = os.environ.get("TERM", "").lower()
-    term_program = os.environ.get("TERM_PROGRAM", "").lower()
-
-    # The VS Code / Cursor integrated terminal sets TERM_PROGRAM=vscode
-    # authoritatively but does NOT scrub the terminal env vars it inherits when
-    # launched from another emulator (ITERM_SESSION_ID, KITTY_WINDOW_ID, …).
-    # Trusting those leaks emits an image protocol the embedded xterm.js can't
-    # display — you get a blank frame. Inline images there are opt-in
-    # (terminal.integrated.enableImages), so default to half-blocks, which
-    # always render in its truecolor grid. Users who enabled images can pin
-    # display.pet.render_mode explicitly.
-    if term_program == "vscode":
-        return "unicode"
-
-    # kitty graphics protocol
-    if os.environ.get("KITTY_WINDOW_ID") or "kitty" in term or "ghostty" in term:
-        return "kitty"
-    if term_program in {"ghostty"}:
-        return "kitty"
-
-    # WezTerm speaks both kitty and iterm; prefer kitty (richer placement).
-    if term_program == "wezterm" or os.environ.get("WEZTERM_PANE"):
-        return "kitty"
-
-    # iTerm2 inline images
-    if term_program == "iterm.app" or os.environ.get("ITERM_SESSION_ID"):
-        return "iterm"
-
-    # sixel-capable terminals (env heuristics only)
-    if term_program in {"mintty"} or "foot" in term or "mlterm" in term:
-        return "sixel"
-    if "sixel" in term:
-        return "sixel"
-
-    return "unicode"
 
 
 def resolve_mode(configured: str | None, *, stream=None) -> str:
