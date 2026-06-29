@@ -206,6 +206,12 @@ class LSPClient:
             raise
 
     async def _spawn(self) -> None:
+        from tools.environments.local import hermes_subprocess_env
+
+        # Language servers need only their deliberately configured credentials.
+        env = hermes_subprocess_env(inherit_credentials=False)
+        if self._env:
+            env.update(self._env)
         cmd = self._command
         if sys.platform == "win32" and cmd[0].lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c", *cmd]  # CreateProcess can't run .cmd/.bat shims directly
@@ -217,7 +223,7 @@ class LSPClient:
             self._proc = await asyncio.create_subprocess_exec(
                 cmd[0], *cmd[1:],
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **(self._env or {})}, cwd=self._cwd,
+                env=env, cwd=self._cwd,
                 start_new_session=True, creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as e:
