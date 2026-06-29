@@ -3503,6 +3503,30 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in conversation replay, falling back to []")
                     msg["tool_calls"] = []
+                else:
+                    # Drop tool calls with an empty function name. A session
+                    # persisted by an older version (before the write-side
+                    # guard) can carry a nameless tool_call; replaying it makes
+                    # strict providers 400 ("Tool '' does not exist") and, on
+                    # the Responses adapter, the nameless call is silently
+                    # dropped while its result is still emitted — orphaning the
+                    # call_id. Healing at load keeps poisoned sessions
+                    # resumable. Empty *arguments* are intentionally left alone
+                    # (the pre-call repair pass normalizes them to "{}").
+                    tcs = msg["tool_calls"]
+                    if isinstance(tcs, list):
+                        kept = [
+                            tc for tc in tcs
+                            if isinstance(tc, dict)
+                            and (tc.get("name") or (tc.get("function") or {}).get("name"))
+                        ]
+                        if len(kept) != len(tcs):
+                            logger.warning(
+                                "Dropped %d malformed (empty-name) tool call(s) "
+                                "while loading session %s",
+                                len(tcs) - len(kept), session_id,
+                            )
+                        msg["tool_calls"] = kept
             # Surface the platform-side message id (e.g. yuanbao msg_id,
             # telegram update_id) so platform-specific flows like recall
             # can match by external identifier instead of having to fall
