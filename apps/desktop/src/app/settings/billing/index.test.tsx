@@ -13,6 +13,7 @@ import {
   todayBillingState,
   todaySubscriptionState
 } from './fixtures.test-util'
+import { formatUsageUpdatedAgo } from './use-billing-state'
 
 import { BillingSettings } from './index'
 
@@ -235,5 +236,67 @@ describe('BillingSettings', () => {
     renderBilling()
 
     expect((await screen.findByText('$0 of $220 left · $0.79 over')).classList.contains('text-destructive')).toBe(true)
+  })
+
+  it('refreshes both billing queries from the usage refresh button', async () => {
+    renderBilling()
+
+    await screen.findByText('$120 of $220 left')
+    expect(apiMocks.fetchBillingState).toHaveBeenCalledTimes(1)
+    expect(apiMocks.fetchSubscriptionState).toHaveBeenCalledTimes(1)
+
+    fireEvent.click(screen.getByRole('button', { name: 'Refresh usage' }))
+
+    await waitFor(() => expect(apiMocks.fetchBillingState).toHaveBeenCalledTimes(2))
+    expect(apiMocks.fetchSubscriptionState).toHaveBeenCalledTimes(2)
+  })
+
+  it('disables the usage refresh button while either query is fetching', async () => {
+    let settleBilling: (value: unknown) => void = () => {}
+
+    let settleSubscription: (value: unknown) => void = () => {}
+
+    apiMocks.fetchBillingState.mockResolvedValueOnce(okBilling(todayBillingState)).mockReturnValueOnce(
+      new Promise(resolve => {
+        settleBilling = resolve
+      })
+    )
+    apiMocks.fetchSubscriptionState.mockResolvedValueOnce(okSubscription(todaySubscriptionState)).mockReturnValueOnce(
+      new Promise(resolve => {
+        settleSubscription = resolve
+      })
+    )
+
+    renderBilling()
+
+    const refresh = await screen.findByRole('button', { name: 'Refresh usage' })
+
+    fireEvent.click(refresh)
+
+    await waitFor(() => expect(refresh.hasAttribute('disabled')).toBe(true))
+
+    settleBilling(okBilling(todayBillingState))
+    settleSubscription(okSubscription(todaySubscriptionState))
+
+    await waitFor(() => expect(refresh.hasAttribute('disabled')).toBe(false))
+  })
+})
+
+describe('formatUsageUpdatedAgo', () => {
+  it('formats sub-second and current timestamps as just now', () => {
+    expect(formatUsageUpdatedAgo(1_000, 1_000)).toBe('just now')
+    expect(formatUsageUpdatedAgo(1_500, 1_000)).toBe('just now')
+  })
+
+  it('formats seconds below a minute', () => {
+    expect(formatUsageUpdatedAgo(1_000, 60_000)).toBe('59s ago')
+  })
+
+  it('rounds elapsed time to whole minutes from 61 seconds', () => {
+    expect(formatUsageUpdatedAgo(1_000, 62_000)).toBe('1m ago')
+  })
+
+  it('formats one hour and later as hours', () => {
+    expect(formatUsageUpdatedAgo(1_000, 3_601_000)).toBe('1h ago')
   })
 })

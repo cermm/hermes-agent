@@ -1,10 +1,10 @@
 import { useQueryClient } from '@tanstack/react-query'
-import { useMemo, useState } from 'react'
+import { useEffect, useMemo, useState } from 'react'
 
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from '@/components/ui/select'
-import { BarChart3, ExternalLink } from '@/lib/icons'
+import { BarChart3, ExternalLink, RefreshCw } from '@/lib/icons'
 import { cn } from '@/lib/utils'
 
 import { ListRow, Pill, SectionHeading, SettingsContent } from '../primitives'
@@ -20,6 +20,7 @@ import {
   type BillingUsageRowView,
   deriveBillingView,
   EMPTY_BILLING_VALUE,
+  formatUsageUpdatedAgo,
   useBillingState,
   useSubscriptionState
 } from './use-billing-state'
@@ -579,7 +580,7 @@ function UsageBar({ bar }: { bar: NonNullable<BillingUsageRowView['bar']> }) {
           'h-full rounded-full transition-[width] duration-300',
           bar.state === 'danger'
             ? 'bg-destructive'
-            : bar.tone === 'subscription'
+            : bar.state === 'ok' && (bar.tone === 'subscription' || bar.tone === 'topup')
               ? 'bg-(--ui-green)'
               : 'bg-muted-foreground/45'
         )}
@@ -594,8 +595,8 @@ function UsageBar({ bar }: { bar: NonNullable<BillingUsageRowView['bar']> }) {
 
 function UsageRow({ row }: { row: BillingUsageRowView }) {
   return (
-    <div className="py-3">
-      <div className="flex min-w-0 items-start justify-between gap-4">
+    <div className="@container">
+      <div className="grid min-w-0 gap-2 py-3 @2xl:grid-cols-[minmax(0,220px)_minmax(8rem,1fr)_auto] @2xl:items-center @2xl:gap-4">
         <div className="min-w-0">
           <div className="text-[length:var(--conversation-text-font-size)] font-medium text-foreground">
             {row.title}
@@ -604,20 +605,62 @@ function UsageRow({ row }: { row: BillingUsageRowView }) {
             {row.caption}
           </div>
         </div>
+        <div className="min-w-0">{row.bar && <UsageBar bar={row.bar} />}</div>
         <div
           className={cn(
-            'shrink-0 text-right text-[length:var(--conversation-text-font-size)] font-medium',
+            'min-w-0 text-[length:var(--conversation-text-font-size)] font-medium @2xl:text-right',
             row.bar?.state === 'danger' ? 'text-destructive' : 'text-foreground'
           )}
         >
           {row.value}
         </div>
       </div>
-      {row.bar && (
-        <div className="mt-2">
-          <UsageBar bar={row.bar} />
-        </div>
-      )}
+    </div>
+  )
+}
+
+function UsageRefreshRow({
+  fixtureName,
+  isFetching,
+  onRefresh,
+  updatedAt
+}: {
+  fixtureName?: BillingFixtureSelection
+  isFetching: boolean
+  onRefresh: () => void
+  updatedAt: number
+}) {
+  const [now, setNow] = useState(() => Date.now())
+
+  useEffect(() => {
+    const interval = window.setInterval(() => setNow(Date.now()), 30_000)
+
+    return () => window.clearInterval(interval)
+  }, [])
+
+  if (fixtureName && fixtureName !== 'live') {
+    return (
+      <div className="flex items-center justify-end pt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+        fixture: {fixtureName}
+      </div>
+    )
+  }
+
+  return (
+    <div className="flex min-w-0 items-center justify-end gap-1.5 pt-1 text-[length:var(--conversation-caption-font-size)] text-(--ui-text-tertiary)">
+      <span>Updated {formatUsageUpdatedAgo(updatedAt, now)}</span>
+      <span aria-hidden="true">·</span>
+      <Button
+        aria-label="Refresh usage"
+        className="size-7 p-0 text-(--ui-text-tertiary)"
+        disabled={isFetching}
+        onClick={onRefresh}
+        size="sm"
+        type="button"
+        variant="ghost"
+      >
+        <RefreshCw className={cn('size-3.5', isFetching && 'animate-spin')} />
+      </Button>
     </div>
   )
 }
@@ -682,6 +725,12 @@ function BillingSettingsContent({
   const subscriptionResult = fixture?.subscription ?? subscriptionState.data
   const view = deriveBillingView(billingResult, subscriptionResult)
   const billing = billingResult?.ok ? billingResult.data : undefined
+  const usageUpdatedAt = oldestUpdatedAt(billingState.dataUpdatedAt, subscriptionState.dataUpdatedAt)
+  const usageIsFetching = billingState.isFetching || subscriptionState.isFetching
+
+  const refreshUsage = () => {
+    void Promise.all([billingState.refetch(), subscriptionState.refetch()])
+  }
 
   return (
     <SettingsContent>
@@ -709,9 +758,17 @@ function BillingSettingsContent({
       {view.usageRows.length > 0 && (
         <>
           <SectionHeading icon={BarChart3} title="Usage" />
-          {view.usageRows.map(row => (
-            <UsageRow key={row.id} row={row} />
-          ))}
+          <div className="@container rounded-lg border border-border/70 bg-muted/20 px-4 py-2">
+            {view.usageRows.map(row => (
+              <UsageRow key={row.id} row={row} />
+            ))}
+            <UsageRefreshRow
+              fixtureName={fixtureName}
+              isFetching={usageIsFetching}
+              onRefresh={refreshUsage}
+              updatedAt={usageUpdatedAt}
+            />
+          </div>
         </>
       )}
 
@@ -768,6 +825,12 @@ function parseAmount(value?: null | number | string): null | number {
 
 function formatAmountForRequest(value: number): string {
   return Number.isInteger(value) ? String(value) : value.toFixed(2).replace(/0+$/, '').replace(/\.$/, '')
+}
+
+function oldestUpdatedAt(...timestamps: number[]): number {
+  const populated = timestamps.filter(timestamp => timestamp > 0)
+
+  return populated.length > 0 ? Math.min(...populated) : Date.now()
 }
 
 function initialAutoReloadAmount(...candidates: Array<null | string | undefined>): string {

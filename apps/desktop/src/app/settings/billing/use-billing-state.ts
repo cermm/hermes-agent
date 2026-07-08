@@ -61,8 +61,8 @@ export interface BillingAccountRowView {
 export interface BillingUsageRowView {
   bar?: {
     label: string
-    state: 'danger' | 'ok'
-    tone: 'cap' | 'subscription'
+    state: 'danger' | 'neutral' | 'ok'
+    tone: 'cap' | 'subscription' | 'topup'
     track?: 'danger'
     value: number
   }
@@ -195,6 +195,26 @@ export function formatBillingDate(value?: null | string): string {
   }
 
   return fmtDate.format(date)
+}
+
+export function formatUsageUpdatedAgo(updatedAt: number, now: number): string {
+  const elapsedSeconds = Math.max(0, Math.floor((now - updatedAt) / 1000))
+
+  if (elapsedSeconds < 1) {
+    return 'just now'
+  }
+
+  if (elapsedSeconds < 60) {
+    return `${elapsedSeconds}s ago`
+  }
+
+  const elapsedMinutes = Math.floor(elapsedSeconds / 60)
+
+  if (elapsedMinutes < 60) {
+    return `${elapsedMinutes}m ago`
+  }
+
+  return `${Math.floor(elapsedMinutes / 60)}h ago`
 }
 
 function emptySummary(): BillingSummaryItemView[] {
@@ -371,11 +391,23 @@ function deriveUsageRows(
     value: subscriptionValue
   })
 
+  const topupValue = topupCreditsValue(billing, usage)
+  const topupRemaining = topupCreditsAmount(billing, usage)
+
   rows.push({
+    bar:
+      topupRemaining != null
+        ? {
+            label: 'Top-up credits remaining',
+            state: topupRemaining > 0 ? 'ok' : 'neutral',
+            tone: 'topup',
+            value: topupRemaining > 0 ? 1 : 0
+          }
+        : undefined,
     caption: 'Does not expire',
     id: 'topup_credits',
     title: 'Top-up credits',
-    value: topupCreditsValue(billing, usage)
+    value: topupValue
   })
 
   const cap = billing.monthly_cap
@@ -431,6 +463,15 @@ function topupCreditsValue(billing: BillingStateResponse, usage?: UsageModelData
     usage?.topup_bar?.remaining_display ??
     nonEmpty(billing.balance_display) ??
     formatMoney(billing.balance_usd)
+  )
+}
+
+function topupCreditsAmount(billing: BillingStateResponse, usage?: UsageModelData): null | number {
+  return (
+    parseAmount(usage?.topup_bar?.remaining_display) ??
+    parseAmount(usage?.topup_remaining_display) ??
+    parseAmount(billing.balance_usd) ??
+    parseAmount(billing.balance_display)
   )
 }
 

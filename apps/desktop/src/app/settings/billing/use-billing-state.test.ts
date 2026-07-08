@@ -15,7 +15,10 @@ import {
 } from './fixtures.test-util'
 import { buildManageSubscriptionUrl, deriveBillingView } from './use-billing-state'
 
-function usageRowFor(fixtureName: keyof typeof billingDevFixtures, rowId: 'monthly_cap' | 'subscription_credits') {
+function usageRowFor(
+  fixtureName: keyof typeof billingDevFixtures,
+  rowId: 'monthly_cap' | 'subscription_credits' | 'topup_credits'
+) {
   const fixture = billingDevFixtures[fixtureName]
   const view = deriveBillingView(fixture.billing, fixture.subscription)
 
@@ -192,6 +195,43 @@ describe('deriveBillingView', () => {
       state: 'danger',
       track: 'danger',
       value: 1
+    })
+  })
+
+  it('renders top-up balance as a full ok bar when credits remain', () => {
+    const view = deriveBillingView(okBilling(postTrainBillingState), okSubscription(postTrainSubscriptionState))
+
+    expect(view.usageRows.find(row => row.id === 'topup_credits')).toMatchObject({
+      bar: {
+        state: 'ok',
+        tone: 'topup',
+        value: 1
+      },
+      value: '$75'
+    })
+  })
+
+  it('renders zero top-up balance as an empty neutral bar', () => {
+    const view = deriveBillingView(
+      okBilling({
+        ...todayBillingState,
+        balance_display: '$0',
+        balance_usd: '0',
+        usage: {
+          ...todayBillingState.usage,
+          topup_remaining_display: '$0'
+        }
+      }),
+      undefined
+    )
+
+    expect(view.usageRows.find(row => row.id === 'topup_credits')).toMatchObject({
+      bar: {
+        state: 'neutral',
+        tone: 'topup',
+        value: 0
+      },
+      value: '$0'
     })
   })
 })
