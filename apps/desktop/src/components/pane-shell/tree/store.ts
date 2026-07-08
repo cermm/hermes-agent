@@ -195,10 +195,22 @@ function setDismissed(paneId: string, dismissed: boolean) {
 }
 
 const paneClosers: Record<string, () => void> = {}
+const paneOpeners: Record<string, () => void> = {}
 
 /** Route a pane's Close through the app store that owns its visibility. */
 export function registerPaneCloser(paneId: string, close: () => void) {
   paneClosers[paneId] = close
+}
+
+/**
+ * Route a pane's "show it" intent through the app store that owns its
+ * visibility — the mirror of `registerPaneCloser`, so a preset can reveal a
+ * toggle-gated pane (e.g. the terminal, whose visibility ⌃`/`$terminalTakeover`
+ * owns) while the toggle stays truthful. Only panes that opt in via
+ * `data.revealOnPreset` are opened on preset apply.
+ */
+export function registerPaneOpener(paneId: string, open: () => void) {
+  paneOpeners[paneId] = open
 }
 
 /** Remove a pane from the tree WITHOUT a dismissal record — for surfaces
@@ -565,6 +577,23 @@ export function applyTree(tree: LayoutNode, presetId: string) {
   clearAllPaneSizeOverrides()
   commit(previous ? adoptMissingPanes(tree, previous) : tree)
   markActivePreset(presetId)
+
+  // Picking a named layout is an intent to SEE its panes. Toggle-gated panes
+  // (the terminal, whose visibility a store owns) would otherwise stay
+  // collapsed after the tree changes — so reveal the ones that opt in through
+  // their owning store, keeping the ⌃`/toggle state truthful. Iterate the
+  // preset's DECLARED panes (not the adopted result): logs is auto-adopted
+  // hidden into every tree, so only a preset that explicitly places it (Quad)
+  // should turn it on.
+  const panes = registry.getArea('panes')
+
+  for (const paneId of allPaneIds(tree)) {
+    const data = panes.find(c => c.id === paneId)?.data as { revealOnPreset?: boolean } | undefined
+
+    if (data?.revealOnPreset) {
+      paneOpeners[paneId]?.()
+    }
+  }
 }
 
 /**

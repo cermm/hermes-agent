@@ -118,8 +118,10 @@ export function TreeGroup({ node }: { node: GroupNode }) {
   // actions carry into the new zone (header background = the active pane).
   const menuPaneRef = useRef<string | undefined>(undefined)
   const panes = useContributions('panes')
+  // Coarse drag flag only (set once at drag start/end). The per-frame drop
+  // HINT lives in ZoneDropOverlay so a moving pointer re-renders the tiny
+  // overlay, not every zone's header/body (and not the menuDirections walk).
   const dragging = useStore($treeDragging)
-  const hint = useStore($dropHint)
   const editMode = useStore($layoutEditMode)
   const wcOverlap = useWindowControlsOverlap(ref, true)
 
@@ -199,13 +201,6 @@ export function TreeGroup({ node }: { node: GroupNode }) {
 
   // Same menu on the header strip and the edit veil — one prop bag.
   const zoneMenu = { closable, directions: menuDirections, headerHidden, minimized: node.minimized, nodeId: node.id }
-
-  // FancyZones semantics: the highlight SET (multi-zone with Shift) lights up
-  // strongly; the primary zone (ClosestCenter) carries the action badge.
-  const highlightedZone = dragging !== null && (hint?.groupIds?.includes(node.id) ?? false)
-  const primary = dragging !== null && hint?.groupId === node.id
-  const isDragSource = dragging !== null && node.panes.includes(dragging)
-  const showZoneOverlay = dragging !== null && !(isDragSource && node.panes.length === 1)
 
   // Double-click ANYWHERE in the zone toggles the header (the header itself
   // handles its own double-tap, so this covers the body — crucially the only
@@ -374,28 +369,63 @@ export function TreeGroup({ node }: { node: GroupNode }) {
         </ZoneMenu>
       )}
 
-      {/* FancyZones drop overlay: ZonesOverlay semantics — every zone shows
-          the inactive fill, the highlighted set gets the highlight fill at
-          highlightOpacity (50%), all fading in on the 200ms alpha ramp. The
-          PRIMARY zone also offers directional targets (VS Code editor-drop
-          style): hover/drop an arrow chip — or fling into an edge band — to
-          SPLIT that side instead of stacking. */}
-      {showZoneOverlay && (
-        <div
-          className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center rounded-[3px] border transition-colors duration-75"
-          style={{
-            animation: `hermes-zone-fade ${FADE_IN_DURATION_MILLIS}ms linear both`,
-            // Grounded on the chrome bg so the inactive fill actually dims
-            // content on dark themes (a bare 10% accent wash disappears there).
-            background: highlightedZone
-              ? 'color-mix(in srgb, var(--ui-accent) 50%, transparent)'
-              : 'color-mix(in srgb, var(--ui-accent) 10%, color-mix(in srgb, var(--ui-bg-chrome) 45%, transparent))',
-            borderColor: `color-mix(in srgb, var(--ui-accent) ${highlightedZone ? 100 : 35}%, transparent)`,
-            margin: highlightedZone ? 2 : 4
-          }}
-        >
-          {primary && <DropTargets multi={(hint?.groupIds?.length ?? 0) > 1} pos={hint?.pos ?? 'center'} source={isDragSource} stackLabel={isEmpty ? 'move here' : 'stack here'} />}
-        </div>
+      {/* FancyZones drop overlay — its own component so the per-frame drop
+          hint re-renders only this (tiny) node, not the whole zone. */}
+      <ZoneDropOverlay isEmpty={isEmpty} node={node} />
+    </div>
+  )
+}
+
+/**
+ * The FancyZones drop overlay for one zone. Split out of TreeGroup so the
+ * per-pointermove `$dropHint` churn re-renders only this lightweight node —
+ * the zone's header, body, and menu-direction walk stay put during a drag.
+ *
+ * ZonesOverlay semantics: every eligible zone shows the inactive fill, the
+ * highlighted set gets the highlight fill at highlightOpacity (50%), all fading
+ * in on the 200ms alpha ramp. The PRIMARY zone also offers directional targets
+ * (VS Code editor-drop style): hover/drop an arrow chip — or fling into an edge
+ * band — to SPLIT that side instead of stacking.
+ */
+function ZoneDropOverlay({ isEmpty, node }: { isEmpty: boolean; node: GroupNode }) {
+  const dragging = useStore($treeDragging)
+  const hint = useStore($dropHint)
+
+  if (dragging === null) {
+    return null
+  }
+
+  const isDragSource = node.panes.includes(dragging)
+
+  // The source zone, when it holds only the dragged pane, has nothing to drop.
+  if (isDragSource && node.panes.length === 1) {
+    return null
+  }
+
+  const highlightedZone = hint?.groupIds?.includes(node.id) ?? false
+  const primary = hint?.groupId === node.id
+
+  return (
+    <div
+      className="pointer-events-none absolute inset-0 z-40 flex items-center justify-center rounded-[3px] border transition-colors duration-75"
+      style={{
+        animation: `hermes-zone-fade ${FADE_IN_DURATION_MILLIS}ms linear both`,
+        // Grounded on the chrome bg so the inactive fill actually dims
+        // content on dark themes (a bare 10% accent wash disappears there).
+        background: highlightedZone
+          ? 'color-mix(in srgb, var(--ui-accent) 50%, transparent)'
+          : 'color-mix(in srgb, var(--ui-accent) 10%, color-mix(in srgb, var(--ui-bg-chrome) 45%, transparent))',
+        borderColor: `color-mix(in srgb, var(--ui-accent) ${highlightedZone ? 100 : 35}%, transparent)`,
+        margin: highlightedZone ? 2 : 4
+      }}
+    >
+      {primary && (
+        <DropTargets
+          multi={(hint?.groupIds?.length ?? 0) > 1}
+          pos={hint?.pos ?? 'center'}
+          source={isDragSource}
+          stackLabel={isEmpty ? 'move here' : 'stack here'}
+        />
       )}
     </div>
   )

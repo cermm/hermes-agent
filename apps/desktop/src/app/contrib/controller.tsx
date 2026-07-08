@@ -14,6 +14,7 @@ import {
   declareDefaultTree,
   mirrorLayoutTree,
   registerPaneCloser,
+  registerPaneOpener,
   resetLayoutTree,
   revealTreePane,
   setTreePaneHidden,
@@ -44,10 +45,11 @@ import { $filePreviewTarget, $previewTarget, closeRightRail } from '@/store/prev
 import { $reviewOpen, closeReview, REVIEW_PANE_ID } from '@/store/review'
 import { $currentCwd } from '@/store/session'
 
-import { watchSessionTiles } from './chat/session-tile'
-import { FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './contrib-panes'
-import { ContribWiring, WiredPane } from './contrib-wiring'
-import { $terminalTakeover, setTerminalTakeover } from './right-sidebar/store'
+import { watchSessionTiles } from '../chat/session-tile'
+import { $terminalTakeover, setTerminalTakeover } from '../right-sidebar/store'
+
+import { FilesPane, LogsPane, PreviewRailPane, ReviewPaneContent } from './panes'
+import { ContribWiring, WiredPane } from './wiring'
 
 /**
  * Stripped-down app root (bb/contrib-areas) on the layout TREE model, mounting
@@ -95,7 +97,12 @@ registry.registerMany([
     id: 'terminal',
     area: 'panes',
     title: 'terminal',
-    data: { placement: 'bottom', height: '38vh', minHeight: '7.5rem', maxHeight: '80vh' },
+    // revealOnPreset: choosing a layout that places the terminal (e.g.
+    // "Terminal deck") turns takeover on so the zone actually shows, instead of
+    // staying collapsed behind the ⌃` toggle. height sizes the fixed track (a
+    // single-pane zone declaring a height is a fixed track — the preset weight
+    // is moot): a short deck, not a third of the window.
+    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
     render: () => <WiredPane part="terminal" />
   },
   {
@@ -149,7 +156,9 @@ registry.registerMany([
     id: 'logs',
     area: 'panes',
     title: 'logs',
-    data: { placement: 'bottom', height: '38vh', minHeight: '7.5rem', maxHeight: '80vh' },
+    // revealOnPreset: the Quad layout places logs, so applying it turns the
+    // logs pane on (like a ⌘K "Toggle logs") instead of leaving it collapsed.
+    data: { placement: 'bottom', height: '20vh', minHeight: '7.5rem', maxHeight: '80vh', revealOnPreset: true },
     render: () => <LogsPane />
   }
 ])
@@ -278,7 +287,7 @@ const QUAD_TREE = split(
   'column',
   [
     split('row', [group(['sessions', 'files']), group(['workspace'])], [1, 3]),
-    split('row', [group(['terminal']), group(['preview', 'review'])], [1.4, 1])
+    split('row', [group(['terminal']), group(['preview', 'review', 'logs'])], [1.4, 1])
   ],
   [3, 1]
 )
@@ -314,15 +323,22 @@ watchSessionTiles()
 function bindPaneVisibility(
   paneId: string,
   $open: { get(): boolean; listen(fn: (open: boolean) => void): void },
-  close?: () => void
+  close?: () => void,
+  open?: () => void
 ) {
   setTreePaneHidden(paneId, !$open.get())
-  $open.listen(open => setTreePaneHidden(paneId, !open))
+  $open.listen(isOpen => setTreePaneHidden(paneId, !isOpen))
 
   // The tab menu's Close routes through the owning store (never dismissal),
   // so the pane's toggle buttons stay truthful.
   if (close) {
     registerPaneCloser(paneId, close)
+  }
+
+  // The opener is the mirror: preset application (revealOnPreset) shows the
+  // pane through the same store, so the toggle stays truthful.
+  if (open) {
+    registerPaneOpener(paneId, open)
   }
 }
 
@@ -383,7 +399,7 @@ bindPaneVisibility(
 )
 // ⌃` / statusbar toggle — the terminal zone follows takeover instead of
 // being forced on (PTYs stay alive while hidden; see PersistentTerminal).
-bindPaneVisibility('terminal', $terminalTakeover, () => setTerminalTakeover(false))
+bindPaneVisibility('terminal', $terminalTakeover, () => setTerminalTakeover(false), () => setTerminalTakeover(true))
 
 // Preview EXISTS only while something is previewed (old-shell semantics:
 // closing the last preview tab closes the pane; a new target opens + fronts
@@ -398,7 +414,7 @@ bindPaneVisibility('preview', $previewVisible, closeRightRail)
 // Logs are optional chrome: off by default, toggled from ⌘K, persisted.
 const $logsOpen = persistentAtom('hermes.desktop.logsOpen', false, Codecs.bool)
 
-bindPaneVisibility('logs', $logsOpen, () => $logsOpen.set(false))
+bindPaneVisibility('logs', $logsOpen, () => $logsOpen.set(false), () => $logsOpen.set(true))
 registry.register({
   id: 'logs.toggle',
   area: PALETTE_AREA,

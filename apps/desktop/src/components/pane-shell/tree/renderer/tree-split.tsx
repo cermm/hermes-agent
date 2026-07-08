@@ -7,11 +7,11 @@
  */
 
 import { useStore } from '@nanostores/react'
-import { type PointerEvent as ReactPointerEvent, useCallback, useRef } from 'react'
+import { type PointerEvent as ReactPointerEvent, useCallback, useMemo, useRef, useSyncExternalStore } from 'react'
 
 import { useContributions } from '@/contrib/react/use-contributions'
 import { cn } from '@/lib/utils'
-import { $paneStates, setPaneHeightOverride, setPaneWidthOverride } from '@/store/panes'
+import { $paneStates, type PaneStateSnapshot, setPaneHeightOverride, setPaneWidthOverride } from '@/store/panes'
 
 import { $layoutEditMode } from '../../edit-mode'
 import type { LayoutNode, SplitNode } from '../model'
@@ -40,12 +40,40 @@ import {
 } from './track-model'
 import { TreeNode } from './tree-node'
 
+/**
+ * The size overrides for a fixed set of panes, referentially stable until one
+ * of THEM changes. Sash drags churn `$paneStates` every frame; subscribing the
+ * whole map would re-render every split — this narrows each split to its own
+ * subtree via a signature-gated snapshot.
+ */
+function useSubtreeOverrides(paneIds: readonly string[]): TrackContext['overrides'] {
+  const key = paneIds.join(',')
+  const cache = useRef<{ sig: string; value: Record<string, PaneStateSnapshot> }>({ sig: '\0', value: {} })
+
+  const snapshot = useCallback(() => {
+    const all = $paneStates.get()
+    const sig = paneIds.map(id => `${id}:${all[id]?.widthOverride ?? ''}:${all[id]?.heightOverride ?? ''}`).join('|')
+
+    if (cache.current.sig !== sig) {
+      cache.current = { sig, value: Object.fromEntries(paneIds.flatMap(id => (all[id] ? [[id, all[id]]] : []))) }
+    }
+
+    return cache.current.value
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [key])
+
+  return useSyncExternalStore(cb => $paneStates.listen(cb), snapshot, snapshot)
+}
+
 export function TreeSplit({ node, root }: { node: SplitNode; root?: boolean }) {
   const containerRef = useRef<HTMLDivElement>(null)
   const panes = useContributions('panes')
   const hiddenPanes = useStore($hiddenTreePanes)
   const narrow = useStore($narrowViewport)
-  const overrides = useStore($paneStates)
+  // Scoped to THIS subtree's panes: a sash drag writes size overrides on every
+  // pointermove, but only the splits whose subtree actually resized should
+  // re-render — not every split in the tree.
+  const overrides = useSubtreeOverrides(useMemo(() => allPaneIds(node), [node]))
   const editMode = useStore($layoutEditMode)
   const collapsedSides = useStore($collapsedTreeSides)
   const horizontal = node.orientation === 'row'
