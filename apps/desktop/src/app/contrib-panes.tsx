@@ -147,11 +147,15 @@ export function ReviewPaneContent() {
 // the real statusbar owns the core items (model pill, terminal toggle, …).
 // ---------------------------------------------------------------------------
 
-/** Collect StatusbarItem data contributions for one side of the footer. */
+/** Collect statusbar contributions for one side. A `render()` contribution
+ *  becomes a render-item (arbitrary stateful node); otherwise the declarative
+ *  `data` payload is the StatusbarItem. */
 export function useStatusbarContributions(side: 'left' | 'right'): StatusbarItem[] {
   const items = useContributions(`statusBar.${side}`)
 
-  return items.map(c => c.data as StatusbarItem).filter(Boolean)
+  return items
+    .map(c => (c.render ? ({ id: c.id, render: c.render } satisfies StatusbarItem) : (c.data as StatusbarItem)))
+    .filter(Boolean)
 }
 
 /** Collect TitlebarTool data contributions for one side of the titlebar. */

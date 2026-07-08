@@ -35,6 +35,7 @@ import { RemoteDisplayBanner } from '@/components/remote-display-banner'
 import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { DecodeText } from '@/components/ui/decode-text'
+import { emitGatewayEvent } from '@/contrib/events'
 import { useContributions } from '@/contrib/react/use-contributions'
 import { getSessionMessages, triggerCronJob } from '@/hermes'
 import {
@@ -756,8 +757,18 @@ export function ContribWiring({ children }: { children: ReactNode }) {
     startFreshSessionDraft
   })
 
+  // Plugins hear the stream FIRST (isolated fan-out in contrib/events), then
+  // the app dispatches as before — a plugin listener can't affect app flow.
+  const handleGatewayEventWithPlugins = useCallback(
+    (event: Parameters<typeof handleDesktopGatewayEvent>[0]) => {
+      emitGatewayEvent(event)
+      handleDesktopGatewayEvent(event)
+    },
+    [handleDesktopGatewayEvent]
+  )
+
   useGatewayBoot({
-    handleGatewayEvent: handleDesktopGatewayEvent,
+    handleGatewayEvent: handleGatewayEventWithPlugins,
     onConnectionReady: c => {
       connectionRef.current = c
     },

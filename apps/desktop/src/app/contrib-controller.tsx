@@ -19,6 +19,7 @@ import {
 } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
 import { SidebarProvider } from '@/components/ui/sidebar'
+import { discoverBundledPlugins } from '@/contrib/plugins'
 import { Slot } from '@/contrib/react/slot'
 import { registry } from '@/contrib/registry'
 import { LayoutDashboard } from '@/lib/icons'
@@ -150,9 +151,9 @@ registry.registerMany([
 // ---------------------------------------------------------------------------
 // Chrome contributions. The title bar and status bar are fixed chrome outside
 // the grid, composable through these areas. Everything real lives in the real
-// components (TitlebarControls / useStatusbarItems); the `example-plugin-*`
-// entries below are DELIBERATE samples showing the plugin surface — delete
-// them freely.
+// components (TitlebarControls / useStatusbarItems). Sample PLUGIN
+// contributions don't live here — they're their own files under `src/plugins/`,
+// auto-discovered by discoverBundledPlugins() below.
 // ---------------------------------------------------------------------------
 
 function ResetLayoutButton() {
@@ -168,14 +169,6 @@ registry.registerMany([
   // chat header, living in the titlebar's center slot over the workspace.
   { id: 'session-title', area: 'titleBar.center', order: 0, render: () => <WiredPane part="sessionTitle" /> },
   { id: 'reset-layout', area: 'titleBar.right', order: 0, render: () => <ResetLayoutButton /> },
-  // Sample plugin contribution (remove at will) — shows the statusbar surface.
-  {
-    id: 'example-plugin-status',
-    area: 'statusBar.right',
-    source: 'plugin:example',
-    order: 100,
-    data: { id: 'example-plugin-status', label: 'example-plugin: ok', variant: 'text' } satisfies StatusbarItem
-  },
   // Layout edit mode registers through the SAME declarative surfaces plugins
   // use: a rebindable keybind (collision-checked in the panel) + a ⌘K row
   // whose hotkey hint tracks the live binding.
@@ -267,6 +260,11 @@ registry.registerMany([
 ])
 
 declareDefaultTree(DEFAULT_TREE)
+
+// Bundled plugins load AFTER core, so a same-id contribution from a plugin
+// deliberately overrides the core default (last writer wins). Third-party
+// runtime plugins will flow through the same discovery seam.
+discoverBundledPlugins()
 
 // ---------------------------------------------------------------------------
 // Titlebar chrome toggles -> tree. The TitlebarControls buttons keep their
