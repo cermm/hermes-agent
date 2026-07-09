@@ -1,5 +1,7 @@
 import { atom } from 'nanostores'
 
+import { readJson, writeJson } from '@/lib/storage'
+
 import type { SplitDir } from './session-states'
 
 /**
@@ -17,34 +19,20 @@ export interface RouteTile {
 const TILES_KEY = 'hermes.desktop.routeTiles.v1'
 
 function loadTiles(): RouteTile[] {
-  try {
-    const raw = window.localStorage.getItem(TILES_KEY)
-    const parsed = raw ? (JSON.parse(raw) as unknown) : []
+  const parsed = readJson<unknown>(TILES_KEY)
 
-    return Array.isArray(parsed)
-      ? parsed
-          .filter((t): t is RouteTile => Boolean(t && typeof (t as RouteTile).path === 'string'))
-          .map(t => ({ dir: t.dir, path: t.path }))
-      : []
-  } catch {
-    return []
-  }
+  return Array.isArray(parsed)
+    ? parsed
+        .filter((t): t is RouteTile => Boolean(t && typeof (t as RouteTile).path === 'string'))
+        .map(t => ({ dir: t.dir, path: t.path }))
+    : []
 }
 
 export const $routeTiles = atom<RouteTile[]>(loadTiles())
 
 function saveTiles(tiles: RouteTile[]) {
   $routeTiles.set(tiles)
-
-  try {
-    if (tiles.length === 0) {
-      window.localStorage.removeItem(TILES_KEY)
-    } else {
-      window.localStorage.setItem(TILES_KEY, JSON.stringify(tiles))
-    }
-  } catch {
-    // Nonfatal.
-  }
+  writeJson(TILES_KEY, tiles.length === 0 ? null : tiles)
 }
 
 /** Open (or front) a page tile for a route, docked on `dir` (default right).

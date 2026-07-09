@@ -9,6 +9,7 @@
  */
 
 import { registry } from '@/contrib/registry'
+import { readJson, writeJson, writeKey } from '@/lib/storage'
 
 import { isLayoutNode, type LayoutNode } from './model'
 import { $layoutTree, applyTree, markActivePreset } from './store'
@@ -18,11 +19,7 @@ export const LAYOUTS_AREA = 'layouts'
 // v2: v1 presets predate semantic placement (see store.ts) — retire them.
 const USER_KEY = 'hermes.desktop.layoutPresets.v2'
 
-try {
-  window.localStorage.removeItem('hermes.desktop.layoutPresets.v1')
-} catch {
-  // Nonfatal.
-}
+writeKey('hermes.desktop.layoutPresets.v1', null)
 
 interface StoredPreset {
   name: string
@@ -32,38 +29,20 @@ interface StoredPreset {
 const userDisposers = new Map<string, () => void>()
 
 function loadUserPresets(): Record<string, StoredPreset> {
-  if (typeof window === 'undefined') {
-    return {}
+  const parsed = readJson<Record<string, StoredPreset>>(USER_KEY) ?? {}
+  const out: Record<string, StoredPreset> = {}
+
+  for (const [id, preset] of Object.entries(parsed)) {
+    if (preset && typeof preset.name === 'string' && isLayoutNode(preset.tree)) {
+      out[id] = preset
+    }
   }
 
-  try {
-    const raw = window.localStorage.getItem(USER_KEY)
-
-    if (!raw) {
-      return {}
-    }
-
-    const parsed = JSON.parse(raw) as Record<string, StoredPreset>
-    const out: Record<string, StoredPreset> = {}
-
-    for (const [id, preset] of Object.entries(parsed)) {
-      if (preset && typeof preset.name === 'string' && isLayoutNode(preset.tree)) {
-        out[id] = preset
-      }
-    }
-
-    return out
-  } catch {
-    return {}
-  }
+  return out
 }
 
 function persistUserPresets(presets: Record<string, StoredPreset>) {
-  try {
-    window.localStorage.setItem(USER_KEY, JSON.stringify(presets))
-  } catch {
-    // Nonfatal.
-  }
+  writeJson(USER_KEY, presets)
 }
 
 function registerUserPreset(id: string, preset: StoredPreset) {
@@ -89,7 +68,12 @@ export function saveLayoutPresetTree(name: string, tree: LayoutNode): string | n
     return null
   }
 
-  const id = `user-${trimmed.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || Date.now().toString(36)}`
+  const id = `user-${
+    trimmed
+      .toLowerCase()
+      .replace(/[^a-z0-9]+/g, '-')
+      .replace(/^-+|-+$/g, '') || Date.now().toString(36)
+  }`
 
   userPresets[id] = { name: trimmed, tree }
   persistUserPresets(userPresets)

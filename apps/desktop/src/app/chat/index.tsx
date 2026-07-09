@@ -1,8 +1,4 @@
-import {
-  type AppendMessage,
-  AssistantRuntimeProvider,
-  type ThreadMessage
-} from '@assistant-ui/react'
+import { type AppendMessage, AssistantRuntimeProvider, type ThreadMessage } from '@assistant-ui/react'
 import { useStore } from '@nanostores/react'
 import { useQuery } from '@tanstack/react-query'
 import type * as React from 'react'
@@ -32,6 +28,7 @@ import {
   $introSeed,
   $resumeExhaustedSessionId,
   $sessions,
+  sessionMatchesStoredId,
   sessionPinId
 } from '@/store/session'
 import { isSecondaryWindow, isWatchWindow } from '@/store/windows'
@@ -105,7 +102,7 @@ function ChatHeader({
   const pinnedSessionIds = useStore($pinnedSessionIds)
 
   const activeStoredSession =
-    sessions.find(session => session.id === selectedSessionId || session._lineage_root_id === selectedSessionId) || null
+    (selectedSessionId && sessions.find(session => sessionMatchesStoredId(session, selectedSessionId))) || null
 
   const title = activeStoredSession ? sessionTitle(activeStoredSession) : 'New session'
 

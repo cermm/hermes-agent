@@ -19,6 +19,7 @@
 import { atom } from 'nanostores'
 
 import type { ClientSessionState } from '@/app/types'
+import { readJson, writeJson } from '@/lib/storage'
 
 // ---------------------------------------------------------------------------
 // Reactive per-runtime session state (view mirror of the wiring cache).
@@ -64,38 +65,21 @@ export interface SessionTile {
 const TILES_KEY = 'hermes.desktop.sessionTiles.v1'
 
 function loadTiles(): SessionTile[] {
-  try {
-    const raw = window.localStorage.getItem(TILES_KEY)
-    const parsed = raw ? (JSON.parse(raw) as unknown) : []
+  const parsed = readJson<unknown>(TILES_KEY)
 
-    // Runtime ids are process-scoped — never trust a persisted one.
-    return Array.isArray(parsed)
-      ? parsed
-          .filter((t): t is SessionTile => Boolean(t && typeof (t as SessionTile).storedSessionId === 'string'))
-          .map(t => ({ dir: t.dir, storedSessionId: t.storedSessionId }))
-      : []
-  } catch {
-    return []
-  }
+  // Runtime ids are process-scoped — never trust a persisted one.
+  return Array.isArray(parsed)
+    ? parsed
+        .filter((t): t is SessionTile => Boolean(t && typeof (t as SessionTile).storedSessionId === 'string'))
+        .map(t => ({ dir: t.dir, storedSessionId: t.storedSessionId }))
+    : []
 }
 
 export const $sessionTiles = atom<SessionTile[]>(loadTiles())
 
 function saveTiles(tiles: SessionTile[]) {
   $sessionTiles.set(tiles)
-
-  try {
-    if (tiles.length === 0) {
-      window.localStorage.removeItem(TILES_KEY)
-    } else {
-      window.localStorage.setItem(
-        TILES_KEY,
-        JSON.stringify(tiles.map(t => ({ dir: t.dir, storedSessionId: t.storedSessionId })))
-      )
-    }
-  } catch {
-    // Nonfatal.
-  }
+  writeJson(TILES_KEY, tiles.length === 0 ? null : tiles.map(t => ({ dir: t.dir, storedSessionId: t.storedSessionId })))
 }
 
 export function patchSessionTile(storedSessionId: string, patch: Partial<SessionTile>) {

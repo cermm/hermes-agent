@@ -21,42 +21,45 @@ import { useEffect, useMemo, useRef } from 'react'
 import { useGatewayRequest } from '@/app/gateway/hooks/use-gateway-request'
 import { blobToDataUrl } from '@/app/session/hooks/use-prompt-actions/utils'
 import { formatRefValue } from '@/components/assistant-ui/directive-text'
-import { registerPaneCloser, removeTreePane } from '@/components/pane-shell/tree/store'
 import { Button } from '@/components/ui/button'
-import { registry } from '@/contrib/registry'
 import { transcribeAudio } from '@/hermes'
 import type { ChatMessage } from '@/lib/chat-messages'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { createComposerAttachmentScope } from '@/store/composer'
 import { sessionAwaitingInput } from '@/store/prompts'
-import { $sessions } from '@/store/session'
+import { $sessions, sessionMatchesStoredId } from '@/store/session'
 import {
   $sessionStates,
   $sessionTiles,
   closeSessionTile,
   patchSessionTile,
+  type SessionTile,
   sessionTileDelegate
 } from '@/store/session-states'
 
-import { sessionMatchesStoredId } from '../session/hooks/use-session-actions/utils'
-
 import { type ComposerScope, ComposerScopeProvider } from './composer/scope'
 import { useComposerActions } from './hooks/use-composer-actions'
+import { paneMirror } from './pane-mirror'
 import { useSessionTileActions } from './session-tile-actions'
 import { type SessionView, SessionViewProvider } from './session-view'
 import { lastVisibleMessageIsUser } from './thread-loading'
 
 import { ChatView } from '.'
 
-const tilePaneId = (storedSessionId: string) => `session-tile:${storedSessionId}`
-
 const NO_MESSAGES: ChatMessage[] = []
 
 /** The tile's SessionView: the same atom shape the primary chat renders
  *  from, computed from this session's slice of `$sessionStates`. */
 function buildTileView(storedSessionId: string): SessionView {
-  const $runtimeId = computed($sessionTiles, tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null)
-  const $state = computed([$runtimeId, $sessionStates], (runtimeId, states) => (runtimeId ? states[runtimeId] : undefined))
+  const $runtimeId = computed(
+    $sessionTiles,
+    tiles => tiles.find(t => t.storedSessionId === storedSessionId)?.runtimeId ?? null
+  )
+
+  const $state = computed([$runtimeId, $sessionStates], (runtimeId, states) =>
+    runtimeId ? states[runtimeId] : undefined
+  )
+
   const $messages = computed($state, state => state?.messages ?? NO_MESSAGES)
 
   return {
@@ -75,7 +78,15 @@ function buildTileView(storedSessionId: string): SessionView {
   }
 }
 
-function TileChat({ runtimeId, storedSessionId, view }: { runtimeId: string; storedSessionId: string; view: SessionView }) {
+function TileChat({
+  runtimeId,
+  storedSessionId,
+  view
+}: {
+  runtimeId: string
+  storedSessionId: string
+  view: SessionView
+}) {
   const { gatewayRef, requestGateway } = useGatewayRequest()
   const cwd = useStore(view.$cwd)
 
@@ -198,55 +209,22 @@ export function SessionTilePane({ storedSessionId }: { storedSessionId: string }
 // Tile -> pane contribution sync (call once from the app root).
 // ---------------------------------------------------------------------------
 
-/** Registered tile panes: stored id -> { dispose, title used at register }. */
-const registered = new Map<string, { dispose: () => void; title: string }>()
-
 function tileTitle(storedSessionId: string): string {
   const stored = $sessions.get().find(s => sessionMatchesStoredId(s, storedSessionId))
 
   return stored ? sessionTitle(stored) : 'Session'
 }
 
-function syncTilePanes(): void {
-  const tiles = $sessionTiles.get()
-  const wanted = new Set(tiles.map(t => t.storedSessionId))
-
-  for (const { dir, storedSessionId } of tiles) {
-    const title = tileTitle(storedSessionId)
-    const current = registered.get(storedSessionId)
-
-    // register() replaces same-id in place — safe for live title refreshes.
-    if (!current || current.title !== title) {
-      const dispose = registry.register({
-        id: tilePaneId(storedSessionId),
-        area: 'panes',
-        title,
-        // Tiles dock against main on the chosen edge (default right), flex width.
-        data: { dock: { pane: 'workspace', pos: dir ?? 'right' }, minWidth: '20rem', placement: 'main' },
-        render: () => <SessionTilePane storedSessionId={storedSessionId} />
-      })
-
-      registered.set(storedSessionId, { dispose, title })
-
-      if (!current) {
-        registerPaneCloser(tilePaneId(storedSessionId), () => closeSessionTile(storedSessionId))
-      }
-    }
-  }
-
-  for (const [storedSessionId, entry] of registered) {
-    if (!wanted.has(storedSessionId)) {
-      entry.dispose()
-      registered.delete(storedSessionId)
-      removeTreePane(tilePaneId(storedSessionId))
-    }
-  }
-}
-
 /** Keep pane contributions mirroring `$sessionTiles` (+ titles from
- *  `$sessions`). Idempotent-ish: module-level maps dedupe across HMR. */
-export function watchSessionTiles(): void {
-  syncTilePanes()
-  $sessionTiles.listen(syncTilePanes)
-  $sessions.listen(syncTilePanes)
-}
+ *  `$sessions`). Tiles dock against main on the chosen edge, flex width. */
+export const watchSessionTiles = paneMirror<SessionTile>({
+  source: $sessionTiles,
+  also: [$sessions],
+  key: t => t.storedSessionId,
+  prefix: 'session-tile',
+  dir: t => t.dir,
+  minWidth: '20rem',
+  title: tileTitle,
+  render: storedSessionId => <SessionTilePane storedSessionId={storedSessionId} />,
+  close: closeSessionTile
+})

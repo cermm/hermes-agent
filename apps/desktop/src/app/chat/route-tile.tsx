@@ -9,13 +9,13 @@
 
 import { lazy, type ReactNode, Suspense } from 'react'
 
-import { registerPaneCloser, removeTreePane } from '@/components/pane-shell/tree/store'
 import { ContribBoundary } from '@/contrib/react/boundary'
 import { useContributions } from '@/contrib/react/use-contributions'
-import { registry } from '@/contrib/registry'
-import { $routeTiles, closeRouteTile } from '@/store/route-tiles'
+import { $routeTiles, closeRouteTile, type RouteTile } from '@/store/route-tiles'
 
 import { ARTIFACTS_ROUTE, contributedRoutes, MESSAGING_ROUTE, ROUTES_AREA, SKILLS_ROUTE } from '../routes'
+
+import { paneMirror } from './pane-mirror'
 
 const SkillsView = lazy(async () => ({ default: (await import('../skills')).SkillsView }))
 const MessagingView = lazy(async () => ({ default: (await import('../messaging')).MessagingView }))
@@ -27,8 +27,6 @@ const BUILTIN_PAGES: Record<string, { render: () => ReactNode; title: string }> 
   [MESSAGING_ROUTE]: { render: () => <MessagingView />, title: 'Messaging' },
   [SKILLS_ROUTE]: { render: () => <SkillsView />, title: 'Capabilities' }
 }
-
-const routeTilePaneId = (path: string) => `route-tile:${path}`
 
 /** Title for a route tile: the built-in name, else the plugin route's own. */
 function routeTitle(path: string): string {
@@ -54,51 +52,25 @@ function RouteTilePane({ path }: { path: string }) {
     return <ContribBoundary id={path}>{contrib.render()}</ContribBoundary>
   }
 
-  return <div className="grid h-full place-items-center font-mono text-[11px] text-(--ui-text-quaternary)">no page at {path}</div>
+  return (
+    <div className="grid h-full place-items-center font-mono text-[11px] text-(--ui-text-quaternary)">
+      no page at {path}
+    </div>
+  )
 }
 
 // ---------------------------------------------------------------------------
 // Route tile -> pane contribution sync (call once from the app root).
 // ---------------------------------------------------------------------------
 
-const registered = new Map<string, { dispose: () => void; title: string }>()
-
-function syncRouteTilePanes(): void {
-  const tiles = $routeTiles.get()
-  const wanted = new Set(tiles.map(t => t.path))
-
-  for (const { dir, path } of tiles) {
-    const title = routeTitle(path)
-    const current = registered.get(path)
-
-    if (!current || current.title !== title) {
-      const dispose = registry.register({
-        id: routeTilePaneId(path),
-        area: 'panes',
-        title,
-        data: { dock: { pane: 'workspace', pos: dir ?? 'right' }, minWidth: '22rem', placement: 'main' },
-        render: () => <RouteTilePane path={path} />
-      })
-
-      registered.set(path, { dispose, title })
-
-      if (!current) {
-        registerPaneCloser(routeTilePaneId(path), () => closeRouteTile(path))
-      }
-    }
-  }
-
-  for (const [path, entry] of registered) {
-    if (!wanted.has(path)) {
-      entry.dispose()
-      registered.delete(path)
-      removeTreePane(routeTilePaneId(path))
-    }
-  }
-}
-
 /** Keep pane contributions mirroring `$routeTiles`. Call once from the root. */
-export function watchRouteTiles(): void {
-  syncRouteTilePanes()
-  $routeTiles.listen(syncRouteTilePanes)
-}
+export const watchRouteTiles = paneMirror<RouteTile>({
+  source: $routeTiles,
+  key: t => t.path,
+  prefix: 'route-tile',
+  dir: t => t.dir,
+  minWidth: '22rem',
+  title: routeTitle,
+  render: path => <RouteTilePane path={path} />,
+  close: closeRouteTile
+})
