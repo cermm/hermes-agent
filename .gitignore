@@ -56,6 +56,7 @@ __pycache__/
 hermes_agent.egg-info/
 wandb/
 testlogs
+playwright-report/
 
 # CLI config (may contain sensitive SSH paths)
 cli-config.yaml

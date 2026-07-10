@@ -12,10 +12,7 @@ export default defineConfig({
   fullyParallel: false,
   reporter: [['list'], ['html', { open: 'never', outputFolder: 'playwright-report' }]],
   use: {
-    /* Capture traces and videos on failure — invaluable when the CI runner
-     * has no display we can watch live. */
-    screenshot: 'only-on-failure',
-    trace: 'retain-on-failure',
-    video: 'retain-on-failure',
+    screenshot: 'on',
+    trace: 'on',
   },
 })
