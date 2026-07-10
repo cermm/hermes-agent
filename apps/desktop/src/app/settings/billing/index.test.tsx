@@ -256,12 +256,26 @@ describe('BillingSettings', () => {
     renderBilling()
 
     expect((await screen.findByText('$0 of $220 left · $0.79 over')).classList.contains('text-destructive')).toBe(true)
+    const subscriptionTrack = screen.getByRole('progressbar', { name: 'Subscription credits remaining' })
+
+    expect(subscriptionTrack.classList.contains('dither')).toBe(true)
+    expect(subscriptionTrack.classList.contains('text-destructive/60')).toBe(true)
+    expect(subscriptionTrack.classList.contains('bg-destructive/10')).toBe(true)
   })
 
   it('renders an empty neutral usage track when a row has no bar data', async () => {
     const fixture = billingDevFixtures['no-subscription']
 
-    apiMocks.fetchBillingState.mockResolvedValue(fixture.billing)
+    apiMocks.fetchBillingState.mockResolvedValue(
+      okBilling({
+        ...todayBillingState,
+        monthly_cap: {
+          ...todayBillingState.monthly_cap,
+          spent_display: '$0',
+          spent_this_month_usd: '0'
+        }
+      })
+    )
     apiMocks.fetchSubscriptionState.mockResolvedValue(fixture.subscription)
 
     renderBilling()
@@ -270,8 +284,14 @@ describe('BillingSettings', () => {
     const subscriptionTrack = screen.getByRole('progressbar', { name: 'Subscription credits usage' })
 
     expect(subscriptionTrack.getAttribute('aria-valuenow')).toBe('0')
-    expect(subscriptionTrack.classList.contains('bg-destructive/25')).toBe(false)
-    expect(subscriptionTrack.classList.contains('bg-muted')).toBe(true)
+    expect(subscriptionTrack.classList.contains('text-destructive')).toBe(false)
+    expect(subscriptionTrack.classList.contains('dither')).toBe(true)
+
+    const monthlyCapTrack = screen.getByRole('progressbar', { name: 'Monthly spend cap used' })
+
+    expect(monthlyCapTrack.getAttribute('aria-valuenow')).toBe('0')
+    expect(monthlyCapTrack.classList.contains('dither')).toBe(true)
+    expect(monthlyCapTrack.classList.contains('bg-(--ui-bg-elevated)')).toBe(true)
   })
 
   it('refreshes both billing queries from the usage refresh button', async () => {

@@ -574,6 +574,7 @@ function UsageBar({ bar, fallbackLabel }: { bar?: BillingUsageRowView['bar']; fa
   }
 
   const width = Math.round(resolvedBar.value * 100)
+  const isEmpty = resolvedBar.value === 0
   const showDangerNub = resolvedBar.track === 'danger' && resolvedBar.state === 'danger' && width === 0
 
   return (
@@ -583,17 +584,20 @@ function UsageBar({ bar, fallbackLabel }: { bar?: BillingUsageRowView['bar']; fa
       aria-valuemin={0}
       aria-valuenow={width}
       className={cn(
+        // Radius follows the app-wide rounded-full progress-bar idiom.
         'relative h-2 w-full overflow-hidden rounded-full',
         resolvedBar.track === 'danger'
-          ? 'bg-destructive/25'
-          : 'bg-muted shadow-[inset_0_0_0_1px_rgba(0,0,0,0.05)] dark:bg-muted/55 dark:shadow-[inset_0_0_0_1px_rgba(255,255,255,0.04)]'
+          ? 'dither text-destructive/60 bg-destructive/10'
+          : isEmpty
+            ? 'dither bg-(--ui-bg-elevated)'
+            : 'bg-muted shadow-[inset_0_0_0_1px_color-mix(in_srgb,var(--ui-stroke-secondary)_50%,transparent)]'
       )}
       role="progressbar"
     >
       {showDangerNub && <div className="absolute inset-y-0 left-0 z-10 w-2 rounded-full bg-destructive" />}
       <div
         className={cn(
-          'h-full rounded-full transition-[width] duration-300',
+          'relative h-full rounded-full transition-[width] duration-300 ease-out',
           resolvedBar.state === 'danger'
             ? 'bg-destructive'
             : resolvedBar.state === 'ok' && (resolvedBar.tone === 'subscription' || resolvedBar.tone === 'topup')
