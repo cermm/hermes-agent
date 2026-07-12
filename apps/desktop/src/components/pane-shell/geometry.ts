@@ -167,6 +167,8 @@ function sameRect(a: Rect | null, b: Rect | null) {
 export function publishWorkspaceGeometry(): () => void {
   const root = document.documentElement
   let el: HTMLElement | null = null
+  let lastLeft = NaN
+  let lastRight = NaN
 
   const ro = new ResizeObserver(() => measure())
 
@@ -190,8 +192,20 @@ export function publishWorkspaceGeometry(): () => void {
     }
 
     const r = el.getBoundingClientRect()
-    root.style.setProperty('--workspace-left', `${Math.round(r.left)}px`)
-    root.style.setProperty('--workspace-right', `${Math.round(window.innerWidth - r.right)}px`)
+    const left = Math.round(r.left)
+    const right = Math.round(window.innerWidth - r.right)
+
+    // Skip unchanged writes: a sash drag fires the RO every frame, and each
+    // :root custom-property set dirties style for everything that reads them.
+    if (left !== lastLeft) {
+      lastLeft = left
+      root.style.setProperty('--workspace-left', `${left}px`)
+    }
+
+    if (right !== lastRight) {
+      lastRight = right
+      root.style.setProperty('--workspace-right', `${right}px`)
+    }
   }
 
   // Tree mutations move zones without resizing them (⌘\ flip) — re-measure a
