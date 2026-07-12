@@ -15,6 +15,7 @@ import {
 } from '@/components/ui/dialog'
 import { Input } from '@/components/ui/input'
 import { useI18n } from '@/i18n'
+import { isMissingPendingPromptRequest } from '@/lib/gateway-rpc'
 import { triggerHaptic } from '@/lib/haptics'
 import { KeyRound, Loader2, Lock } from '@/lib/icons'
 import { $gateway } from '@/store/gateway'
@@ -75,6 +76,12 @@ function SudoDialog({ sessionId }: { sessionId: string | null }) {
         triggerHaptic('submit')
         clearSudoRequest(request.sessionId, request.requestId)
       } catch (error) {
+        if (isMissingPendingPromptRequest(error, 'password')) {
+          clearSudoRequest(request.sessionId, request.requestId)
+
+          return
+        }
+
         notifyError(error, copy.sudoSendFailed)
         setSubmitting(false)
       }
@@ -172,6 +179,12 @@ function SecretDialog({ sessionId }: { sessionId: string | null }) {
         triggerHaptic('submit')
         clearSecretRequest(request.sessionId, request.requestId)
       } catch (error) {
+        if (isMissingPendingPromptRequest(error, 'value')) {
+          clearSecretRequest(request.sessionId, request.requestId)
+
+          return
+        }
+
         notifyError(error, copy.secretSendFailed)
         setSubmitting(false)
       }
