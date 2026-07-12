@@ -160,11 +160,7 @@ export function useDesktopIntegrations({
   // OS-standard window close, esp. secondary windows). The Win/Linux keyboard
   // path is the `view.closeTab` keybind (use-keybinds), sharing closeActiveTab.
   useEffect(() => {
-    const unsubscribe = window.hermesDesktop?.onClosePreviewRequested?.(() => {
-      if (!closeActiveTab()) {
-        window.hermesDesktop?.closeWindow?.()
-      }
-    })
+    const unsubscribe = window.hermesDesktop?.onClosePreviewRequested?.(() => void closeActiveTab())
 
     return () => unsubscribe?.()
   }, [])

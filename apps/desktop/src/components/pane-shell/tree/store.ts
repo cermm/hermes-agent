@@ -17,7 +17,6 @@ import { clearAllPaneSizeOverrides } from '@/store/panes'
 import {
   allPaneIds,
   type DropPosition,
-  findGroup,
   findGroupOfPane,
   groupLeafIds,
   insertAtGroup,
@@ -219,29 +218,12 @@ export function trackActiveTreeGroup(): () => void {
   }
 }
 
-/** The active pane of the zone the user is in — the DOM-focused zone, else the
- *  last-interacted one ($activeTreeGroup). Null when neither resolves to a live
- *  zone. The ⌘W target. */
-export function focusedTreePane(): null | string {
+/** ⌘W "main tabs always": close the MAIN (workspace) zone's active tab, unless
+ *  it's the uncloseable workspace itself. Returns false when there's nothing to
+ *  close, so ⌘W stays a no-op — it never closes the window. */
+export function closeWorkspaceTab(): boolean {
   const tree = $layoutTree.get()
-
-  if (!tree) {
-    return null
-  }
-
-  const el = typeof document !== 'undefined' ? (document.activeElement as HTMLElement | null) : null
-  const domGroup = el?.closest<HTMLElement>('[data-tree-group]')?.dataset.treeGroup
-  const groupId = domGroup ?? $activeTreeGroup.get() ?? undefined
-
-  return (groupId ? findGroup(tree, groupId)?.active : null) ?? null
-}
-
-/** ⌘W: close the focused zone's active tab. Routes through the pane's closer
- *  (session tile / files / terminal…); the uncloseable workspace is a no-op.
- *  Returns false when there's nothing to close, so the key can fall through
- *  (the caller special-cases panes with their OWN tab strip, e.g. preview). */
-export function closeFocusedTreeTab(): boolean {
-  const active = focusedTreePane()
+  const active = tree ? findGroupOfPane(tree, 'workspace')?.active : null
 
   if (!active) {
     return false

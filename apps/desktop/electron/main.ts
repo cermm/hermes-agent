@@ -7827,12 +7827,6 @@ ipcMain.on('hermes:previewShortcutActive', (_event, active) => {
   previewShortcutActive = Boolean(active)
 })
 
-// ⌘W fallback: the renderer found no tab to close, so close the sender's
-// window (the OS-standard behavior it intercepted for tab-close).
-ipcMain.on('hermes:closeWindow', event => {
-  BrowserWindow.fromWebContents(event.sender)?.close()
-})
-
 ipcMain.handle('hermes:requestMicrophoneAccess', async () => {
   if (!IS_MAC || typeof systemPreferences.askForMediaAccess !== 'function') {
     return true

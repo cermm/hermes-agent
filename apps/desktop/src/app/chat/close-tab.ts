@@ -1,18 +1,16 @@
 import { closeActiveTerminal } from '@/app/right-sidebar/terminal/terminals'
-import { closeFocusedTreeTab, focusedTreePane } from '@/components/pane-shell/tree/store'
+import { closeWorkspaceTab } from '@/components/pane-shell/tree/store'
 import { isFocusWithin } from '@/lib/keybinds/combo'
-import { PREVIEW_PANE_ID } from '@/store/layout'
-import { closeActiveRightRailTab } from '@/store/preview'
+import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '@/store/preview'
 
 /**
- * ⌘W — close whatever "tab" the interacted zone holds, by precedence:
+ * ⌘W — close the tab of the context you're in, by precedence:
  *   1. a focused terminal → its active terminal tab,
- *   2. the preview zone (its OWN per-target strip) → its active target tab,
- *   3. any other zone → its active tree tab (session tile / files…).
- * The zone is resolved from the active-zone tracker (last click/focus), so it
- * works even when nothing is DOM-focused. Returns false when nothing is
- * closeable, so the caller falls back (close the window). Shared by the
- * keyboard path (Win/Linux) and the macOS menu-accelerator IPC.
+ *   2. an open preview → its active preview tab (unchanged from pre-tiling),
+ *   3. the MAIN zone → its active tab (a session tile stacked into the workspace).
+ * Returns false when nothing closes, so ⌘W is a no-op — it never closes the
+ * window (a bare workspace stays put). Shared by the keyboard path (Win/Linux)
+ * and the macOS menu-accelerator IPC.
  */
 export function closeActiveTab(): boolean {
   if (isFocusWithin('[data-terminal]')) {
@@ -21,11 +19,11 @@ export function closeActiveTab(): boolean {
     return true
   }
 
-  if (focusedTreePane() === PREVIEW_PANE_ID) {
+  if ($filePreviewTarget.get() || $previewTarget.get()) {
     closeActiveRightRailTab()
 
     return true
   }
 
-  return closeFocusedTreeTab()
+  return closeWorkspaceTab()
 }
