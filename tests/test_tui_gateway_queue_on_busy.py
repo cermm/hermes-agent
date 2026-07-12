@@ -155,6 +155,27 @@ def test_busy_queue_fallback_preserves_original_structured_text(monkeypatch):
     assert session["queued_prompt"]["text"] == rich
 
 
+def test_busy_interrupt_mode_queues_multimodal_payload_instead_of_redirect(monkeypatch):
+    monkeypatch.setattr(server, "_load_busy_input_mode", lambda: "interrupt")
+    seen = []
+    rich = [
+        {"type": "text", "text": "caption"},
+        {"type": "image_url", "image_url": {"url": "data:image/png;base64,abc"}},
+    ]
+    agent = types.SimpleNamespace(
+        _supports_active_turn_redirect=True,
+        redirect=lambda text: seen.append(text) or True,
+        interrupt=lambda *a, **k: None,
+    )
+    session = _session(agent=agent)
+
+    resp = server._handle_busy_submit("r1", "sid", session, rich, "ws-1")
+
+    assert resp["result"]["status"] == "queued"
+    assert seen == []
+    assert session["queued_prompt"]["text"] == rich
+
+
 # ── _drain_queued_prompt ───────────────────────────────────────────────────
 
 def test_drain_fires_queued_prompt_and_claims_running(monkeypatch):

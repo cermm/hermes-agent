@@ -4804,14 +4804,16 @@ def test_session_steer_errors_when_agent_has_no_steer_method():
     assert resp["error"]["code"] == 4010
 
 
-def test_session_redirect_calls_capable_core_agent():
+def test_session_redirect_calls_capable_core_agent(monkeypatch):
     calls = []
     agent = types.SimpleNamespace(
         _supports_active_turn_redirect=True,
         redirect=lambda text: calls.append(text) or True,
     )
-    server._sessions["sid"] = _session(agent=agent)
+    session = _session(agent=agent)
+    server._sessions["sid"] = session
     try:
+        before = session.get("last_active")
         resp = server.handle_request(
             {
                 "id": "1",
@@ -4827,6 +4829,8 @@ def test_session_redirect_calls_capable_core_agent():
         "text": "use Postgres",
     }
     assert calls == ["use Postgres"]
+    assert session.get("last_active") is not None
+    assert before is None or session["last_active"] >= before
 
 
 def test_session_info_includes_mcp_servers(monkeypatch):

@@ -4911,6 +4911,38 @@ def _coerce_message_text(content: Any) -> str:
     return str(content)
 
 
+_TEXT_ONLY_BUSY_PART_KINDS = frozenset({"text", "input_text", "output_text"})
+
+
+def _is_text_only_busy_payload(content: Any) -> bool:
+    """True when a busy submit carries only plain text, not attachments/media."""
+    if content is None:
+        return False
+    if isinstance(content, (str, int, float)):
+        return True
+    if isinstance(content, list):
+        if not content:
+            return False
+        for part in content:
+            if isinstance(part, str):
+                continue
+            if not isinstance(part, dict):
+                return False
+            kind = part.get("type")
+            if kind in _TEXT_ONLY_BUSY_PART_KINDS:
+                continue
+            if kind is None and isinstance(part.get("text"), str):
+                continue
+            return False
+        return True
+    if isinstance(content, dict):
+        kind = content.get("type")
+        if kind in _TEXT_ONLY_BUSY_PART_KINDS:
+            return True
+        return kind is None and isinstance(content.get("text"), str)
+    return False
+
+
 def _history_to_messages(history: list[dict]) -> list[dict]:
     messages = []
     tool_call_args = {}
@@ -5092,8 +5124,9 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
     """
     mode = _load_busy_input_mode()
     agent = session.get("agent")
-    plain_text = _coerce_message_text(text).strip()
-    if mode == "steer" and agent is not None and hasattr(agent, "steer") and plain_text:
+    text_only = _is_text_only_busy_payload(text)
+    plain_text = _coerce_message_text(text).strip() if text_only else ""
+    if mode == "steer" and text_only and plain_text and agent is not None and hasattr(agent, "steer"):
         try:
             if agent.steer(plain_text):
                 session["last_active"] = time.time()
@@ -5102,6 +5135,7 @@ def _handle_busy_submit(rid, sid: str, session: dict, text: Any, transport: Any)
             pass  # fall through to queue
     if (
         mode == "interrupt"
+        and text_only
         and plain_text
         and agent is not None
         and getattr(agent, "_supports_active_turn_redirect", False) is True
@@ -8437,6 +8471,8 @@ def _(rid, params: dict) -> dict:
         accepted = agent.redirect(text)
     except Exception as exc:
         return _err(rid, 5000, f"redirect failed: {exc}")
+    if accepted:
+        session["last_active"] = time.time()
     return _ok(
         rid,
         {"status": "redirected" if accepted else "rejected", "text": text},

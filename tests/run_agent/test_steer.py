@@ -236,9 +236,10 @@ class TestActiveTurnRedirectCheckpoint:
 
         _apply_active_turn_redirect(agent, messages, "Use Postgres instead.")
 
+        assert [m["role"] for m in messages] == ["user", "assistant", "user"]
         assert messages[-1]["role"] == "user"
         assert messages[-1]["content"].endswith("Use Postgres instead.")
-        assert "committed assistant item" not in messages
+        assert sum(1 for m in messages if m["role"] == "assistant") == 1
         assert "Shown reasoning." in messages[-1]["content"]
         assert "Visible draft." in messages[-1]["content"]
         assert "Context from the interrupted assistant response" in messages[-1]["content"]

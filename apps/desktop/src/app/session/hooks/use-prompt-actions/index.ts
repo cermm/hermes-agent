@@ -584,7 +584,7 @@ export function usePromptActions({
   // model generation and rebuilds the live turn with displayed reasoning and
   // completed work intact. During a tool it waits for the safe result boundary.
   // Returns false when the turn raced to completion so the composer can queue.
-  const steerPrompt = useCallback(
+  const redirectPrompt = useCallback(
     async (rawText: string): Promise<boolean> => {
       const text = rawText.trim()
       const sessionId = activeSessionId || activeSessionIdRef.current
@@ -949,7 +949,9 @@ export function usePromptActions({
     handoffSession,
     reloadFromMessage,
     restoreToMessage,
-    steerPrompt,
+    redirectPrompt,
+    /** @deprecated Use `redirectPrompt` — this is an active-turn redirect, not tool steer. */
+    steerPrompt: redirectPrompt,
     submitText,
     transcribeVoiceAudio
   }

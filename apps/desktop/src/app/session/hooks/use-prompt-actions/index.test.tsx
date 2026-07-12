@@ -46,6 +46,8 @@ function sessionInfo(overrides: Partial<SessionInfo> = {}): SessionInfo {
 interface HarnessHandle {
   cancelRun: () => Promise<void>
   restoreToMessage: (messageId: string, target?: { text?: string; userOrdinal?: number | null }) => Promise<void>
+  redirectPrompt: (text: string) => Promise<boolean>
+  /** @deprecated Use `redirectPrompt`. */
   steerPrompt: (text: string) => Promise<boolean>
   submitText: (text: string, options?: { attachments?: ComposerAttachment[]; fromQueue?: boolean }) => Promise<boolean>
 }
@@ -127,10 +129,11 @@ function Harness({
     onReady({
       cancelRun: actions.cancelRun,
       restoreToMessage: actions.restoreToMessage,
+      redirectPrompt: actions.redirectPrompt,
       steerPrompt: actions.steerPrompt,
       submitText: actions.submitText
     })
-  }, [actions.cancelRun, actions.restoreToMessage, actions.steerPrompt, actions.submitText, onReady])
+  }, [actions.cancelRun, actions.restoreToMessage, actions.redirectPrompt, actions.steerPrompt, actions.submitText, onReady])
 
   return null
 }
@@ -612,7 +615,7 @@ describe('usePromptActions submit / queue drain semantics', () => {
   })
 })
 
-describe('usePromptActions steerPrompt', () => {
+describe('usePromptActions redirectPrompt', () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
@@ -632,7 +635,7 @@ describe('usePromptActions steerPrompt', () => {
       />
     )
 
-    const accepted = await handle!.steerPrompt('  nudge the run  ')
+    const accepted = await handle!.redirectPrompt('  nudge the run  ')
 
     expect(accepted).toBe(true)
     expect(requestGateway).toHaveBeenCalledWith('session.redirect', {
@@ -654,7 +657,7 @@ describe('usePromptActions steerPrompt', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    expect(await handle!.steerPrompt('too late')).toBe(false)
+    expect(await handle!.redirectPrompt('too late')).toBe(false)
   })
 
   it('reports rejection without throwing when the redirect RPC errors', async () => {
@@ -667,7 +670,7 @@ describe('usePromptActions steerPrompt', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    expect(await handle!.steerPrompt('boom')).toBe(false)
+    expect(await handle!.redirectPrompt('boom')).toBe(false)
   })
 
   it('skips the RPC entirely for empty text', async () => {
@@ -678,7 +681,7 @@ describe('usePromptActions steerPrompt', () => {
       <Harness onReady={h => (handle = h)} refreshSessions={async () => undefined} requestGateway={requestGateway} />
     )
 
-    expect(await handle!.steerPrompt('   ')).toBe(false)
+    expect(await handle!.redirectPrompt('   ')).toBe(false)
     expect(requestGateway).not.toHaveBeenCalled()
   })
 })

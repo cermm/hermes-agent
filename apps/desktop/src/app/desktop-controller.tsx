@@ -776,7 +776,7 @@ export function DesktopController() {
     handleThreadMessagesChange,
     reloadFromMessage,
     restoreToMessage,
-    steerPrompt,
+    redirectPrompt,
     submitText,
     transcribeVoiceAudio
   } = usePromptActions({
@@ -1132,7 +1132,7 @@ export function DesktopController() {
       onRemoveAttachment={id => void composer.removeAttachment(id)}
       onRestoreToMessage={restoreToMessage}
       onRetryResume={sessionId => void resumeSession(sessionId, true)}
-      onSteer={steerPrompt}
+      onSteer={redirectPrompt}
       onSubmit={submitText}
       onThreadMessagesChange={handleThreadMessagesChange}
       onToggleSelectedPin={toggleSelectedPin}
