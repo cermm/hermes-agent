@@ -239,7 +239,7 @@ export function statusRuleWidths(cols: number, cwdLabel: string, minLeftContent 
 }
 
 // Progressive disclosure for the status rule's lower-priority tail segments.
-// As the terminal narrows we shed the least important pieces first (cost →
+// As the terminal narrows we shed the least important pieces first (subagents →
 // bg → voice → compressions → duration → context bar), and below the bar
 // breakpoint the context read-out collapses to a bare token count. Status and
 // model are never gated here — they're guaranteed room by `statusRuleWidths`.

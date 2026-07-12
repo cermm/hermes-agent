@@ -57,6 +57,10 @@ export interface HeapDumpResult {
   success: boolean
 }
 
+export function isAutoHeapdumpEnabled(raw = process.env.HERMES_AUTO_HEAPDUMP): boolean {
+  return /^(?:1|true|yes|on)$/i.test((raw ?? '').trim())
+}
+
 export async function captureMemoryDiagnostics(trigger: MemoryTrigger): Promise<MemoryDiagnostics> {
   const usage = process.memoryUsage()
   const heapStats = getHeapStatistics()
@@ -163,7 +167,7 @@ export async function performHeapDump(trigger: MemoryTrigger = 'manual'): Promis
     // Auto triggers require explicit opt-in: multi-GiB snapshots written on
     // every threshold cross can fill the user's disk (issue #21767).
     const isAuto = trigger === 'auto-critical' || trigger === 'auto-high'
-    const autoEnabled = /^(?:1|true|yes|on)$/i.test((process.env.HERMES_AUTO_HEAPDUMP ?? '').trim())
+    const autoEnabled = isAutoHeapdumpEnabled()
 
     if (isAuto && !autoEnabled) {
       await pruneHeapdumps(dir).catch(() => undefined)
