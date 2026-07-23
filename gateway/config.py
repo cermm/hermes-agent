@@ -1497,6 +1497,24 @@ def load_gateway_config() -> GatewayConfig:
                     bridged["typing_indicator"] = platform_cfg["typing_indicator"]
                 if "typing_status_text" in platform_cfg:
                     bridged["typing_status_text"] = platform_cfg["typing_status_text"]
+                # Bridge top-level port/host/secret into extra for platforms
+                # whose adapters read these from config.extra (webhook,
+                # msgraph_webhook, api_server).  Without this, YAML like:
+                #   platforms:
+                #     webhook:
+                #       enabled: true
+                #       port: 8649
+                # silently falls back to the hardcoded DEFAULT_PORT because
+                # PlatformConfig.from_dict only extracts ``extra`` from the
+                # ``extra:`` sub-key, not from the top level.
+                if plat in {Platform.WEBHOOK, Platform.MSGRAPH_WEBHOOK}:
+                    for _bridge_key in ("port", "host", "secret"):
+                        if _bridge_key in platform_cfg and _bridge_key not in platform_cfg.get("extra", {}):
+                            bridged[_bridge_key] = platform_cfg[_bridge_key]
+                if plat == Platform.API_SERVER:
+                    for _bridge_key in ("port", "host"):
+                        if _bridge_key in platform_cfg and _bridge_key not in platform_cfg.get("extra", {}):
+                            bridged[_bridge_key] = platform_cfg[_bridge_key]
                 has_channel_overrides = "channel_overrides" in platform_cfg
                 if has_channel_overrides:
                     raw_overrides = platform_cfg.get("channel_overrides")
@@ -2011,7 +2029,19 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     if api_server_enabled or api_server_key:
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
-        config.platforms[Platform.API_SERVER].enabled = True
+        # Respect an explicit ``enabled: false`` in config.yaml (flagged by
+        # ``_enabled_explicit``). In multiplex mode a secondary profile's
+        # config.yaml pins ``platforms.api_server.enabled: false`` so it shares
+        # the default profile's listener instead of binding its own port. That
+        # profile still inherits the process-level env (including
+        # ``API_SERVER_KEY``); without this guard the env-var presence would
+        # force-enable the listener and trip the MultiplexConfigError check.
+        # Pop (don't read) the marker — the api_server branch is terminal (no
+        # later registry pass re-enables it), so this both consumes the flag and
+        # avoids reading it twice, matching the pop convention used elsewhere.
+        api_server_explicit = config.platforms[Platform.API_SERVER].extra.pop("_enabled_explicit", False)
+        if not api_server_explicit or config.platforms[Platform.API_SERVER].enabled:
+            config.platforms[Platform.API_SERVER].enabled = True
         if api_server_key:
             config.platforms[Platform.API_SERVER].extra["key"] = api_server_key
         if api_server_cors_origins:

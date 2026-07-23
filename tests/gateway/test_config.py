@@ -1855,6 +1855,148 @@ class TestLoadGatewayConfig:
         assert Platform.API_SERVER not in config.platforms
 
 
+class TestWebhookPortBridging:
+    """Top-level port/host in the YAML platform section must be bridged into
+    PlatformConfig.extra so the webhook/api_server adapters can read them.
+
+    The adapters (WebhookAdapter, ApiServerAdapter) read port/host from
+    ``config.extra``, but users naturally write them at the top level of the
+    platform section in config.yaml:
+
+        platforms:
+          webhook:
+            enabled: true
+            host: 0.0.0.0
+            port: 8649
+
+    Without bridging, the port silently falls back to DEFAULT_PORT (8644),
+    causing port conflicts between profiles that configure different ports."""
+
+    def test_webhook_port_bridged_from_toplevel(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  webhook:\n"
+            "    enabled: true\n"
+            "    host: 0.0.0.0\n"
+            "    port: 8649\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEBHOOK_ENABLED", raising=False)
+        monkeypatch.delenv("WEBHOOK_PORT", raising=False)
+
+        config = load_gateway_config()
+
+        assert Platform.WEBHOOK in config.platforms
+        wh = config.platforms[Platform.WEBHOOK]
+        assert wh.enabled is True
+        assert wh.extra.get("port") == 8649
+        assert wh.extra.get("host") == "0.0.0.0"
+
+    def test_webhook_port_in_extra_not_overwritten_by_toplevel(self, tmp_path, monkeypatch):
+        """If port is already under extra, the top-level value must not clobber it."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  webhook:\n"
+            "    enabled: true\n"
+            "    extra:\n"
+            "      port: 8650\n"
+            "    port: 8649\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEBHOOK_ENABLED", raising=False)
+        monkeypatch.delenv("WEBHOOK_PORT", raising=False)
+
+        config = load_gateway_config()
+
+        wh = config.platforms[Platform.WEBHOOK]
+        assert wh.extra.get("port") == 8650
+
+    def test_api_server_port_bridged_from_toplevel(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  api_server:\n"
+            "    enabled: true\n"
+            "    host: 127.0.0.1\n"
+            "    port: 8648\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("API_SERVER_ENABLED", raising=False)
+        monkeypatch.delenv("API_SERVER_PORT", raising=False)
+
+        config = load_gateway_config()
+
+        assert Platform.API_SERVER in config.platforms
+        api = config.platforms[Platform.API_SERVER]
+        assert api.extra.get("port") == 8648
+        assert api.extra.get("host") == "127.0.0.1"
+
+    def test_webhook_port_defaults_when_not_configured(self, tmp_path, monkeypatch):
+        """No port anywhere -> adapter uses its hardcoded DEFAULT_PORT."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  webhook:\n"
+            "    enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("WEBHOOK_ENABLED", raising=False)
+        monkeypatch.delenv("WEBHOOK_PORT", raising=False)
+
+        config = load_gateway_config()
+
+        wh = config.platforms[Platform.WEBHOOK]
+        assert "port" not in wh.extra or wh.extra.get("port") is None
+
+    def test_msgraph_webhook_port_host_secret_bridged_from_toplevel(self, tmp_path, monkeypatch):
+        """msgraph_webhook top-level port/host/secret must be bridged into extra,
+        with an explicit extra: value still winning over the top-level one."""
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "platforms:\n"
+            "  msgraph_webhook:\n"
+            "    enabled: true\n"
+            "    host: 0.0.0.0\n"
+            "    port: 8651\n"
+            "    secret: toplevel-secret\n"
+            "    extra:\n"
+            "      client_state: my-client-state\n"
+            "      secret: extra-secret\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.delenv("MSGRAPH_WEBHOOK_ENABLED", raising=False)
+        monkeypatch.delenv("MSGRAPH_WEBHOOK_PORT", raising=False)
+        monkeypatch.delenv("MSGRAPH_WEBHOOK_CLIENT_STATE", raising=False)
+
+        config = load_gateway_config()
+
+        assert Platform.MSGRAPH_WEBHOOK in config.platforms
+        ms = config.platforms[Platform.MSGRAPH_WEBHOOK]
+        assert ms.enabled is True
+        assert ms.extra.get("port") == 8651
+        assert ms.extra.get("host") == "0.0.0.0"
+        # explicit extra: wins over top-level
+        assert ms.extra.get("secret") == "extra-secret"
+        assert ms.extra.get("client_state") == "my-client-state"
+
+
 class TestHomeChannelEnvOverrides:
     """Home channel env vars should apply even when the platform was already
     configured via config.yaml (not just when credential env vars create it)."""
@@ -2117,3 +2259,36 @@ class TestMultiplexProfilesConfig:
             "Explicit top-level false was overridden by nested true — "
             "loader must respect top-level precedence when key is present"
         )
+
+
+class TestApiServerEnvOverride:
+    def test_env_key_does_not_reenable_explicitly_disabled_api_server(self):
+        """An explicit ``platforms.api_server.enabled: false`` must survive
+        _apply_env_overrides() even when API_SERVER_KEY is present in the env.
+
+        Regression: _apply_env_overrides() force-set api_server.enabled = True
+        whenever API_SERVER_KEY (or API_SERVER_ENABLED) was set. In multiplex
+        mode a secondary profile pins ``api_server.enabled: false`` so it shares
+        the default profile's listener instead of binding its own port, but it
+        still inherits the process-level API_SERVER_KEY. The unconditional
+        re-enable flipped it back on and tripped the MultiplexConfigError check.
+
+        The fix honors the explicit disable, flagged by ``_enabled_explicit`` in
+        the platform's extra (set when the config.yaml pins enabled).
+        """
+        config = GatewayConfig(
+            platforms={
+                Platform.API_SERVER: PlatformConfig(
+                    enabled=False,
+                    extra={"_enabled_explicit": True},
+                ),
+            },
+        )
+
+        with patch.dict(os.environ, {"API_SERVER_KEY": "secret-key"}, clear=True):
+            _apply_env_overrides(config)
+
+        # Explicit disable wins over the env-var presence.
+        assert config.platforms[Platform.API_SERVER].enabled is False
+        # The key is still wired through for the shared listener.
+        assert config.platforms[Platform.API_SERVER].extra.get("key") == "secret-key"
