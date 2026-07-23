@@ -43,6 +43,19 @@ Mode — all at once.
    This writes `~/.hermes/slack-manifest.json` and prints paste-in
    instructions. Existing apps that still use Slack's legacy Assistant view
    can omit `--agent-view` until they are ready to migrate.
+
+   To populate Slack's long app description from an existing UTF-8 text or
+   Markdown file, add `--long-description-file`:
+
+   ```bash
+   hermes slack manifest --agent-view \
+     --long-description-file AGENTS.md --write
+   ```
+
+   The file contents are preserved exactly within Slack's 175–4,000-character
+   range. Use `--long-description "..."` for inline text instead; the inline
+   and file options are mutually exclusive and cannot be combined with
+   `--slashes-only`.
 2. Go to [https://api.slack.com/apps](https://api.slack.com/apps) →
    **Create New App** → **From an app manifest**
 3. Pick your workspace, paste the JSON contents, review, click **Next**
@@ -624,6 +637,50 @@ How `mentions` mode gates:
 `mentions` is the recommended mode for bot-to-bot collaboration: each agent must explicitly summon the other per turn. Avoid `all` unless every peer bot's own reply policy is loop-safe — two bots that answer everything will answer each other forever. Detection covers labeled bot messages (`bot_id`, `subtype: bot_message`), app-originated events, and unlabeled bot *users* (probed via `users.info`), so peer Hermes agents are filtered consistently across workspaces.
 
 For strict multi-bot deployments, pair with `require_mention: true` and `strict_mention: true` — see the smoke-check profile below.
+
+### Reaction Triggers (`reaction_triggers`)
+
+By default, emoji reactions are acknowledged and dropped — a 👍 on a bot
+message does nothing. Set `slack.reaction_triggers` to route reactions into
+the agent loop (requires the `reactions:read` scope plus the
+`reaction_added`/`reaction_removed` bot event subscriptions in your Slack app
+manifest — regenerate with `hermes slack manifest`):
+
+```yaml
+slack:
+  # Opt-in. false/absent (default) = reactions are acked and dropped.
+  # true = any reaction ON THE BOT'S OWN MESSAGES routes to the agent.
+  reaction_triggers: true
+  # Or an explicit emoji allowlist — only these names route, and they may
+  # target ANY message (emoji-handoff workflows, e.g. :task: to capture):
+  # reaction_triggers: [white_check_mark, thumbsup, task]
+  # Optional handoff target: respond in this channel (top-level) or thread
+  # (C123:<thread_ts>) instead of the reacted-to message's thread.
+  # reaction_trigger_target: C0123456789
+```
+
+Environment equivalents: `SLACK_REACTION_TRIGGERS` (`true`/`all` or a
+comma-separated list) and `SLACK_REACTION_TRIGGER_TARGET`.
+
+Behavior:
+
+- The reaction arrives as a normal agent turn with text
+  `reaction:added:👍` / `reaction:removed:👍` (common Slack names are
+  translated to unicode; unknown names pass through as-is, e.g.
+  `reaction:added:custom-emoji`), threaded under
+  the reacted-to message so the agent sees what was reacted to and the
+  turn lands in the same session as a reply would.
+- The reactor becomes the message's user, so **user authorization and
+  `allowed_channels` gating apply exactly as for typed messages** — a
+  random user's reaction cannot trigger the agent anywhere their message
+  couldn't.
+- With `reaction_triggers: true`, only reactions on the bot's **own**
+  messages route (approve/acknowledge flows). With an explicit emoji
+  allowlist, the listed emojis route from any message.
+- The bot's own lifecycle reactions (`:eyes:` etc.) never feed back.
+- Independent of this opt-in, every human reaction fires the
+  `reaction:added`/`reaction:removed` [gateway hooks](../features/hooks.md#available-events)
+  for observers that don't need agent turns.
 
 ### Peer-Agent Smoke Check
 

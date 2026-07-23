@@ -941,6 +941,53 @@ def _uses_telegram_observed_group_context(channel_prompt: Optional[str]) -> bool
     return bool(channel_prompt and _TELEGRAM_OBSERVED_CONTEXT_PROMPT_MARKER in channel_prompt)
 
 
+def _csv_or_list_to_set(raw: Any) -> set[str]:
+    """Normalize a config list or comma-separated scalar into a string set."""
+    if raw is None:
+        return set()
+    if isinstance(raw, list):
+        return {str(part).strip() for part in raw if str(part).strip()}
+    s = str(raw).strip()
+    if not s:
+        return set()
+    return {part.strip() for part in s.split(",") if part.strip()}
+
+
+def _slack_ignored_channels_from_gateway_config(config: Any) -> set[str]:
+    """Return Slack channels that the generic gateway must never dispatch.
+
+    The Slack adapter has the first-line drop, but this runner-level guard is
+    intentionally duplicated as a fail-safe. If a future Slack code path, test
+    hook, malformed event, or stale adapter instance bypasses the Slack plugin
+    adapter, ignored channels still cannot reach auth, pairing, sessions, or
+    the agent/home-channel prompt pipeline.
+    """
+    platform_cfg = getattr(config, "platforms", {}).get(Platform.SLACK)
+    raw = None
+    if platform_cfg is not None:
+        raw = getattr(platform_cfg, "extra", {}).get("ignored_channels")
+    if raw is None:
+        # Top-level ``slack.ignored_channels`` config flows through the
+        # plugin's YAML→env bridge (SLACK_IGNORED_CHANNELS) rather than
+        # PlatformConfig.extra — honor it here too (#46925).
+        raw = os.getenv("SLACK_IGNORED_CHANNELS") or None
+    return _csv_or_list_to_set(raw)
+
+
+def _slack_parent_channel_id(chat_id: Any) -> str:
+    """Return the parent Slack channel from a possibly thread-scoped chat ID."""
+    if not chat_id:
+        return ""
+    return str(chat_id).split(":", 1)[0]
+
+
+def _is_slack_ignored_channel(config: Any, chat_id: Any) -> bool:
+    """Check the generic Slack gateway blacklist for channel or thread IDs."""
+    channel_id = _slack_parent_channel_id(chat_id)
+    ignored = _slack_ignored_channels_from_gateway_config(config)
+    return bool(channel_id and ("*" in ignored or channel_id in ignored))
+
+
 def _message_timestamps_enabled(user_config: Optional[dict]) -> bool:
     """True when gateway.message_timestamps.enabled is opted in.
 
@@ -1972,6 +2019,7 @@ from gateway.session import (
     SessionContext,
     build_session_context,
     build_session_context_prompt,
+    build_channel_continuity_note,
     build_session_key,
     is_shared_multi_user_session,
     neutralize_untrusted_inline_text,
@@ -4448,6 +4496,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             db.update_session_meta(session_id, json.dumps(config), model=model)
         except Exception:
             logger.debug("Failed to sync gateway session model metadata", exc_info=True)
+
+    async def _handle_reaction_event(self, ctx: Dict[str, Any]) -> None:
+        """Fan a normalised platform reaction event out to the HookRegistry.
+
+        Adapters call this via ``set_reaction_handler`` for every
+        platform-native reaction event they surface. The adapter-supplied
+        ``event_name`` ("reaction:added" / "reaction:removed") becomes the
+        hook event so user hooks subscribe with the same name scheme as the
+        existing ``agent:*`` family. Errors never block the adapter's event
+        loop — the hook contract is non-blocking.
+        """
+        event_name = str(ctx.get("event_name") or "reaction:added")
+        try:
+            await self.hooks.emit(event_name, ctx)
+        except Exception:
+            logger.debug("[Gateway] reaction hook emit failed", exc_info=True)
 
     async def _handle_adapter_fatal_error(self, adapter: BasePlatformAdapter) -> None:
         """React to an adapter failure after startup.
@@ -7903,6 +7967,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
             adapter.set_session_store(self.session_store)
             adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+            _set_reaction = getattr(adapter, "set_reaction_handler", None)
+            if callable(_set_reaction):
+                _set_reaction(self._handle_reaction_event)
             adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
             adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
             adapter._busy_text_mode = self._busy_text_mode
@@ -8882,6 +8949,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     adapter.set_fatal_error_handler(self._handle_adapter_fatal_error)
                     adapter.set_session_store(self.session_store)
                     adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+                    _set_reaction = getattr(adapter, "set_reaction_handler", None)
+                    if callable(_set_reaction):
+                        _set_reaction(self._handle_reaction_event)
                     adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
                     adapter.set_authorization_check(self._make_adapter_auth_check(adapter.platform))
                     adapter._busy_text_mode = self._busy_text_mode
@@ -9756,6 +9826,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         )
         adapter.set_session_store(self.session_store)
         adapter.set_busy_session_handler(self._handle_active_session_busy_message)
+        _set_reaction = getattr(adapter, "set_reaction_handler", None)
+        if callable(_set_reaction):
+            _set_reaction(self._handle_reaction_event)
         adapter.set_topic_recovery_fn(self._recover_telegram_topic_thread_id)
         adapter.set_authorization_check(
             self._make_adapter_auth_check(platform, profile_name=profile_name)
@@ -10177,6 +10250,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             return
 
         config = getattr(self, "config", None)
+        if (
+            config
+            and getattr(source, "platform", None) == Platform.SLACK
+            and _is_slack_ignored_channel(config, getattr(source, "chat_id", None))
+        ):
+            logger.info(
+                "Skipping Slack platform notice for configured ignored channel %s",
+                getattr(source, "chat_id", None),
+            )
+            return
+
         notice_delivery = "public"
         if config and hasattr(config, "get_notice_delivery"):
             notice_delivery = config.get_notice_delivery(source.platform)
@@ -10383,17 +10467,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.debug("reset_session_vars failed at handler entry", exc_info=True)
 
+        # Internal events (e.g. background-process completion notifications)
+        # are system-generated and must skip user authorization.
+        is_internal = bool(getattr(event, "internal", False))
+
+        # Ignored-channel guard runs FIRST — before startup-restore queueing,
+        # plugin hooks, auth, and session setup — so a configured ignored
+        # channel can never reach pairing/auth/session state (#51899).
+        # getattr: bare test runners construct GatewayRunner via
+        # object.__new__ without config (see AGENTS.md pitfall on
+        # object.__new__ test pattern).
+        if (
+            not is_internal
+            and getattr(source, "platform", None) == Platform.SLACK
+            and _is_slack_ignored_channel(
+                getattr(self, "config", None), getattr(source, "chat_id", None)
+            )
+        ):
+            logger.info(
+                "Dropping Slack message from configured ignored channel %s",
+                getattr(source, "chat_id", None),
+            )
+            return None
+
         if (
             getattr(self, "_startup_restore_in_progress", False)
-            and not getattr(event, "internal", False)
+            and not is_internal
             and not getattr(event, "_hermes_startup_restore_replay", False)
         ):
             self._queue_startup_restore_event(event)
             return None
-
-        # Internal events (e.g. background-process completion notifications)
-        # are system-generated and must skip user authorization.
-        is_internal = bool(getattr(event, "internal", False))
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -12599,6 +12702,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 context_note = "[System note: The previous gateway session could not be recovered after a restart (API recovery timed out). This is a fresh conversation — use /resume to restore history if needed.]"
             else:
                 context_note = "[System note: The user's previous session expired due to inactivity. This is a fresh conversation with no prior context.]"
+            # Slack/Discord channels/threads are long-lived: point the agent at
+            # the specific prior same-channel session so it recalls that context
+            # via session_search instead of an unrelated recent session.  Returns
+            # None (appends nothing) for other platforms or when there's no prior
+            # activity to recall.  Deterministic — no extra API/DB calls (#36220).
+            try:
+                continuity_note = build_channel_continuity_note(session_entry, source)
+            except Exception:
+                continuity_note = None
+            if continuity_note:
+                context_note = context_note + "\n\n" + continuity_note
             turn_sidecar_notes.append(context_note)
 
             # Send a user-facing notification explaining the reset, unless:
@@ -13646,6 +13760,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _show_reasoning_effective and response and not _intentional_silence:
                 last_reasoning = agent_result.get("last_reasoning")
                 if last_reasoning:
+                    from gateway.stream_consumer import escape_code_fences_for_display
                     # Collapse long reasoning to keep messages readable
                     lines = last_reasoning.strip().splitlines()
                     if len(lines) > 15:
@@ -13677,6 +13792,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                         response = f"> 💭 **Reasoning:**\n{_quoted}\n\n{response}"
                     else:
+                        # Escape ``` inside reasoning so inner fences don't
+                        # break the outer code block used to render it.
+                        display_reasoning = escape_code_fences_for_display(display_reasoning)
                         response = f"💭 **Reasoning:**\n```\n{display_reasoning}\n```\n\n{response}"
 
             # Runtime-metadata footer — only on the FINAL message of the turn.
@@ -15014,7 +15132,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         has_agent_tts = any(
             msg.get("role") == "assistant"
             and any(
-                tc.get("function", {}).get("name") == "text_to_speech"
+                (tc.get("function") or {}).get("name") == "text_to_speech"
                 for tc in (msg.get("tool_calls") or [])
             )
             for msg in agent_messages
@@ -17418,6 +17536,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """
         source = self._build_process_event_source(evt)
         if not source:
+            # API-server-originated sessions bind a RAW session key (the
+            # X-Hermes-Session-Id value — see _bind_api_server_session), not a
+            # structured ``agent:main:...`` key, so _build_process_event_source
+            # cannot derive routing metadata from it and returns None above.
+            # Recover the raw session id and wake the real session via the API
+            # server's own /v1/chat/completions entry point instead of
+            # dropping the event.
+            raw_sid = str(evt.get("origin_session_id") or "").strip()
+            if not raw_sid:
+                _sk = str(evt.get("session_key") or "").strip()
+                if _sk and _parse_session_key(_sk) is None:
+                    raw_sid = _sk
+            if raw_sid:
+                adapter = self.adapters.get(Platform.API_SERVER)
+                from gateway.wake import adapter_supports_push, deliver_wake
+                if adapter is not None and not adapter_supports_push(adapter):
+                    try:
+                        logger.info(
+                            "Watch pattern notification — waking api_server "
+                            "session %s via self-post",
+                            raw_sid,
+                        )
+                        await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                        return True
+                    except Exception as e:
+                        logger.warning(
+                            "Watch notification self-post wake failed for "
+                            "session %s: %s",
+                            raw_sid, e,
+                        )
+                        return False
+                logger.warning(
+                    "Dropping watch notification for raw session %s: no "
+                    "api_server adapter to self-post through",
+                    raw_sid,
+                )
+                return None
             logger.warning(
                 "Dropping watch notification with no routing metadata for process %s",
                 evt.get("session_id", "unknown"),
@@ -17431,6 +17586,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 break
         if not adapter:
             return None
+        from gateway.wake import adapter_supports_push as _wake_push_ok
+        if not _wake_push_ok(adapter):
+            # Non-push adapter (api_server) resolved WITH routing metadata:
+            # its chat_id is the raw session id (see _bind_api_server_session,
+            # which binds chat_id = session_id). handle_message would run the
+            # wake under a build_session_key()-derived key that never matches
+            # the raw X-Hermes-Session-Id session — self-post instead.
+            from gateway.wake import deliver_wake
+            raw_sid = str(evt.get("origin_session_id") or "").strip() or str(source.chat_id or "")
+            try:
+                logger.info(
+                    "Watch pattern notification — waking api_server session "
+                    "%s via self-post",
+                    raw_sid,
+                )
+                await deliver_wake(adapter, text=synth_text, session_id=raw_sid)
+                return True
+            except Exception as e:
+                logger.warning(
+                    "Watch notification self-post wake failed for session "
+                    "%s: %s",
+                    raw_sid, e,
+                )
+                return False
         try:
             metadata = {}
             parent_session_id = str(evt.get("parent_session_id") or "").strip()
@@ -17840,6 +18019,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     break
 
                 # --- Normal text-only notification ---
+                # Skip when the agent already consumed this completion via
+                # wait/log (#65379): process(wait) returned the exit code and
+                # output inline, so the raw "[Background process ... finished
+                # with exit code ...]" message would be a duplicate delivery
+                # of the same completion. The agent_notify branch above
+                # already honors _completion_consumed; without this check its
+                # skip FALLS THROUGH to this block and re-delivers the output
+                # the agent is actively summarizing. poll() is read-only and
+                # intentionally does not mark consumed (#10156), so a status
+                # check never suppresses this message.
+                if _pr_check.is_completion_consumed(session_id):
+                    logger.debug(
+                        "Process watcher: completion for %s already consumed "
+                        "via wait/log — skipping raw notification (#65379)",
+                        session_id,
+                    )
+                    break
                 # Decide whether to notify based on mode
                 should_notify = (
                     notify_mode in {"all", "result"}

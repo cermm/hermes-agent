@@ -789,6 +789,22 @@ class StreamingConfig:
 # platform is sufficiently configured to be considered "connected".  Platforms
 # that rely on the generic ``token or api_key`` check (Telegram, Discord,
 # Slack, Matrix, Mattermost, HomeAssistant) do not need an entry here.
+def _has_usable_api_server_key(key: object) -> bool:
+    """True when API_SERVER_KEY is present and strong enough to be usable.
+
+    Mirrors the startup guard in ``gateway/platforms/api_server.py``
+    (``has_usable_secret`` with ``min_length=16``) so the platform is only
+    enrolled at load time when the adapter would actually agree to start.
+    """
+    if not key:
+        return False
+    try:
+        from hermes_cli.auth import has_usable_secret
+    except ImportError:
+        return len(str(key).strip()) >= 16
+    return has_usable_secret(key, min_length=16)
+
+
 _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] = {
     Platform.WEIXIN: lambda cfg: bool(
         cfg.extra.get("account_id") and (cfg.token or cfg.extra.get("token"))
@@ -797,7 +813,9 @@ _PLATFORM_CONNECTED_CHECKERS: dict[Platform, Callable[[PlatformConfig], bool]] =
         cfg.extra.get("phone_number_id") and cfg.extra.get("access_token")
     ),
     Platform.SIGNAL: lambda cfg: bool(cfg.extra.get("http_url")),
-    Platform.API_SERVER: lambda cfg: True,
+    Platform.API_SERVER: lambda cfg: _has_usable_api_server_key(
+        cfg.extra.get("key") if cfg else None
+    ),
     Platform.WEBHOOK: lambda cfg: True,
     Platform.MSGRAPH_WEBHOOK: lambda cfg: bool(
         str(cfg.extra.get("client_state") or "").strip()
@@ -1386,6 +1404,41 @@ def load_gateway_config() -> GatewayConfig:
 
             _merge_platform_map(gateway_platforms)
             _merge_platform_map(yaml_cfg.get("platforms"))
+
+            # Also merge platform configs placed directly under ``gateway.*``
+            # (e.g. ``gateway.api_server``) so subsections are discovered the
+            # same way ``gateway.streaming`` is handled elsewhere.  Iterate
+            # all ``gateway:*`` keys and merge only those that match a known
+            # platform value, skipping reserved keys like ``platforms``.
+            if isinstance(gateway_cfg, dict):
+                _nested_platforms: dict = {}
+                for _k, _v in gateway_cfg.items():
+                    if _k == "platforms":
+                        continue
+                    try:
+                        Platform(_k)
+                    except (ValueError, AttributeError):
+                        continue
+                    if isinstance(_v, dict):
+                        _nested_platforms[_k] = _v
+                if _nested_platforms:
+                    _merge_platform_map(_nested_platforms)
+
+            # Bridge api_server-specific keys (port, key, host, cors_origins,
+            # model_name) into extra so PlatformConfig.from_dict preserves
+            # them — adapting what _apply_env_overrides does for env vars to
+            # the YAML path.  Users writing ``gateway.api_server.port: 8642``
+            # expect these to end up in the platform's extra dict.
+            _api_plat = platforms_data.get("api_server")
+            if isinstance(_api_plat, dict):
+                _api_extra = _api_plat.get("extra")
+                if not isinstance(_api_extra, dict):
+                    _api_extra = {}
+                    _api_plat["extra"] = _api_extra
+                for _bridge_key in ("port", "key", "host", "cors_origins", "model_name"):
+                    if _bridge_key in _api_plat and _bridge_key not in _api_extra:
+                        _api_extra[_bridge_key] = _api_plat.pop(_bridge_key)
+
             if platforms_data:
                 gw_data["platforms"] = platforms_data
             # Iterate built-in platforms plus any registered plugin platforms
@@ -2026,7 +2079,12 @@ def _apply_env_overrides(config: GatewayConfig) -> None:
     api_server_cors_origins = getenv("API_SERVER_CORS_ORIGINS", "")
     api_server_port = getenv("API_SERVER_PORT")
     api_server_host = getenv("API_SERVER_HOST")
-    if api_server_enabled or api_server_key:
+    # Require a usable key: API_SERVER_ENABLED alone would load an
+    # unauthenticated platform whose adapter refuses to start at connect()
+    # anyway (startup guard in gateway/platforms/api_server.py), leaving the
+    # reconnect watcher spinning and logging errors forever. Same strength
+    # bar as the startup guard (has_usable_secret, min_length=16).
+    if _has_usable_api_server_key(api_server_key):
         if Platform.API_SERVER not in config.platforms:
             config.platforms[Platform.API_SERVER] = PlatformConfig()
         # Respect an explicit ``enabled: false`` in config.yaml (flagged by
