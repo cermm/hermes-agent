@@ -12,9 +12,9 @@
 // spent regardless of the isolated backend.
 
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { homedir, tmpdir } from 'node:os'
+import { tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -51,20 +51,15 @@ async function waitFor(fn, { timeoutMs, label }) {
 // spawned instance reaches an empty chat view instead of the onboarding wizard.
 // A separate HERMES_HOME dir means a separate gateway lock — no collision with
 // the user's running app, which keeps its own sessions DB and state.
-function seedConfigFrom(sourceHome, targetHome) {
-  if (!existsSync(sourceHome)) {
-    return
-  }
+export function seedConfigFrom(sourceHome, targetHome) {
+  if (!existsSync(sourceHome)) return
 
-  for (const name of ['config.yaml', '.env', 'auth.json']) {
-    const from = join(sourceHome, name)
-
-    if (existsSync(from)) {
-      try {
-        copyFileSync(from, join(targetHome, name))
-      } catch {
-        // best-effort — a missing file just means onboarding may appear.
-      }
+  const from = join(sourceHome, 'config.yaml')
+  if (existsSync(from)) {
+    try {
+      copyFileSync(from, join(targetHome, 'config.yaml'))
+    } catch {
+      // best-effort — a missing file just means onboarding may appear.
     }
   }
 }

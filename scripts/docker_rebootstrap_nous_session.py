@@ -202,7 +202,16 @@ def main() -> int:
     auth_path = sys.argv[1] if len(sys.argv) > 1 else ""
     if not auth_path:
         home = os.environ.get("HERMES_HOME", "")
-        auth_path = os.path.join(home, "auth.json") if home else "auth.json"
+        if home:
+            try:
+                from docker_auth_authority import resolve_auth_authority
+
+                auth_path = resolve_auth_authority(home)["auth_path"]
+            except Exception as exc:
+                print(f"[rebootstrap] authority resolution failed (ignored): {exc}", file=sys.stderr)
+                return 0
+        else:
+            auth_path = "auth.json"
     seed_raw = os.environ.get(REBOOTSTRAP_ENV, "")
 
     try:

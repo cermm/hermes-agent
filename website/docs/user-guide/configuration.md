@@ -18,7 +18,7 @@ Run `hermes setup --portal` — one OAuth gets you a model provider and all four
 ~/.hermes/
 ├── config.yaml     # Settings (model, terminal, TTS, compression, etc.)
 ├── .env            # API keys and secrets
-├── auth.json       # OAuth provider credentials (Nous Portal, etc.)
+├── auth.json       # Default shared OAuth and credential-pool authority
 ├── SOUL.md         # Primary agent identity (slot #1 in system prompt)
 ├── memories/       # Persistent memory (MEMORY.md, USER.md)
 ├── skills/         # Agent-created skills (managed via skill_manage tool)
@@ -62,6 +62,10 @@ Settings are resolved in this order (highest priority first):
 :::info Rule of Thumb
 Secrets (API keys, bot tokens, passwords) go in `.env`. Everything else (model, terminal backend, compression settings, memory limits, toolsets) goes in `config.yaml`. When both are set, `config.yaml` wins for non-secret settings.
 :::
+
+### Authentication authority
+
+OAuth tokens and credential pools remain in `auth.json`, but `auth.authority` controls which store is canonical. The default `shared` authority uses `~/.hermes/auth.json` across named profiles; `profile` isolates credentials to the active profile. See [Authentication store authority](/guides/auth-authority) for migration, conflict, backup, and recovery behavior.
 
 :::tip Org deployments
 An administrator can pin specific config and secret values that a standard user

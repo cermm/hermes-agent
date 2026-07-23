@@ -123,6 +123,11 @@ _CLONE_ALL_HISTORY_EXCLUDE_ROOT: frozenset[str] = frozenset({
     "backups",
     "state-snapshots",
     "checkpoints",
+    # Credential stores are controlled by auth authority and are never copied
+    # implicitly.  A profile-local store must be moved with the explicit
+    # auth migration/restore workflow.
+    "auth.json",
+    "auth.lock",
 })
 
 # Marker file written by `hermes profile create --no-skills`.  When present in
@@ -995,6 +1000,7 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
+    auth_mode: str = "retain",
 ) -> Path:
     """Create a new profile directory.
 
@@ -1023,6 +1029,8 @@ def create_profile(
     Path
         The newly created profile directory.
     """
+    if auth_mode not in {"retain", "shared", "profile"}:
+        raise ValueError("auth_mode must be retain, shared, or profile")
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
@@ -1105,6 +1113,41 @@ def create_profile(
                     dst = profile_dir / relpath
                     dst.parent.mkdir(parents=True, exist_ok=True)
                     shutil.copy2(src, dst)
+
+    # Credential content never moves implicitly. ``profile`` is the explicit
+    # opt-in that copies the resolved source authority into a new local store;
+    # ``shared`` only changes authority and keeps the singleton store in place.
+    if auth_mode in {"shared", "profile"}:
+        import yaml
+
+        config_path = profile_dir / "config.yaml"
+        config: dict = {}
+        if config_path.is_file():
+            loaded = yaml.safe_load(config_path.read_text(encoding="utf-8")) or {}
+            if isinstance(loaded, dict):
+                config = loaded
+        auth_config = config.setdefault("auth", {})
+        if not isinstance(auth_config, dict):
+            auth_config = {}
+            config["auth"] = auth_config
+        auth_config["authority"] = auth_mode
+        config_path.write_text(
+            yaml.safe_dump(config, sort_keys=False, default_flow_style=False),
+            encoding="utf-8",
+        )
+        os.chmod(config_path, 0o600)
+
+    if auth_mode == "profile" and source_dir is not None:
+        from hermes_cli.auth_authority import resolve_auth_authority
+
+        source_auth = resolve_auth_authority(
+            profile_home=source_dir,
+            shared_root=_get_default_hermes_home(),
+            enforce_migration=False,
+        ).auth_path
+        if source_auth.is_file():
+            shutil.copy2(source_auth, profile_dir / "auth.json")
+            os.chmod(profile_dir / "auth.json", 0o600)
 
     # Seed an empty .env so the profile has its own credentials file from
     # day one. Without it, profile-scoped env writes (dashboard Channels /
@@ -1460,7 +1503,34 @@ def _rmtree_with_retry(profile_dir: Path, onexc_handler) -> None:
         raise last_exc
 
 
-def delete_profile(name: str, yes: bool = False) -> Path:
+def _archive_profile_auth(profile_name: str, auth_path: Path) -> Path:
+    """Archive profile-local credentials privately while holding their lock."""
+    from hermes_cli.auth import _auth_store_lock
+
+    archive_dir = _get_default_hermes_home() / "state-snapshots" / "auth-profile-deletions"
+    archive_dir.mkdir(parents=True, exist_ok=True)
+    archive_path = archive_dir / f"{profile_name}-{time.time_ns()}.json"
+    tmp_path = archive_path.with_name(f".{archive_path.name}.tmp.{os.getpid()}")
+    with _auth_store_lock(target_path=auth_path):
+        raw = auth_path.read_bytes()
+        fd = os.open(str(tmp_path), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as handle:
+                handle.write(raw)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_path, archive_path)
+            archive_path.chmod(0o600)
+        finally:
+            tmp_path.unlink(missing_ok=True)
+    return archive_path
+
+
+def delete_profile(
+    name: str,
+    yes: bool = False,
+    auth_action: str | None = None,
+) -> Path:
     """Delete a profile, its wrapper script, and its gateway service.
 
     Stops the gateway if running. Disables systemd/launchd service first
@@ -1481,6 +1551,19 @@ def delete_profile(name: str, yes: bool = False) -> Path:
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"Profile '{canon}' does not exist.")
 
+    if auth_action not in {None, "archive", "purge"}:
+        raise ValueError("--auth-action must be either 'archive' or 'purge'")
+    from hermes_cli.auth_authority import resolve_auth_authority
+
+    authority = resolve_auth_authority(profile_home=profile_dir)
+    local_auth = (
+        authority.effective_mode == "profile" and authority.auth_path.is_file()
+    )
+    if local_auth and auth_action is None:
+        raise ValueError(
+            "Profile-local credentials require --auth-action archive or "
+            "--auth-action purge before deletion"
+        )
     # Show what will be deleted
     model, provider = _read_config_model(profile_dir)
     gw_running = _check_gateway_running(profile_dir)
@@ -1525,6 +1608,10 @@ def delete_profile(name: str, yes: bool = False) -> Path:
         if confirm != canon:
             print("Cancelled.")
             return profile_dir
+
+    if local_auth and auth_action == "archive":
+        archive_path = _archive_profile_auth(canon, authority.auth_path)
+        print(f"✓ Archived profile credentials to {archive_path}")
 
     # 1. Disable service (prevents auto-restart)
     _cleanup_gateway_service(canon, profile_dir)

@@ -52,6 +52,11 @@ def _write(path: Path, payload: dict) -> None:
     path.write_text(json.dumps(payload, indent=2))
 
 
+def _write_profile_auth_mode(profile: Path) -> None:
+    """Opt into profile authority for profile-only write and lock tests."""
+    (profile / "config.yaml").write_text("auth:\n  authority: profile\n", encoding="utf-8")
+
+
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
@@ -422,6 +427,7 @@ def test_classic_mode_does_not_double_read_same_file(tmp_path, monkeypatch):
 def test_write_credential_pool_targets_profile_not_global(profile_env):
     from hermes_cli.auth import read_credential_pool, write_credential_pool
 
+    _write_profile_auth_mode(profile_env["profile"])
     _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
         "openrouter": [{
             "id": "glob-1",
@@ -500,6 +506,8 @@ def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env
 
     profile_b = profile_env["global"] / "profiles" / "reviewer"
     profile_b.mkdir(parents=True)
+    _write_profile_auth_mode(profile_env["profile"])
+    _write_profile_auth_mode(profile_b)
     profile_b_lock = profile_b / "auth.lock"
 
     with auth._auth_store_lock():

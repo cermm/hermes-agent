@@ -49,8 +49,11 @@
     # settings.terminal.cwd overrides the workingDirectory default.
     # Container mode uses the in-container mount path.
     effectiveWorkDir = if cfg.container.enable then containerWorkDir else cfg.workingDirectory;
+    authSettings = { auth.authority = cfg.authAuthority; };
     configJson = builtins.toJSON (
-      lib.recursiveUpdate { terminal.cwd = effectiveWorkDir; } cfg.settings
+      lib.recursiveUpdate
+        (lib.recursiveUpdate { terminal.cwd = effectiveWorkDir; } cfg.settings)
+        authSettings
     );
     generatedConfigFile = pkgs.writeText "hermes-config.yaml" configJson;
     configFile = if cfg.configFile != null then cfg.configFile else generatedConfigFile;
@@ -62,7 +65,6 @@
     # CLI/TUI without hitting EACCES; otherwise group-read-only (0640). Secrets
     # (.env) stay 0640 regardless — see below.
     configYamlMode = if cfg.addToSystemPackages then "0660" else "0640";
-
     # Generate .env from non-secret environment attrset
     envFileContent = lib.concatStringsSep "\n" (
       lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment
@@ -315,10 +317,22 @@
         '';
       };
 
+      authAuthority = mkOption {
+        type = types.enum [ "shared" "profile" ];
+        default = "shared";
+        description = ''
+          Authoritative auth-store class. The NixOS service uses the default
+          profile, so shared and profile both target stateDir/.hermes/auth.json.
+        '';
+      };
+
       authFileForceOverwrite = mkOption {
         type = types.bool;
         default = false;
-        description = "Always overwrite auth.json from authFile on activation.";
+        description = ''
+          Deprecated compatibility option. Existing auth.json state is always
+          preserved so activation cannot roll back runtime-rotated credentials.
+        '';
       };
 
       # ── Documents ────────────────────────────────────────────────────────
@@ -818,13 +832,12 @@
 
           # Seed auth file if provided
           ${lib.optionalString (cfg.authFile != null) ''
-            ${if cfg.authFileForceOverwrite then ''
-              install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-            '' else ''
-              if [ ! -f ${cfg.stateDir}/.hermes/auth.json ]; then
-                install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-              fi
-            ''}
+            ${pkgs.python3}/bin/python3 ${../scripts/nix_auth_authority.py} \
+              ${lib.escapeShellArg "${cfg.stateDir}/.hermes"} \
+              ${lib.escapeShellArg cfg.authFile} \
+              --uid "$(${pkgs.coreutils}/bin/id -u ${cfg.user})" \
+              --gid "$(${pkgs.coreutils}/bin/id -g ${cfg.group})" \
+              --force ${if cfg.authFileForceOverwrite then "true" else "false"}
           ''}
 
           # Seed .env from Nix-declared environment + environmentFiles.

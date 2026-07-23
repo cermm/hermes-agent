@@ -405,12 +405,14 @@ For platforms requiring OAuth (e.g., Discord), use `authFile` to seed credential
 {
   services.hermes-agent = {
     authFile = config.sops.secrets."hermes/auth.json".path;
-    # authFileForceOverwrite = true;  # overwrite on every activation
   };
 }
 ```
 
-The file is only copied if `auth.json` doesn't already exist (unless `authFileForceOverwrite = true`). Runtime OAuth token refreshes are written to the state directory and preserved across rebuilds.
+The file is seeded only when the configured authentication authority has no
+`auth.json`. Activation resolves the authority first and performs the seed
+under its canonical lock, so runtime OAuth token refreshes are never silently
+overwritten by a later rebuild.
 
 ---
 
@@ -851,7 +853,6 @@ nix build .#checks.x86_64-linux.config-roundtrip    # merge script preserves use
 | `environmentFiles` | `listOf str` | `[]` | Paths to env files with secrets. Merged into `$HERMES_HOME/.env` at activation time |
 | `environment` | `attrsOf str` | `{}` | Non-secret env vars. **Visible in Nix store** — do not put secrets here |
 | `authFile` | `null` or `path` | `null` | OAuth credentials seed. Only copied on first deploy |
-| `authFileForceOverwrite` | `bool` | `false` | Always overwrite `auth.json` from `authFile` on activation |
 
 ### Documents
 

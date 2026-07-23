@@ -261,6 +261,7 @@ class TestCreateProfile:
         (default_home / "memories").mkdir(exist_ok=True)
         (default_home / "memories" / "note.md").write_text("remember this")
         (default_home / "config.yaml").write_text("model: gpt-4")
+        (default_home / "auth.json").write_text('{"providers": {"nous": {"access_token": "secret"}}}')
         # Runtime files that should be stripped
         (default_home / "gateway.pid").write_text("12345")
         (default_home / "gateway_state.json").write_text("{}")
@@ -271,6 +272,7 @@ class TestCreateProfile:
         # Content should be copied
         assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
         assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        assert not (profile_dir / "auth.json").exists()
         # Runtime files should be stripped
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()

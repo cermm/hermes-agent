@@ -385,12 +385,13 @@ hermes-env: |
 {
   services.hermes-agent = {
     authFile = config.sops.secrets."hermes/auth.json".path;
-    # authFileForceOverwrite = true;  # 每次激活时强制覆盖
   };
 }
 ```
 
-仅当 `auth.json` 不存在时才复制该文件（除非 `authFileForceOverwrite = true`）。运行时 OAuth token 刷新会写入状态目录，并在重建后保留。
+仅当配置的身份验证权威位置中不存在 `auth.json` 时，系统才会预置该文件。
+激活过程会先解析权威位置，并在其规范锁保护下完成预置，因此后续重建不会静默覆盖
+运行时刷新的 OAuth token。
 
 ---
 
@@ -803,7 +804,6 @@ nix build .#checks.x86_64-linux.config-roundtrip    # 合并脚本保留用户�
 | `environmentFiles` | `listOf str` | `[]` | 包含密钥的 env 文件路径。激活时合并到 `$HERMES_HOME/.env` |
 | `environment` | `attrsOf str` | `{}` | 非密钥环境变量。**在 Nix store 中可见**——请勿在此放置密钥 |
 | `authFile` | `null` 或 `path` | `null` | OAuth 凭据预置文件。仅在首次部署时复制 |
-| `authFileForceOverwrite` | `bool` | `false` | 每次激活时始终从 `authFile` 覆盖 `auth.json` |
 
 ### 文档
 
