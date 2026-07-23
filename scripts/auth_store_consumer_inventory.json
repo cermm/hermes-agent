@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "consumers": {
+    "agent/credential_pool.py": "non_io_security_guard",
+    "hermes_cli/auth.py": "canonical_authority_owner",
+    "hermes_cli/auth_authority.py": "canonical_authority_owner",
+    "hermes_cli/auth_migration.py": "whole_store_migration_adapter",
+    "hermes_cli/backup.py": "whole_store_backup_restore_adapter",
+    "hermes_cli/profiles.py": "profile_clone_export_adapter",
+    "scripts/docker_auth_authority.py": "whole_store_boot_adapter",
+    "scripts/nix_auth_authority.py": "whole_store_deployment_adapter",
+    "scripts/tool_search_livetest.py": "explicit_credential_copy_harness",
+    "plugins/google_meet/cli.py": "provider_native_store",
+    "docker/hermes-exec-shim.sh": "whole_store_boot_adapter",
+    "docker/stage2-hook.sh": "whole_store_boot_adapter",
+    "nix/nixosModules.nix": "whole_store_deployment_adapter"
+  }
+}

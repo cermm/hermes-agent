@@ -85,6 +85,23 @@ def resolve_auth_authority(hermes_home: str) -> dict[str, Any]:
     else:
         raise ValueError(f"Invalid auth.authority {authority!r}; expected shared or profile")
 
+    bridged = os.environ.get("HERMES_INTERNAL_AUTHORITY_PATH", "").strip()
+    if bridged:
+        bridge_path = Path(bridged).expanduser()
+        if not bridge_path.is_absolute():
+            raise ValueError("HERMES_INTERNAL_AUTHORITY_PATH must be absolute")
+        bridge_path = bridge_path.resolve(strict=False)
+        try:
+            bridge_path.relative_to(root.resolve(strict=False))
+        except ValueError as exc:
+            raise ValueError(
+                "HERMES_INTERNAL_AUTHORITY_PATH must remain inside the Hermes root"
+            ) from exc
+        if bridge_path != path.resolve(strict=False):
+            raise ValueError(
+                "HERMES_INTERNAL_AUTHORITY_PATH does not match the configured auth authority"
+            )
+
     return {
         "authority": authority,
         "requested_authority": requested,
@@ -120,11 +137,17 @@ def _atomic_json_write(auth_path: Path, value: dict[str, Any]) -> None:
 def update_auth_store(
     hermes_home: str | Path,
     updater: Callable[[dict[str, Any]], tuple[str, dict[str, Any] | None]],
+    *,
+    expected_auth_path: str | Path | None = None,
 ) -> str:
     """Lock, reread, and optionally replace the selected canonical auth store."""
     resolved = resolve_auth_authority(str(hermes_home))
     auth_path = Path(resolved["auth_path"])
     lock_path = Path(resolved["lock_path"])
+    if expected_auth_path is not None and auth_path.resolve(strict=False) != Path(
+        expected_auth_path
+    ).resolve(strict=False):
+        raise RuntimeError("auth authority changed before update")
     auth_path.parent.mkdir(parents=True, exist_ok=True)
     lock_flags = os.O_CREAT | os.O_RDWR
     if hasattr(os, "O_NOFOLLOW"):
@@ -133,6 +156,11 @@ def update_auth_store(
     try:
         os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        locked = resolve_auth_authority(str(hermes_home))
+        if Path(locked["auth_path"]).resolve(strict=False) != auth_path.resolve(
+            strict=False
+        ):
+            raise RuntimeError("auth authority changed while waiting for the lock")
         if auth_path.is_symlink():
             raise RuntimeError("refusing symlinked auth destination")
         if not auth_path.is_file():
@@ -170,6 +198,11 @@ def seed_auth_store(hermes_home: str, raw: str) -> str:
     try:
         os.fchmod(lock_fd, 0o600)
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        locked = resolve_auth_authority(hermes_home)
+        if Path(locked["auth_path"]).resolve(strict=False) != auth_path.resolve(
+            strict=False
+        ):
+            raise ValueError("auth authority changed while waiting for the lock")
         if auth_path.is_symlink():
             raise ValueError("refusing symlinked auth bootstrap destination")
         if auth_path.exists():

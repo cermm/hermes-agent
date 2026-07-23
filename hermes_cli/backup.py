@@ -18,11 +18,12 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
 from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
@@ -205,9 +206,178 @@ def _atomic_private_write(path: Path, raw: bytes) -> None:
             staged_path = Path(staged.name)
         os.chmod(staged_path, 0o600)
         os.replace(staged_path, path)
+        directory_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
     finally:
         if staged_path is not None:
             staged_path.unlink(missing_ok=True)
+
+
+_AUTH_RESTORE_TERMINAL_PHASES = frozenset({"committed", "rolled_back", "aborted"})
+
+
+def _restore_identity(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"exists": False}
+    raw = path.read_bytes()
+    return {
+        "exists": True,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+    }
+
+
+def _restore_matches(path: Path, expected: Optional[dict[str, Any]]) -> bool:
+    return expected is not None and _restore_identity(path) == expected
+
+
+def _restore_journals_root() -> Path:
+    return get_default_hermes_root() / "state-snapshots" / "auth-restores"
+
+
+def _write_restore_journal(path: Path, journal: dict[str, Any]) -> None:
+    _atomic_private_write(
+        path, (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+
+def _restore_previous(path: Path, backup: Path, expected: dict[str, Any]) -> None:
+    if expected.get("exists"):
+        if not backup.is_file():
+            raise RuntimeError(f"auth restore backup is missing: {backup}")
+        _atomic_private_write(path, backup.read_bytes())
+    else:
+        path.unlink(missing_ok=True)
+        directory_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    if not _restore_matches(path, expected):
+        raise RuntimeError(f"auth restore rollback verification failed: {path.name}")
+
+
+def _recover_auth_restore_journal(journal_path: Path) -> str:
+    from hermes_cli.auth import _auth_transition_lock
+
+    with _auth_transition_lock():
+        return _recover_auth_restore_journal_locked(journal_path)
+
+
+def _recover_auth_restore_journal_locked(journal_path: Path) -> str:
+    from hermes_cli.auth import _auth_store_locks
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    phase = str(journal.get("phase") or "unknown")
+    if phase in _AUTH_RESTORE_TERMINAL_PHASES:
+        return phase
+
+    root = get_default_hermes_root().resolve(strict=False)
+    auth_target = Path(journal["auth_target"]).resolve(strict=False)
+    config_path = Path(journal["config_path"]).resolve(strict=False)
+    for path in (auth_target, config_path):
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError("auth restore journal target escapes Hermes root") from exc
+
+    current_dir = Path(journal["current_dir"]).resolve(strict=False)
+    try:
+        current_dir.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("auth restore backup path escapes Hermes root") from exc
+
+    old_auth = journal["preconditions"]["auth"]
+    old_config = journal["preconditions"]["config"]
+    new_auth = journal["postconditions"]["auth"]
+    new_config = journal["postconditions"]["config"]
+    lock_paths = sorted(
+        {auth_target, config_path},
+        key=lambda path: os.fsencode(str(path.resolve(strict=False))),
+    )
+
+    with _auth_store_locks(lock_paths, transaction_target=auth_target):
+        auth_is_old = _restore_matches(auth_target, old_auth)
+        auth_is_new = _restore_matches(auth_target, new_auth)
+        config_is_old = _restore_matches(config_path, old_config)
+        config_is_new = _restore_matches(config_path, new_config)
+
+        if phase in {"planned", "backed_up"} and auth_is_old and config_is_old:
+            journal["phase"] = "aborted"
+            journal["aborted_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            return "aborted"
+
+        if auth_is_new and config_is_new:
+            journal["phase"] = "committed"
+            journal["committed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            return "committed"
+
+        if not (auth_is_old or auth_is_new) or not (config_is_old or config_is_new):
+            journal["phase"] = "manual_required"
+            journal["reason"] = "restore_state_changed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise RuntimeError(
+                "auth restore state changed after interruption; manual recovery required"
+            )
+
+        backup_identities = journal.get("backup_identities") or {}
+        backup_paths = {
+            "auth": current_dir / "auth.json",
+            "config": current_dir / "config.yaml",
+        }
+        invalid_backups = [
+            name
+            for name, backup_path in backup_paths.items()
+            if not _restore_matches(backup_path, backup_identities.get(name))
+        ]
+        if invalid_backups:
+            journal["phase"] = "manual_required"
+            journal["reason"] = "backup_verification_failed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise RuntimeError(
+                "auth restore backup verification failed: "
+                + ", ".join(invalid_backups)
+            )
+
+        try:
+            _restore_previous(auth_target, backup_paths["auth"], old_auth)
+            _restore_previous(config_path, backup_paths["config"], old_config)
+        except Exception:
+            journal["phase"] = "manual_required"
+            journal["reason"] = "rollback_verification_failed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise
+
+        journal["phase"] = (
+            "aborted" if phase in {"planned", "backed_up"} else "rolled_back"
+        )
+        journal[f"{journal['phase']}_at"] = datetime.now(timezone.utc).isoformat()
+        _write_restore_journal(journal_path, journal)
+        return str(journal["phase"])
+
+
+def _recover_incomplete_auth_restores() -> list[str]:
+    journals_dir = _restore_journals_root() / "journals"
+    if not journals_dir.is_dir():
+        return []
+    results: list[str] = []
+    for journal_path in sorted(journals_dir.glob("*.json")):
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        if journal.get("phase") not in _AUTH_RESTORE_TERMINAL_PHASES:
+            results.append(_recover_auth_restore_journal(journal_path))
+    return results
 
 
 def _restore_auth_transactionally(
@@ -215,31 +385,62 @@ def _restore_auth_transactionally(
     auth_action: str,
     *,
     config_home: Optional[Path] = None,
+    restored_config_raw: Optional[bytes] = None,
+    failure_injector: Optional[Callable[[str], None]] = None,
 ) -> None:
-    """Commit authority bytes and topology config under locks, or roll back."""
+    from hermes_cli.auth import _auth_transition_lock
+
+    with _auth_transition_lock():
+        _restore_auth_transaction_locked(
+            raw,
+            auth_action,
+            config_home=config_home,
+            restored_config_raw=restored_config_raw,
+            failure_injector=failure_injector,
+        )
+
+
+def _restore_auth_transaction_locked(
+    raw: bytes,
+    auth_action: str,
+    *,
+    config_home: Optional[Path] = None,
+    restored_config_raw: Optional[bytes] = None,
+    failure_injector: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Durably commit auth plus topology config, recovering interrupted restores."""
     import yaml
     from hermes_cli.auth import _auth_store_locks
 
     if auth_action not in {"restore-shared", "restore-profile"}:
         raise ValueError(f"unsupported auth restore action: {auth_action}")
+    decoded = json.loads(raw.decode("utf-8"))
+    if not isinstance(decoded, dict):
+        raise ValueError("restored auth payload must be a JSON object")
 
-    home = config_home or get_hermes_home()
+    _recover_incomplete_auth_restores()
+    home = Path(config_home or get_hermes_home()).resolve(strict=False)
     authority = "shared" if auth_action == "restore-shared" else "profile"
     auth_target = (
         get_default_hermes_root() / "auth.json"
         if authority == "shared"
         else home / "auth.json"
-    )
+    ).resolve(strict=False)
     config_path = home / "config.yaml"
-    lock_paths = sorted({auth_target, config_path}, key=lambda path: str(path))
+    lock_paths = sorted(
+        {auth_target, config_path},
+        key=lambda path: os.fsencode(str(path.resolve(strict=False))),
+    )
 
     with _auth_store_locks(lock_paths, transaction_target=auth_target):
-
         old_auth = auth_target.read_bytes() if auth_target.exists() else None
         old_config = config_path.read_bytes() if config_path.exists() else None
         config: dict[str, Any] = {}
-        if old_config is not None:
-            loaded = yaml.safe_load(old_config.decode("utf-8")) or {}
+        config_source = (
+            restored_config_raw if restored_config_raw is not None else old_config
+        )
+        if config_source is not None:
+            loaded = yaml.safe_load(config_source.decode("utf-8")) or {}
             if not isinstance(loaded, dict):
                 raise ValueError("config.yaml must contain a YAML mapping")
             config = loaded
@@ -252,24 +453,94 @@ def _restore_auth_transactionally(
             config, sort_keys=False, default_flow_style=False
         ).encode("utf-8")
 
-        auth_attempted = False
-        config_attempted = False
+        operation_id = uuid.uuid4().hex
+        restore_root = _restore_journals_root()
+        current_dir = restore_root / "current-store" / operation_id
+        current_dir.mkdir(parents=True, mode=0o700)
+        current_dir.chmod(0o700)
+        journal_path = restore_root / "journals" / f"{operation_id}.json"
+        journal = {
+            "version": 1,
+            "operation_id": operation_id,
+            "phase": "planned",
+            "auth_action": auth_action,
+            "auth_target": str(auth_target),
+            "config_path": str(config_path),
+            "current_dir": str(current_dir),
+            "preconditions": {
+                "auth": _restore_identity(auth_target),
+                "config": _restore_identity(config_path),
+            },
+            "postconditions": {
+                "auth": {
+                    "exists": True,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size": len(raw),
+                },
+                "config": {
+                    "exists": True,
+                    "sha256": hashlib.sha256(config_raw).hexdigest(),
+                    "size": len(config_raw),
+                },
+            },
+        }
+        _write_restore_journal(journal_path, journal)
+        if failure_injector:
+            failure_injector("planned")
+
+        if old_auth is not None:
+            _atomic_private_write(current_dir / "auth.json", old_auth)
+        if old_config is not None:
+            _atomic_private_write(current_dir / "config.yaml", old_config)
+        journal["phase"] = "backed_up"
+        journal["backup_identities"] = {
+            "auth": _restore_identity(current_dir / "auth.json"),
+            "config": _restore_identity(current_dir / "config.yaml"),
+        }
+        _write_restore_journal(journal_path, journal)
+        if failure_injector:
+            failure_injector("backed_up")
+
         try:
-            auth_attempted = True
+            journal["phase"] = "auth_write_pending"
+            _write_restore_journal(journal_path, journal)
+            if failure_injector:
+                failure_injector("auth_write_pending")
             _atomic_private_write(auth_target, raw)
-            config_attempted = True
+            if failure_injector:
+                failure_injector("auth_written")
+            journal["phase"] = "auth_written"
+            _write_restore_journal(journal_path, journal)
+
+            journal["phase"] = "config_write_pending"
+            _write_restore_journal(journal_path, journal)
+            if failure_injector:
+                failure_injector("config_write_pending")
             _atomic_private_write(config_path, config_raw)
+            if failure_injector:
+                failure_injector("config_written")
+            journal["phase"] = "config_written"
+            _write_restore_journal(journal_path, journal)
+
+            if not _restore_matches(auth_target, journal["postconditions"]["auth"]):
+                raise RuntimeError("restored auth postcondition verification failed")
+            if not _restore_matches(config_path, journal["postconditions"]["config"]):
+                raise RuntimeError("restored config postcondition verification failed")
+            journal["phase"] = "committed"
+            journal["committed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
         except Exception:
-            if config_attempted:
-                if old_config is None:
-                    config_path.unlink(missing_ok=True)
-                else:
-                    _atomic_private_write(config_path, old_config)
-            if auth_attempted:
-                if old_auth is None:
-                    auth_target.unlink(missing_ok=True)
-                else:
-                    _atomic_private_write(auth_target, old_auth)
+            _restore_previous(
+                auth_target, current_dir / "auth.json", journal["preconditions"]["auth"]
+            )
+            _restore_previous(
+                config_path,
+                current_dir / "config.yaml",
+                journal["preconditions"]["config"],
+            )
+            journal["phase"] = "rolled_back"
+            journal["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
             raise
 
 
@@ -304,6 +575,7 @@ def _assert_auth_restore_quiescent(home: Path, auth_action: str) -> None:
             profile_home=candidate,
             shared_root=root,
             enforce_migration=False,
+            enforce_restore=False,
         )
         if authority.auth_path.resolve(strict=False) != target:
             continue
@@ -860,6 +1132,7 @@ def run_import(args) -> None:
         errors = []
         restored = 0
         restored_external = 0
+        restored_config_raw: Optional[bytes] = None
         skipped_runtime: list[str] = []
         home_dir = Path.home().resolve()
         t0 = time.monotonic()
@@ -922,6 +1195,7 @@ def run_import(args) -> None:
                 except ValueError:
                     active_config_rel = "config.yaml"
                 if rel == active_config_rel:
+                    restored_config_raw = zf.read(member)
                     continue
 
             # Never overwrite volatile gateway/process runtime state. These are
@@ -964,6 +1238,7 @@ def run_import(args) -> None:
                     restored_auth_raw,
                     auth_action,
                     config_home=get_hermes_home(),
+                    restored_config_raw=restored_config_raw,
                 )
             except Exception as exc:
                 print(f"Error: transactional auth restore failed: {exc}")
@@ -1384,6 +1659,7 @@ def restore_quick_snapshot(
             return False
 
     restored = 0
+    restored_config_raw: Optional[bytes] = None
     for rel in meta.get("files", {}):
         if rel.startswith(("_auth_authority/", "_auth/")):
             continue
@@ -1405,6 +1681,10 @@ def restore_quick_snapshot(
         if not src.exists():
             continue
 
+        if auth_restore_raw is not None and rel == "config.yaml":
+            restored_config_raw = src.read_bytes()
+            continue
+
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -1423,11 +1703,15 @@ def restore_quick_snapshot(
     if auth_restore_raw is not None:
         try:
             _restore_auth_transactionally(
-                auth_restore_raw, auth_action, config_home=home
+                auth_restore_raw,
+                auth_action,
+                config_home=home,
+                restored_config_raw=restored_config_raw,
             )
             restored += 1
         except (OSError, PermissionError, RuntimeError, ValueError) as exc:
             logger.error("Failed to restore auth authority: %s", exc)
+            return False
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0

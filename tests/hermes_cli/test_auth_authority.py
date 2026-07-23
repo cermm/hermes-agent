@@ -178,3 +178,25 @@ def test_auth_status_all_profiles_reports_redacted_topology(profile_layout, caps
     assert "coder: mode=shared" in output
     assert "isolated: mode=profile" in output
     assert secret not in output
+
+
+def test_incomplete_restore_skips_unstatable_journal_candidate(profile_layout):
+    from hermes_cli.auth_authority import incomplete_auth_restore
+
+    journals = (
+        profile_layout["root"]
+        / "state-snapshots"
+        / "auth-restores"
+        / "journals"
+    )
+    journals.mkdir(parents=True)
+    (journals / "valid.json").write_text(
+        json.dumps({"operation_id": "valid-operation", "phase": "auth_written"}),
+        encoding="utf-8",
+    )
+    (journals / "dangling.json").symlink_to(journals / "missing-target")
+
+    assert incomplete_auth_restore(profile_layout["root"]) == {
+        "operation_id": "valid-operation",
+        "phase": "auth_written",
+    }

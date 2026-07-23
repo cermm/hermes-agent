@@ -65,6 +65,27 @@ def resolve_auth_authority(home: Path) -> dict[str, Any]:
     }
 
 
+def _verify_private_file(
+    path: Path,
+    *,
+    label: str,
+    uid: int | None,
+    gid: int | None,
+) -> None:
+    try:
+        metadata = path.stat(follow_symlinks=False)
+    except OSError as exc:
+        raise RuntimeError(f"cannot verify {label}: {exc}") from exc
+    if not stat.S_ISREG(metadata.st_mode):
+        raise RuntimeError(f"{label} must be a regular file")
+    if stat.S_IMODE(metadata.st_mode) != 0o600:
+        raise RuntimeError(f"{label} must have mode 0600")
+    if uid is not None and metadata.st_uid != uid:
+        raise RuntimeError(f"{label} is not owned by runtime uid {uid}")
+    if gid is not None and metadata.st_gid != gid:
+        raise RuntimeError(f"{label} is not owned by runtime gid {gid}")
+
+
 def seed_auth(
     home: Path,
     source: Path,
@@ -77,6 +98,8 @@ def seed_auth(
     if source.is_symlink():
         raise RuntimeError("auth seed source must not be a symlink")
     source = source.resolve(strict=True)
+    if not source.is_file():
+        raise RuntimeError("auth seed source must be a regular file")
     authority = resolve_auth_authority(home)
     destination = authority["auth_path"]
     lock_path = authority["lock_path"]
@@ -95,6 +118,8 @@ def seed_auth(
         fcntl.flock(lock_fd, fcntl.LOCK_EX)
         if destination.is_symlink():
             raise RuntimeError("refusing symlinked auth seed destination")
+        if destination.exists() and not destination.is_file():
+            raise RuntimeError("auth seed destination must be a regular file")
         existed = destination.is_file()
         if existed:
             status = "preserved"
@@ -127,6 +152,18 @@ def seed_auth(
             finally:
                 tmp_path.unlink(missing_ok=True)
             status = "created"
+        _verify_private_file(
+            destination, label="auth seed destination", uid=uid, gid=gid
+        )
+        lock_stat = os.fstat(lock_fd)
+        if not stat.S_ISREG(lock_stat.st_mode):
+            raise RuntimeError("auth seed lock must be a regular file")
+        if stat.S_IMODE(lock_stat.st_mode) != 0o600:
+            raise RuntimeError("auth seed lock must have mode 0600")
+        if uid is not None and lock_stat.st_uid != uid:
+            raise RuntimeError(f"auth seed lock is not owned by runtime uid {uid}")
+        if gid is not None and lock_stat.st_gid != gid:
+            raise RuntimeError(f"auth seed lock is not owned by runtime gid {gid}")
     finally:
         fcntl.flock(lock_fd, fcntl.LOCK_UN)
         os.close(lock_fd)

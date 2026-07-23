@@ -414,6 +414,14 @@ The file is seeded only when the configured authentication authority has no
 under its canonical lock, so runtime OAuth token refreshes are never silently
 overwritten by a later rebuild.
 
+The deprecated `authFileForceOverwrite` option is fail-closed. Remove it from
+your Nix configuration. To change authority topology, use `hermes auth
+migrate-shared`; to replace credentials from a backup, use the explicit
+encrypted restore flow. A rebuild must never overwrite a refresh token that
+Hermes rotated at runtime. Activation also verifies the final target and
+persistent lock are regular mode-0600 files owned by the configured service
+user and group before reporting success.
+
 ---
 
 ## Documents
@@ -853,6 +861,7 @@ nix build .#checks.x86_64-linux.config-roundtrip    # merge script preserves use
 | `environmentFiles` | `listOf str` | `[]` | Paths to env files with secrets. Merged into `$HERMES_HOME/.env` at activation time |
 | `environment` | `attrsOf str` | `{}` | Non-secret env vars. **Visible in Nix store** — do not put secrets here |
 | `authFile` | `null` or `path` | `null` | OAuth credentials seed. Only copied on first deploy |
+| `authFileForceOverwrite` | deprecated | `false` | Rejected when enabled. Remove it and use the reviewed migration or encrypted restore workflow. |
 
 ### Documents
 

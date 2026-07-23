@@ -422,8 +422,19 @@ def test_recovery_after_backup_only_preserves_later_writes(migration_home):
         root / "auth.json", {"providers": {"openai-codex": {"token": "later"}}}
     )
 
-    assert migration.recover_shared_migration(plan_id=plan.plan_id) == "rolled_back"
+    assert migration.recover_shared_migration(plan_id=plan.plan_id) == "aborted"
     assert (root / "auth.json").read_bytes() == changed
+    journal = json.loads(
+        (
+            root
+            / "state-snapshots"
+            / "auth-migrations"
+            / "journals"
+            / f"{plan.plan_id}.json"
+        ).read_text()
+    )
+    assert journal["phase"] == "aborted"
+    assert journal["reason"] == "external_change_after_backup"
 
 
 def test_concurrent_source_write_is_not_lost_and_invalidates_plan(migration_home):

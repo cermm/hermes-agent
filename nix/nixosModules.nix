@@ -320,6 +320,15 @@
         '';
       };
 
+      authFileForceOverwrite = mkOption {
+        type = types.bool;
+        default = false;
+        description = ''
+          Deprecated unsafe compatibility option. Setting this to true is
+          rejected; live auth stores are never overwritten during activation.
+        '';
+      };
+
       authAuthority = mkOption {
         type = types.enum [ "shared" "profile" ];
         default = "shared";
@@ -685,10 +694,16 @@
       {
         assertions = let
           names = map lib.getName cfg.extraPlugins;
-        in [{
-          assertion = (lib.length names) == (lib.length (lib.unique names));
-          message = "services.hermes-agent.extraPlugins: duplicate plugin names detected: ${toString names}. If using fetchFromGitHub, set name = \"plugin-name\" to disambiguate.";
-        }];
+        in [
+          {
+            assertion = (lib.length names) == (lib.length (lib.unique names));
+            message = "services.hermes-agent.extraPlugins: duplicate plugin names detected: ${toString names}. If using fetchFromGitHub, set name = \"plugin-name\" to disambiguate.";
+          }
+          {
+            assertion = !cfg.authFileForceOverwrite;
+            message = "services.hermes-agent.authFileForceOverwrite=true is no longer supported because activation must not overwrite a live credential store. Preserve the current store and use `hermes auth migrate-shared` or an explicit encrypted backup restore instead.";
+          }
+        ];
       }
 
       # ── Warnings ──────────────────────────────────────────────────────

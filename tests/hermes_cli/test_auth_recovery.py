@@ -25,11 +25,17 @@ def test_auth_migrate_recover_command_dispatches(monkeypatch) -> None:
 
 
 @pytest.mark.parametrize(
-    "failure_phase",
-    ["planned", "locked", "backed_up", "target_written", "profiles_configured"],
+    ("failure_phase", "expected_result"),
+    [
+        ("planned", "aborted"),
+        ("locked", "aborted"),
+        ("backed_up", "aborted"),
+        ("target_written", "rolled_back"),
+        ("profiles_configured", "rolled_back"),
+    ],
 )
 def test_failure_after_every_journal_phase_blocks_until_recovery(
-    tmp_path: Path, monkeypatch, failure_phase: str
+    tmp_path: Path, monkeypatch, failure_phase: str, expected_result: str
 ) -> None:
     from hermes_cli.auth_authority import AuthAuthorityConfigError, get_auth_store_path
     from hermes_cli.auth_migration import (
@@ -64,7 +70,7 @@ def test_failure_after_every_journal_phase_blocks_until_recovery(
     with pytest.raises(AuthAuthorityConfigError, match=plan.plan_id):
         get_auth_store_path()
 
-    assert recover_shared_migration(plan_id=plan.plan_id) == "rolled_back"
+    assert recover_shared_migration(plan_id=plan.plan_id) == expected_result
     assert (root / "auth.json").read_bytes() == shared_raw
     assert (profile / "auth.json").read_bytes() == profile_raw
     assert not (profile / "config.yaml").exists()

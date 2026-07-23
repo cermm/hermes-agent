@@ -10,9 +10,15 @@ const docs = [
   "i18n/zh-Hans/docusaurus-plugin-content-docs/current/getting-started/nix-setup.md",
   "docs/guides/auth-authority.md",
   "i18n/zh-Hans/docusaurus-plugin-content-docs/current/guides/auth-authority.md",
+  "docs/user-guide/profiles.md",
+  "i18n/zh-Hans/docusaurus-plugin-content-docs/current/user-guide/profiles.md",
+  "docs/reference/profile-commands.md",
+  "i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/profile-commands.md",
+  "docs/reference/slash-commands.md",
+  "i18n/zh-Hans/docusaurus-plugin-content-docs/current/reference/slash-commands.md",
 ];
 
-const authorityGuides = docs.slice(2);
+const authorityGuides = docs.slice(2, 4);
 const requiredContracts = [
   "auth.authority",
   "hermes auth migrate-shared --profile coder --dry-run",
@@ -30,9 +36,18 @@ const requiredContracts = [
   "tools.xai_http",
 ];
 
+const surfaceContracts = new Map([
+  [docs[4], ["auth.authority: shared", "--auth-mode profile", "hermes auth migrate-shared"]],
+  [docs[5], ["auth.authority: shared", "--auth-mode profile", "hermes auth migrate-shared"]],
+  [docs[6], ["--auth-mode <shared\\|profile>", "hermes auth status", "hermes auth migrate-shared"]],
+  [docs[7], ["--auth-mode <shared\\|profile>", "hermes auth status", "hermes auth migrate-shared"]],
+  [docs[8], ["Plain `restore <id>` always skips auth", "--include-auth", "--auth-action restore-shared\\|restore-profile"]],
+  [docs[9], ["普通 `restore <id>` 始终跳过认证数据", "--include-auth", "--auth-action restore-shared\\|restore-profile"]],
+]);
+
 const forbidden = [
   {
-    pattern: /authFileForceOverwrite/g,
+    pattern: /authFileForceOverwrite\s*=\s*true/g,
     reason: "docs must not recommend repeated OAuth credential overwrite",
   },
   {
@@ -57,6 +72,15 @@ for (const relativePath of authorityGuides) {
   for (const contract of requiredContracts) {
     if (!text.includes(contract)) {
       errors.push(`${relativePath}: missing authority contract: ${contract}`);
+    }
+  }
+}
+
+for (const [relativePath, contracts] of surfaceContracts) {
+  const text = readFileSync(resolve(websiteDir, relativePath), "utf8");
+  for (const contract of contracts) {
+    if (!text.includes(contract)) {
+      errors.push(`${relativePath}: missing surface contract: ${contract}`);
     }
   }
 }

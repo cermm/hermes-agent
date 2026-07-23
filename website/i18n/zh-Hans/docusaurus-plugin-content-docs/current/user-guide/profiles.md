@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Profiles：运行多个 Agent
 
-在同一台机器上运行多个独立的 Hermes agent——每个 agent 拥有各自的配置、API 密钥、记忆、会话、技能和 gateway 状态。
+在同一台机器上运行多个隔离的 Hermes agent。配置、记忆、会话、技能、cron、gateway 状态和平台凭据仍按 profile 隔离；除非显式选择本地认证存储，否则 Hermes OAuth 凭据使用默认根目录中的共享权威存储。
 
 ## 什么是 profile？
 
@@ -20,7 +20,19 @@ coder setup                       # 配置 API 密钥和模型
 coder chat                        # 开始对话
 ```
 
-就这些。`coder` 现在是拥有独立配置、记忆和状态的 Hermes profile。
+就这些。`coder` 现在拥有独立的配置、记忆和状态。其 `config.yaml` 显式设置 `auth.authority: shared`，因此可以复用提供商 OAuth 登录，而不会合并任何其他 profile 状态。
+
+### 认证权威存储
+
+新 profile 使用 `~/.hermes/auth.json` 作为规范共享存储。共享的仅是 Hermes 提供商凭据；profile 配置、记忆、会话、技能、cron 任务、gateway 状态、消息平台 token 和项目文件都不会合并。
+
+仅在确实需要凭据隔离时使用 profile 本地存储：
+
+```bash
+hermes profile create regulated --auth-mode profile
+```
+
+该命令写入 `auth.authority: profile`，并使用 `~/.hermes/profiles/regulated/auth.json`。对于已有且本地存储状态不明确的 profile，应使用经过检查的 `hermes auth migrate-shared` 流程，不要手工复制或删除 `auth.json`。详见[认证权威存储](/guides/auth-authority)。
 
 ## 创建 profile
 
@@ -46,7 +58,7 @@ hermes profile create researcher --description "Reads source code and external d
 hermes profile create work --clone
 ```
 
-将当前 profile 的 `config.yaml`、`.env`、`SOUL.md` 和 skills 复制到新 profile。API 密钥、模型和能力相同，但会话和记忆是全新的。编辑 `~/.hermes/profiles/work/.env` 可使用不同的 API 密钥，编辑 `~/.hermes/profiles/work/SOUL.md` 可设置不同的人格。
+将当前 profile 的 `config.yaml`、`.env`、`SOUL.md` 和 skills 复制到新 profile。`.env` 中的静态 API 密钥、模型设置和能力会被复制，但默认共享模式不会复制 OAuth `auth.json`。会话和记忆从空白开始。编辑 `~/.hermes/profiles/work/.env` 可使用不同的静态 API 密钥，编辑 `~/.hermes/profiles/work/SOUL.md` 可设置不同的人格。
 
 ### 克隆全部内容（`--clone-all`）
 
@@ -54,7 +66,7 @@ hermes profile create work --clone
 hermes profile create backup --clone-all
 ```
 
-复制**所有内容**——配置、API 密钥、人格、记忆、技能、cron 任务、插件。会排除每个 profile 自己的历史数据（会话历史、`state.db`、`backups/`、`state-snapshots/`、`checkpoints/`），这些数据属于源 profile 且可能达到数十 GB。若要包含历史的完整备份，请使用 `hermes profile export` 或 `hermes backup`。
+复制配置、`.env` API 密钥、人格、记忆、技能、cron 任务和插件。默认共享模式仍不会复制规范 OAuth `auth.json`。会排除每个 profile 自己的历史数据（会话历史、`state.db`、`backups/`、`state-snapshots/`、`checkpoints/`），这些数据属于源 profile 且可能达到数十 GB。若需包含加密认证数据并感知权威拓扑的备份，请使用 `hermes backup --auth-mode include-encrypted`。
 
 ### 从指定 profile 克隆
 

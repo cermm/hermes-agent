@@ -571,7 +571,7 @@ def recover_shared_migration(*, plan_id: str) -> str:
         raise AuthMigrationError("Migration journal was not found")
     journal = _read_json_object(journal_path)
     phase = journal.get("phase")
-    if phase in {"rolled_back", "aborted"}:
+    if phase in {"rolled_back", "aborted", "committed_state_changed"}:
         return str(phase)
     if phase == "manual_required":
         phase = journal.get("resume_phase")
@@ -612,23 +612,42 @@ def recover_shared_migration(*, plan_id: str) -> str:
                 for home in homes
             )
             if not committed_ok:
-                require_manual("committed_state_changed")
+                journal["phase"] = "committed_state_changed"
+                journal["reason"] = "committed_state_changed"
+                journal["committed_state_changed_at"] = datetime.now(
+                    timezone.utc
+                ).isoformat()
+                _private_json_write(journal_path, journal)
+                return "committed_state_changed"
             return "committed"
 
-        if phase in {"planned", "locked", "backed_up"}:
+        if phase in {"planned", "locked"}:
             changed = any(
                 not _matches_identity(Path(raw_path), expected)
                 for raw_path, expected in preconditions.items()
             )
             journal["phase"] = "aborted"
             journal["reason"] = (
-                "external_change_after_backup" if changed else "interrupted_before_mutation"
+                "precondition_changed" if changed else "interrupted_before_mutation"
             )
             journal["aborted_at"] = datetime.now(timezone.utc).isoformat()
             _private_json_write(journal_path, journal)
-            # Preserve the historical command result while the durable journal
-            # distinguishes a no-mutation abort from an actual rollback.
-            return "rolled_back"
+            return "aborted"
+
+        if phase == "backed_up":
+            changed = any(
+                not _matches_identity(Path(raw_path), expected)
+                for raw_path, expected in preconditions.items()
+            )
+            journal["phase"] = "aborted"
+            journal["reason"] = (
+                "external_change_after_backup"
+                if changed
+                else "interrupted_before_mutation"
+            )
+            journal["aborted_at"] = datetime.now(timezone.utc).isoformat()
+            _private_json_write(journal_path, journal)
+            return "aborted"
 
         target_is_migration = _matches_identity(
             target, journal.get("target_written_postcondition")

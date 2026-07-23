@@ -91,6 +91,46 @@ def test_gateway_quiescence_uses_runtime_status_when_pid_artifacts_are_missing(
         )
 
 
+@pytest.mark.parametrize("failure_phase", ["planned", "locked", "backed_up"])
+def test_recovery_aborts_pre_mutation_phases_without_claiming_rollback(
+    migration_home, failure_phase: str
+) -> None:
+    import hermes_cli.auth_migration as migration
+
+    root, profile = migration_home
+    original_shared = _write(
+        root / "auth.json", {"providers": {"openai-codex": {"token": "shared"}}}
+    )
+    _write(profile / "auth.json", {"providers": {"nous": {"token": "profile"}}})
+    plan = migration.plan_shared_migration(profile="coder")
+
+    def fail(phase: str) -> None:
+        if phase == failure_phase:
+            raise RuntimeError(f"injected at {phase}")
+
+    with pytest.raises(RuntimeError, match="injected"):
+        migration.apply_shared_migration(
+            plan_id=plan.plan_id,
+            plan_digest=plan.plan_digest,
+            conflict_policy="abort",
+            failure_injector=fail,
+        )
+
+    assert migration.recover_shared_migration(plan_id=plan.plan_id) == "aborted"
+    assert (root / "auth.json").read_bytes() == original_shared
+    journal = json.loads(
+        (
+            root
+            / "state-snapshots"
+            / "auth-migrations"
+            / "journals"
+            / f"{plan.plan_id}.json"
+        ).read_text()
+    )
+    assert journal["phase"] == "aborted"
+    assert journal["reason"] == "interrupted_before_mutation"
+
+
 @pytest.mark.parametrize("failure_phase", ["target_write_pending", "profile_written"])
 def test_recovery_covers_mutation_journal_windows(
     migration_home, failure_phase: str
@@ -169,8 +209,10 @@ def test_recovery_detects_changed_committed_state(migration_home) -> None:
     )
     changed = _write(root / "auth.json", {"providers": {"nous": {"token": "later"}}})
 
-    with pytest.raises(migration.AuthMigrationError, match="changed after interruption"):
+    assert (
         migration.recover_shared_migration(plan_id=plan.plan_id)
+        == "committed_state_changed"
+    )
     assert (root / "auth.json").read_bytes() == changed
     journal = json.loads(
         (
@@ -181,8 +223,16 @@ def test_recovery_detects_changed_committed_state(migration_home) -> None:
             / f"{plan.plan_id}.json"
         ).read_text()
     )
-    assert journal["phase"] == "manual_required"
+    assert journal["phase"] == "committed_state_changed"
     assert journal["reason"] == "committed_state_changed"
+    assert (
+        migration.recover_shared_migration(plan_id=plan.plan_id)
+        == "committed_state_changed"
+    )
+    from hermes_cli.auth_authority import resolve_auth_authority
+
+    resolved = resolve_auth_authority(profile_home=profile, shared_root=root)
+    assert resolved.effective_mode == "shared"
 
 
 def test_manifest_records_each_artifact_with_stable_profile_identity(

@@ -177,7 +177,11 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
         providers["nous"] = seed_nous
         return ("reseeded" if terminal else "reseeded_newer"), store
 
-    return update_auth_store(Path(auth_path).parent, update)
+    return update_auth_store(
+        Path(auth_path).parent,
+        update,
+        expected_auth_path=auth_path,
+    )
 
 
 def reseed_profile_if_terminal(profile_home: Path, seed_raw: str) -> str:

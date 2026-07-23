@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import os
 from pathlib import Path
+import threading
 from types import SimpleNamespace
 import zipfile
 
@@ -52,6 +53,9 @@ def test_full_backup_encrypts_and_restores_to_explicit_authority(backup_home):
 
     passphrase = backup_home.parent / "passphrase"
     passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "config.yaml").write_text(
+        "auth:\n  authority: shared\nmarker: archived\n", encoding="utf-8"
+    )
     run_backup(
         _backup_args(
             backup_home,
@@ -66,6 +70,9 @@ def test_full_backup_encrypts_and_restores_to_explicit_authority(backup_home):
         assert b"super-secret" not in zf.read("_auth/authority.enc")
 
     (backup_home / "auth.json").write_text('{"providers":{}}', encoding="utf-8")
+    (backup_home / "config.yaml").write_text(
+        "auth:\n  authority: shared\nmarker: destination\n", encoding="utf-8"
+    )
     run_import(
         SimpleNamespace(
             zipfile=str(archive),
@@ -78,6 +85,7 @@ def test_full_backup_encrypts_and_restores_to_explicit_authority(backup_home):
     restored = json.loads((backup_home / "auth.json").read_text())
     assert restored["providers"]["nous"]["access_token"] == "super-secret"
     assert (backup_home / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert "marker: archived" in (backup_home / "config.yaml").read_text()
 
 
 def test_pre_update_backup_excludes_all_auth_stores(backup_home):
@@ -187,6 +195,100 @@ def test_auth_restore_rolls_back_target_when_config_commit_fails(
     assert (backup_home / "config.yaml").read_bytes() == old_config
 
 
+@pytest.mark.parametrize("failure_phase", ["planned", "backed_up", "auth_written"])
+def test_auth_restore_journal_recovers_interrupted_restore_by_rollback(
+    backup_home, failure_phase: str
+):
+    import hermes_cli.backup as backup_mod
+    from hermes_cli.auth_authority import AuthAuthorityConfigError, resolve_auth_authority
+
+    old_auth = (backup_home / "auth.json").read_bytes()
+    old_config = (backup_home / "config.yaml").read_bytes()
+    restored_auth = b'{"providers":{"restored":{"token":"new"}}}'
+
+    def crash(phase: str) -> None:
+        if phase == failure_phase:
+            raise SystemExit(f"crashed at {phase}")
+
+    with pytest.raises(SystemExit, match="crashed"):
+        backup_mod._restore_auth_transactionally(
+            restored_auth,
+            "restore-profile",
+            config_home=backup_home,
+            failure_injector=crash,
+        )
+
+    with pytest.raises(AuthAuthorityConfigError, match="incomplete restore"):
+        resolve_auth_authority(profile_home=backup_home, shared_root=backup_home)
+
+    expected = "aborted" if failure_phase in {"planned", "backed_up"} else "rolled_back"
+    assert backup_mod._recover_incomplete_auth_restores() == [expected]
+    assert (backup_home / "auth.json").read_bytes() == old_auth
+    assert (backup_home / "config.yaml").read_bytes() == old_config
+    resolve_auth_authority(profile_home=backup_home, shared_root=backup_home)
+
+
+def test_auth_restore_journal_commits_forward_after_both_writes_land(backup_home):
+    import hermes_cli.backup as backup_mod
+
+    restored_auth = b'{"providers":{"restored":{"token":"new"}}}'
+
+    def crash(phase: str) -> None:
+        if phase == "config_written":
+            raise SystemExit("crashed after config write")
+
+    with pytest.raises(SystemExit, match="config write"):
+        backup_mod._restore_auth_transactionally(
+            restored_auth,
+            "restore-profile",
+            config_home=backup_home,
+            failure_injector=crash,
+        )
+
+    assert backup_mod._recover_incomplete_auth_restores() == ["committed"]
+    assert (backup_home / "auth.json").read_bytes() == restored_auth
+    assert "authority: profile" in (backup_home / "config.yaml").read_text()
+    journal_path = next(
+        (backup_home / "state-snapshots" / "auth-restores" / "journals").glob(
+            "*.json"
+        )
+    )
+    assert json.loads(journal_path.read_text())["phase"] == "committed"
+
+
+def test_auth_restore_recovery_preserves_unrecognized_external_change(backup_home):
+    import hermes_cli.backup as backup_mod
+
+    restored_auth = b'{"providers":{"restored":{"token":"new"}}}'
+
+    def crash(phase: str) -> None:
+        if phase == "auth_written":
+            raise SystemExit("crashed after auth write")
+
+    with pytest.raises(SystemExit):
+        backup_mod._restore_auth_transactionally(
+            restored_auth,
+            "restore-shared",
+            config_home=backup_home,
+            failure_injector=crash,
+        )
+    external = b'{"providers":{"external":{"token":"preserve"}}}'
+    (backup_home / "auth.json").write_bytes(external)
+
+    with pytest.raises(RuntimeError, match="manual recovery required"):
+        backup_mod._recover_incomplete_auth_restores()
+
+    assert (backup_home / "auth.json").read_bytes() == external
+    journal_path = next(
+        (backup_home / "state-snapshots" / "auth-restores" / "journals").glob(
+            "*.json"
+        )
+    )
+    journal = json.loads(journal_path.read_text())
+    assert journal["phase"] == "manual_required"
+    assert journal["reason"] == "restore_state_changed"
+
+
 def test_quick_auth_restore_requires_explicit_action_before_any_write(
     backup_home, tmp_path
 ):
@@ -214,6 +316,51 @@ def test_quick_auth_restore_requires_explicit_action_before_any_write(
         auth_passphrase_file=str(passphrase),
     ) is False
     assert (backup_home / "config.yaml").read_bytes() == destination
+
+
+def test_quick_auth_restore_rolls_back_destination_config_on_commit_failure(
+    backup_home, tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup_mod
+
+    passphrase = tmp_path / "quick-rollback-passphrase"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "config.yaml").write_text(
+        "auth:\n  authority: shared\nmarker: snapshot\n", encoding="utf-8"
+    )
+    snapshot_id = backup_mod.create_quick_snapshot(
+        label="auth-rollback",
+        hermes_home=backup_home,
+        auth_mode="include-encrypted",
+        auth_passphrase_file=str(passphrase),
+    )
+    assert snapshot_id is not None
+
+    old_auth = b'{"providers":{"old":{}}}'
+    old_config = b"auth:\n  authority: shared\nmarker: destination\n"
+    (backup_home / "auth.json").write_bytes(old_auth)
+    (backup_home / "config.yaml").write_bytes(old_config)
+    real_write = backup_mod._atomic_private_write
+    failed = False
+
+    def fail_config(path, raw):
+        nonlocal failed
+        real_write(path, raw)
+        if Path(path).name == "config.yaml" and not failed:
+            failed = True
+            raise OSError("forced config commit failure")
+
+    monkeypatch.setattr(backup_mod, "_atomic_private_write", fail_config)
+
+    assert backup_mod.restore_quick_snapshot(
+        snapshot_id,
+        hermes_home=backup_home,
+        include_auth=True,
+        auth_action="restore-shared",
+        auth_passphrase_file=str(passphrase),
+    ) is False
+    assert (backup_home / "auth.json").read_bytes() == old_auth
+    assert (backup_home / "config.yaml").read_bytes() == old_config
 
 
 def test_quick_auth_restore_rejects_live_gateway_before_any_write(
@@ -332,3 +479,82 @@ def test_full_backup_wrong_passphrase_and_legacy_auth_fail_closed(
                 auth_passphrase_file=None,
             )
         )
+
+
+def test_auth_restore_recovery_validates_all_backups_before_mutating_targets(
+    backup_home,
+):
+    import hermes_cli.backup as backup_mod
+
+    restored_auth = b'{"providers":{"restored":{"token":"new"}}}'
+
+    def crash(phase: str) -> None:
+        if phase == "auth_written":
+            raise SystemExit("simulated process death")
+
+    with pytest.raises(SystemExit, match="simulated process death"):
+        backup_mod._restore_auth_transactionally(
+            restored_auth,
+            "restore-profile",
+            config_home=backup_home,
+            failure_injector=crash,
+        )
+
+    journal_path = next(
+        (backup_home / "state-snapshots" / "auth-restores" / "journals").glob(
+            "*.json"
+        )
+    )
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    config_before_recovery = (backup_home / "config.yaml").read_bytes()
+    auth_before_recovery = (backup_home / "auth.json").read_bytes()
+    (Path(journal["current_dir"]) / "config.yaml").write_bytes(b"corrupt backup")
+
+    with pytest.raises(RuntimeError, match="backup verification failed"):
+        backup_mod._recover_incomplete_auth_restores()
+
+    assert (backup_home / "auth.json").read_bytes() == auth_before_recovery
+    assert (backup_home / "config.yaml").read_bytes() == config_before_recovery
+    assert json.loads(journal_path.read_text(encoding="utf-8"))["phase"] == (
+        "manual_required"
+    )
+
+
+def test_auth_restore_holds_transition_gate_through_target_write(
+    backup_home, monkeypatch
+):
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.backup as backup_mod
+
+    restored_auth = b'{"providers":{"restored":{"token":"new"}}}'
+    real_write = backup_mod._atomic_private_write
+    competing_result: list[str] = []
+    checked = False
+
+    def checked_write(path: Path, raw: bytes) -> None:
+        nonlocal checked
+        if Path(path) == backup_home / "auth.json" and not checked:
+            checked = True
+
+            def compete() -> None:
+                try:
+                    with auth_mod._auth_transition_lock(timeout_seconds=0.1):
+                        competing_result.append("acquired")
+                except TimeoutError:
+                    competing_result.append("blocked")
+
+            thread = threading.Thread(target=compete)
+            thread.start()
+            thread.join(timeout=2)
+            assert not thread.is_alive()
+        real_write(path, raw)
+
+    monkeypatch.setattr(backup_mod, "_atomic_private_write", checked_write)
+
+    backup_mod._restore_auth_transactionally(
+        restored_auth,
+        "restore-profile",
+        config_home=backup_home,
+    )
+
+    assert competing_result == ["blocked"]

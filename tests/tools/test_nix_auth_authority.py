@@ -36,6 +36,7 @@ def test_seed_resolves_shared_authority_and_preserves_existing_destination(
     (profile / "config.yaml").write_text("auth:\n  authority: shared\n")
     destination = root / "auth.json"
     destination.write_text(json.dumps({"token": "current"}))
+    destination.chmod(0o600)
     source = tmp_path / "seed.json"
     source.write_text(json.dumps({"token": "seed"}))
 
@@ -43,6 +44,27 @@ def test_seed_resolves_shared_authority_and_preserves_existing_destination(
 
     assert result["status"] == "preserved"
     assert json.loads(destination.read_text()) == {"token": "current"}
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert (root / "auth.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_seed_rejects_insecure_existing_destination_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    destination = home / "auth.json"
+    destination.write_text(json.dumps({"token": "current"}))
+    destination.chmod(0o644)
+    source = tmp_path / "seed.json"
+    source.write_text(json.dumps({"token": "seed"}))
+
+    with pytest.raises(RuntimeError, match="mode 0600"):
+        module.seed_auth(home, source, uid=os.getuid(), gid=os.getgid())
+
+    assert json.loads(destination.read_text()) == {"token": "current"}
+    assert destination.stat().st_mode & 0o777 == 0o644
 
 
 def test_seed_api_has_no_inert_force_control(tmp_path: Path) -> None:
@@ -107,6 +129,8 @@ def test_concurrent_non_force_seed_has_one_writer_and_no_partial_json(
     statuses = sorted(results.get(timeout=2)["status"] for _ in workers)
     assert statuses == ["created", "preserved"]
     assert json.loads((home / "auth.json").read_text())["writer"] in {0, 1}
+    assert (home / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (home / "auth.lock").stat().st_mode & 0o777 == 0o600
     assert not list(home.glob("auth.json.tmp.*"))
 
 

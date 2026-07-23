@@ -26,17 +26,30 @@ class AuthAuthorityConfigError(RuntimeError):
     """Raised when auth authority configuration is malformed or incomplete."""
 
 
-_TERMINAL_MIGRATION_PHASES = frozenset({"committed", "rolled_back", "aborted"})
+_TERMINAL_MIGRATION_PHASES = frozenset(
+    {"committed", "committed_state_changed", "rolled_back", "aborted"}
+)
+
+
+def _newest_statable_journals(journals: Path) -> list[Path]:
+    """Return newest-first journals, ignoring entries that cannot be stat'ed."""
+    candidates: list[tuple[int, Path]] = []
+    try:
+        paths = list(journals.glob("*.json"))
+    except OSError:
+        return []
+    for path in paths:
+        try:
+            candidates.append((path.stat().st_mtime_ns, path))
+        except OSError:
+            continue
+    return [path for _, path in sorted(candidates, reverse=True)]
 
 
 def incomplete_auth_migration(shared_root: Path) -> Optional[dict[str, str]]:
     """Return the newest incomplete migration journal without exposing secrets."""
     journals = shared_root / "state-snapshots" / "auth-migrations" / "journals"
-    try:
-        candidates = sorted(journals.glob("*.json"), key=lambda path: path.stat().st_mtime_ns)
-    except OSError:
-        return None
-    for path in reversed(candidates):
+    for path in _newest_statable_journals(journals):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
@@ -44,6 +57,26 @@ def incomplete_auth_migration(shared_root: Path) -> Optional[dict[str, str]]:
         phase = str(raw.get("phase") or "unknown")
         if phase not in _TERMINAL_MIGRATION_PHASES:
             return {"plan_id": str(raw.get("plan_id") or path.stem), "phase": phase}
+    return None
+
+
+_TERMINAL_RESTORE_PHASES = frozenset({"committed", "rolled_back", "aborted"})
+
+
+def incomplete_auth_restore(shared_root: Path) -> Optional[dict[str, str]]:
+    """Return the newest interrupted auth/config restore journal."""
+    journals = shared_root / "state-snapshots" / "auth-restores" / "journals"
+    for path in _newest_statable_journals(journals):
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        phase = str(raw.get("phase") or "unknown")
+        if phase not in _TERMINAL_RESTORE_PHASES:
+            return {
+                "operation_id": str(raw.get("operation_id") or path.stem),
+                "phase": phase,
+            }
     return None
 
 
@@ -123,6 +156,7 @@ def resolve_auth_authority(
     shared_root: Optional[Path] = None,
     config: Optional[Mapping[str, Any]] = None,
     enforce_migration: bool = True,
+    enforce_restore: bool = True,
 ) -> AuthAuthority:
     """Resolve the one authoritative auth store for the current process.
 
@@ -138,6 +172,13 @@ def resolve_auth_authority(
             "Authentication is blocked by incomplete migration "
             f"{pending['plan_id']} ({pending['phase']}); run "
             f"`hermes auth migrate-shared --recover --plan-id {pending['plan_id']}`"
+        )
+    pending_restore = incomplete_auth_restore(root)
+    if enforce_restore and pending_restore:
+        raise AuthAuthorityConfigError(
+            "Authentication is blocked by incomplete restore "
+            f"{pending_restore['operation_id']} ({pending_restore['phase']}); rerun the "
+            "same snapshot restore command while gateways are stopped"
         )
     config_path = active_home / "config.yaml"
 
