@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import sys
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -156,46 +157,38 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
     if seed_nous is None:
         return "bad_seed"
 
-    if not os.path.exists(auth_path):
-        # Blank volume — this is the normal first-boot case, not a re-seed.
-        return "no_auth_file"
-
     try:
-        with open(auth_path, "r", encoding="utf-8") as fh:
-            store = json.load(fh)
-    except (OSError, ValueError):
-        # Corrupt/unreadable auth.json: do NOT overwrite blindly. A separate
-        # concern; leave it for the operator / other recovery paths.
-        return "auth_unreadable"
+        from docker_auth_authority import update_auth_store
+    except ModuleNotFoundError:  # imported as scripts.* by unit tests/dev tooling
+        from scripts.docker_auth_authority import update_auth_store
 
-    if not isinstance(store, dict):
-        return "auth_unreadable"
+    def update(store: dict[str, object]):
+        providers = store.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+            store["providers"] = providers
 
-    providers = store.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        store["providers"] = providers
+        local_nous = providers.get("nous")
+        terminal = _nous_entry_is_terminal(local_nous)
+        newer_seed = _seed_is_newer(local_nous, seed_nous)
+        if not terminal and not newer_seed:
+            return "not_terminal", None
 
-    local_nous = providers.get("nous")
-    terminal = _nous_entry_is_terminal(local_nous)
-    newer_seed = _seed_is_newer(local_nous, seed_nous)
-    if not terminal and not newer_seed:
-        # Healthy and at least as new as the seed, or incomparable. Never roll a
-        # session back merely because an old rebootstrap env remains configured.
-        return "not_terminal"
+        providers["nous"] = seed_nous
+        return ("reseeded" if terminal else "reseeded_newer"), store
 
-    # Surgical replacement: swap ONLY providers.nous, preserve everything else.
-    providers["nous"] = seed_nous
+    return update_auth_store(Path(auth_path).parent, update)
 
-    tmp_path = f"{auth_path}.rebootstrap.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(store, fh)
-    os.replace(tmp_path, auth_path)
+
+def reseed_profile_if_terminal(profile_home: Path, seed_raw: str) -> str:
+    """Resolve and update auth through Docker's canonical authority helper."""
     try:
-        os.chmod(auth_path, 0o600)
-    except OSError:
-        pass
-    return "reseeded" if terminal else "reseeded_newer"
+        from docker_auth_authority import resolve_auth_authority
+    except ModuleNotFoundError:  # imported as scripts.* by unit tests/dev tooling
+        from scripts.docker_auth_authority import resolve_auth_authority
+
+    authority = resolve_auth_authority(str(profile_home))
+    return reseed_if_terminal(str(authority["auth_path"]), seed_raw)
 
 
 def main() -> int:

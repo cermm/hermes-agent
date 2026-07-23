@@ -69,15 +69,10 @@ def seed_auth(
     home: Path,
     source: Path,
     *,
-    force: bool,
     uid: int | None = None,
     gid: int | None = None,
 ) -> dict[str, Any]:
-    """Seed an empty authority while serializing all existence checks/writes.
-
-    ``force`` remains accepted for backward-compatible Nix configurations, but
-    it cannot replace an existing runtime credential store.
-    """
+    """Seed an empty authority while serializing existence checks and writes."""
     source = source.expanduser()
     if source.is_symlink():
         raise RuntimeError("auth seed source must not be a symlink")
@@ -147,7 +142,7 @@ def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("home", type=Path)
     parser.add_argument("source", type=Path)
-    parser.add_argument("--force", choices=("true", "false"), default="false")
+
     parser.add_argument("--uid", type=int)
     parser.add_argument("--gid", type=int)
     args = parser.parse_args()
@@ -156,7 +151,6 @@ def main() -> int:
             seed_auth(
                 args.home,
                 args.source,
-                force=args.force == "true",
                 uid=args.uid,
                 gid=args.gid,
             ),

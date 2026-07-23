@@ -252,25 +252,77 @@ def _restore_auth_transactionally(
             config, sort_keys=False, default_flow_style=False
         ).encode("utf-8")
 
-        auth_written = False
-        config_written = False
+        auth_attempted = False
+        config_attempted = False
         try:
+            auth_attempted = True
             _atomic_private_write(auth_target, raw)
-            auth_written = True
+            config_attempted = True
             _atomic_private_write(config_path, config_raw)
-            config_written = True
         except Exception:
-            if config_written:
+            if config_attempted:
                 if old_config is None:
                     config_path.unlink(missing_ok=True)
                 else:
                     _atomic_private_write(config_path, old_config)
-            if auth_written:
+            if auth_attempted:
                 if old_auth is None:
                     auth_target.unlink(missing_ok=True)
                 else:
                     _atomic_private_write(auth_target, old_auth)
             raise
+
+
+def _assert_auth_restore_quiescent(home: Path, auth_action: str) -> None:
+    """Fail closed if any gateway can write the selected auth authority."""
+    from gateway.status import (
+        get_running_pid,
+        read_runtime_status,
+        runtime_status_pid_is_live,
+    )
+    from hermes_cli.auth_authority import resolve_auth_authority
+
+    if auth_action not in {"restore-shared", "restore-profile"}:
+        raise ValueError(f"unsupported auth restore action: {auth_action}")
+    root = get_default_hermes_root()
+    target = (
+        root / "auth.json"
+        if auth_action == "restore-shared"
+        else home / "auth.json"
+    ).resolve(strict=False)
+    candidates = {root.resolve(strict=False), home.resolve(strict=False)}
+    profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        candidates.update(
+            path.resolve(strict=False)
+            for path in profiles_root.iterdir()
+            if path.is_dir()
+        )
+
+    for candidate in sorted(candidates, key=lambda path: os.fsencode(str(path))):
+        authority = resolve_auth_authority(
+            profile_home=candidate,
+            shared_root=root,
+            enforce_migration=False,
+        )
+        if authority.auth_path.resolve(strict=False) != target:
+            continue
+        pid = get_running_pid(candidate / "gateway.pid", cleanup_stale=False)
+        if pid is None:
+            runtime = read_runtime_status(candidate / "gateway_state.json")
+            if (
+                isinstance(runtime, dict)
+                and runtime.get("gateway_state") in {"starting", "running", "degraded"}
+                and runtime_status_pid_is_live(runtime)
+            ):
+                raw_pid = runtime.get("pid")
+                if isinstance(raw_pid, int) and raw_pid > 0:
+                    pid = raw_pid
+        if pid is not None:
+            raise RuntimeError(
+                f"gateway for {candidate} is running (PID {pid}); stop all "
+                "gateways sharing the auth authority before restore"
+            )
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
@@ -771,6 +823,11 @@ def run_import(args) -> None:
                     f"{expected_authority!r})"
                 )
                 sys.exit(1)
+            try:
+                _assert_auth_restore_quiescent(get_hermes_home(), auth_action)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"Error: auth restore preflight failed: {exc}")
+                sys.exit(1)
 
         print(f"Backup contains {file_count} files")
         print(f"Target: {display_hermes_home()}")
@@ -850,6 +907,22 @@ def run_import(args) -> None:
 
             if not rel:
                 continue
+
+            # When auth is restored, config.yaml is part of the authority
+            # transaction below. Do not overwrite its rollback preimage during
+            # ordinary archive extraction.
+            if restored_auth_raw is not None:
+                active_home = get_hermes_home().resolve(strict=False)
+                try:
+                    active_config_rel = str(
+                        (active_home / "config.yaml").relative_to(
+                            hermes_root.resolve(strict=False)
+                        )
+                    )
+                except ValueError:
+                    active_config_rel = "config.yaml"
+                if rel == active_config_rel:
+                    continue
 
             # Never overwrite volatile gateway/process runtime state. These are
             # namespaced to the machine/container the backup was taken on;
@@ -1273,6 +1346,43 @@ def restore_quick_snapshot(
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
 
+    auth_restore_raw: Optional[bytes] = None
+    if include_auth:
+        if auth_action not in {"restore-shared", "restore-profile"}:
+            logger.error("include_auth requires an explicit auth_action")
+            return False
+        archived = meta.get("auth_authority")
+        if not isinstance(archived, dict):
+            logger.error("Snapshot contains no encrypted auth authority")
+            return False
+        expected_authority = (
+            "shared" if auth_action == "restore-shared" else "profile"
+        )
+        if archived.get("authority") != expected_authority:
+            logger.error(
+                "auth backup topology does not match the selected restore action"
+            )
+            return False
+        try:
+            from types import SimpleNamespace
+
+            envelope = snap_dir / _AUTH_ENVELOPE
+            envelope.resolve().relative_to(snap_dir.resolve())
+            passphrase = _auth_passphrase(
+                SimpleNamespace(auth_passphrase_file=auth_passphrase_file)
+            )
+            auth_restore_raw = _decrypt_auth(
+                envelope.read_bytes(),
+                archived,
+                passphrase,
+            )
+            if not isinstance(json.loads(auth_restore_raw), dict):
+                raise ValueError("decrypted auth store must be a JSON object")
+            _assert_auth_restore_quiescent(home, auth_action)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.error("Auth restore preflight failed: %s", exc)
+            return False
+
     restored = 0
     for rel in meta.get("files", {}):
         if rel.startswith(("_auth_authority/", "_auth/")):
@@ -1310,34 +1420,11 @@ def restore_quick_snapshot(
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
 
-    if include_auth and auth_action == "skip":
-        logger.error("include_auth requires an explicit auth_action")
-    if (
-        include_auth
-        and auth_action != "skip"
-        and isinstance(meta.get("auth_authority"), dict)
-    ):
+    if auth_restore_raw is not None:
         try:
-            from types import SimpleNamespace
-
-            archived = meta["auth_authority"]
-            expected_authority = (
-                "shared" if auth_action == "restore-shared" else "profile"
+            _restore_auth_transactionally(
+                auth_restore_raw, auth_action, config_home=home
             )
-            if archived.get("authority") != expected_authority:
-                raise ValueError(
-                    "auth backup topology does not match the selected restore action"
-                )
-            src = snap_dir / _AUTH_ENVELOPE
-            src.resolve().relative_to(snap_dir.resolve())
-            raw = _decrypt_auth(
-                src.read_bytes(),
-                archived,
-                _auth_passphrase(
-                    SimpleNamespace(auth_passphrase_file=auth_passphrase_file)
-                ),
-            )
-            _restore_auth_transactionally(raw, auth_action, config_home=home)
             restored += 1
         except (OSError, PermissionError, RuntimeError, ValueError) as exc:
             logger.error("Failed to restore auth authority: %s", exc)

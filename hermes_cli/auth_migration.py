@@ -217,12 +217,27 @@ def _gateway_homes_for_target(
 
 def _gateway_snapshot(profile_homes: Iterable[Path]) -> dict[str, Optional[int]]:
     """Capture live gateway PIDs without cleaning or mutating runtime state."""
-    from gateway.status import get_running_pid
+    from gateway.status import (
+        get_running_pid,
+        read_runtime_status,
+        runtime_status_pid_is_live,
+    )
 
-    return {
-        str(home): get_running_pid(home / "gateway.pid", cleanup_stale=False)
-        for home in profile_homes
-    }
+    snapshot: dict[str, Optional[int]] = {}
+    for home in profile_homes:
+        pid = get_running_pid(home / "gateway.pid", cleanup_stale=False)
+        if pid is None:
+            runtime = read_runtime_status(home / "gateway_state.json")
+            if (
+                isinstance(runtime, dict)
+                and runtime.get("gateway_state") in {"starting", "running", "degraded"}
+                and runtime_status_pid_is_live(runtime)
+            ):
+                raw_pid = runtime.get("pid")
+                if isinstance(raw_pid, int) and raw_pid > 0:
+                    pid = raw_pid
+        snapshot[str(home)] = pid
+    return snapshot
 
 
 def _redacted_manifest(profile_homes: Iterable[Path], target: Path) -> dict[str, Any]:
@@ -231,18 +246,41 @@ def _redacted_manifest(profile_homes: Iterable[Path], target: Path) -> dict[str,
     target_providers = _providers(target_store)
     for home in profile_homes:
         source = home / "auth.json"
+        config = home / "config.yaml"
+        profile_id = resolve_auth_authority(
+            profile_home=home,
+            shared_root=_root(),
+            enforce_migration=False,
+        ).profile_id
         store = _read_json_object(source)
         providers = sorted(_providers(store))
         sources.append({
             "profile": home.name,
+            "profile_id": profile_id,
             "source_class": "profile-local",
             "providers": providers,
             "overlapping_providers": sorted(set(providers) & target_providers),
+            "artifacts": [
+                {
+                    "artifact_class": "profile-auth",
+                    "exists": source.exists(),
+                    "profile_id": profile_id,
+                },
+                {
+                    "artifact_class": "profile-config",
+                    "exists": config.exists(),
+                    "profile_id": profile_id,
+                },
+            ],
         })
     return {
         "operation": "migrate-shared",
         "target_class": "shared-root",
         "target_exists": target.exists(),
+        "target_artifact": {
+            "artifact_class": "shared-auth",
+            "exists": target.exists(),
+        },
         "target_providers": sorted(target_providers),
         "sources": sources,
     }

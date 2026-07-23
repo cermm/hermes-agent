@@ -56,6 +56,9 @@
         authSettings
     );
     generatedConfigFile = pkgs.writeText "hermes-config.yaml" configJson;
+    generatedAuthConfigFile = pkgs.writeText "hermes-auth-authority.yaml" (
+      builtins.toJSON authSettings
+    );
     configFile = if cfg.configFile != null then cfg.configFile else generatedConfigFile;
 
     configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
@@ -326,14 +329,6 @@
         '';
       };
 
-      authFileForceOverwrite = mkOption {
-        type = types.bool;
-        default = false;
-        description = ''
-          Deprecated compatibility option. Existing auth.json state is always
-          preserved so activation cannot roll back runtime-rotated credentials.
-        '';
-      };
 
       # ── Documents ────────────────────────────────────────────────────────
       documents = mkOption {
@@ -766,6 +761,9 @@
           # hermes-group users can save settings via the CLI/TUI, else 0640).
           ${if cfg.configFile != null then ''
             install -o ${cfg.user} -g ${cfg.group} -m ${configYamlMode} -D ${configFile} ${cfg.stateDir}/.hermes/config.yaml
+            ${configMergeScript} ${generatedAuthConfigFile} ${cfg.stateDir}/.hermes/config.yaml
+            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
+            chmod ${configYamlMode} ${cfg.stateDir}/.hermes/config.yaml
           '' else ''
             ${configMergeScript} ${generatedConfigFile} ${cfg.stateDir}/.hermes/config.yaml
             chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
@@ -836,8 +834,7 @@
               ${lib.escapeShellArg "${cfg.stateDir}/.hermes"} \
               ${lib.escapeShellArg cfg.authFile} \
               --uid "$(${pkgs.coreutils}/bin/id -u ${cfg.user})" \
-              --gid "$(${pkgs.coreutils}/bin/id -g ${cfg.group})" \
-              --force ${if cfg.authFileForceOverwrite then "true" else "false"}
+              --gid "$(${pkgs.coreutils}/bin/id -g ${cfg.group})"
           ''}
 
           # Seed .env from Nix-declared environment + environmentFiles.

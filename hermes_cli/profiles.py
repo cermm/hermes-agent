@@ -1000,7 +1000,7 @@ def create_profile(
     no_alias: bool = False,
     no_skills: bool = False,
     description: Optional[str] = None,
-    auth_mode: str = "retain",
+    auth_mode: str = "shared",
 ) -> Path:
     """Create a new profile directory.
 
@@ -1029,8 +1029,8 @@ def create_profile(
     Path
         The newly created profile directory.
     """
-    if auth_mode not in {"retain", "shared", "profile"}:
-        raise ValueError("auth_mode must be retain, shared, or profile")
+    if auth_mode not in {"shared", "profile"}:
+        raise ValueError("auth_mode must be shared or profile")
     if no_skills and (clone_from is not None or clone_config or clone_all):
         raise ValueError(
             "--no-skills is mutually exclusive with --clone / --clone-from / --clone-all "
@@ -1609,10 +1609,6 @@ def delete_profile(
             print("Cancelled.")
             return profile_dir
 
-    if local_auth and auth_action == "archive":
-        archive_path = _archive_profile_auth(canon, authority.auth_path)
-        print(f"✓ Archived profile credentials to {archive_path}")
-
     # 1. Disable service (prevents auto-restart)
     _cleanup_gateway_service(canon, profile_dir)
     # 1b. Phase 4: unregister the s6 service slot (container path).
@@ -1630,6 +1626,13 @@ def delete_profile(
     # the rmtree below fail with ENOTEMPTY and — before the ensure_hermes_home
     # guard — resurrected the deleted tree.
     _stop_profile_backends(canon, profile_dir)
+
+    # Snapshot profile-local credentials only after every known writer is
+    # quiescent, otherwise a refresh can race the archive and produce a
+    # self-inconsistent credential record.
+    if local_auth and auth_action == "archive":
+        archive_path = _archive_profile_auth(canon, authority.auth_path)
+        print(f"✓ Archived profile credentials to {archive_path}")
 
     # 3. Remove wrapper script
     if has_wrapper:
@@ -2257,10 +2260,12 @@ def rename_profile(old_name: str, new_name: str) -> Path:
     if new_dir.exists():
         raise FileExistsError(f"Profile '{new_canon}' already exists.")
 
-    # 1. Stop gateway if running
-    if _check_gateway_running(old_dir):
-        _cleanup_gateway_service(old_canon, old_dir)
-        _stop_gateway_process(old_dir)
+    # 1. Stop every profile process that can write local auth. Service cleanup
+    # is unconditional because a supervisor can restart a gateway even when no
+    # PID artifact is currently visible.
+    _cleanup_gateway_service(old_canon, old_dir)
+    _stop_gateway_process(old_dir)
+    _stop_profile_backends(old_canon, old_dir)
 
     # 2. Rename directory
     old_dir.rename(new_dir)

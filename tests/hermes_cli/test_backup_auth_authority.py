@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import os
 from pathlib import Path
 from types import SimpleNamespace
 import zipfile
@@ -152,10 +153,17 @@ def test_auth_restore_rolls_back_target_when_config_commit_fails(
     archive = backup_home / "backups.zip"
     old_auth = b'{"providers":{"old":{}}}'
     (backup_home / "auth.json").write_bytes(old_auth)
+    old_config = b"auth:\n  authority: shared\noperator_marker: destination\n"
+    (backup_home / "config.yaml").write_bytes(old_config)
     real_write = getattr(backup_mod, "_atomic_private_write", None)
+    failed = False
 
     def fail_config(path, raw):
-        if Path(path).name == "config.yaml":
+        nonlocal failed
+        if Path(path).name == "config.yaml" and not failed:
+            failed = True
+            assert real_write is not None
+            real_write(path, raw)
             raise OSError("forced config commit failure")
         assert real_write is not None
         return real_write(path, raw)
@@ -176,6 +184,110 @@ def test_auth_restore_rolls_back_target_when_config_commit_fails(
         )
 
     assert (backup_home / "auth.json").read_bytes() == old_auth
+    assert (backup_home / "config.yaml").read_bytes() == old_config
+
+
+def test_quick_auth_restore_requires_explicit_action_before_any_write(
+    backup_home, tmp_path
+):
+    import hermes_cli.backup as backup_mod
+
+    passphrase = tmp_path / "quick-passphrase"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "config.yaml").write_text(
+        "auth:\n  authority: shared\nmarker: snapshot\n", encoding="utf-8"
+    )
+    snapshot_id = backup_mod.create_quick_snapshot(
+        label="auth-contract",
+        hermes_home=backup_home,
+        auth_mode="include-encrypted",
+        auth_passphrase_file=str(passphrase),
+    )
+    assert snapshot_id is not None
+    destination = b"auth:\n  authority: shared\nmarker: destination\n"
+    (backup_home / "config.yaml").write_bytes(destination)
+
+    assert backup_mod.restore_quick_snapshot(
+        snapshot_id,
+        hermes_home=backup_home,
+        include_auth=True,
+        auth_passphrase_file=str(passphrase),
+    ) is False
+    assert (backup_home / "config.yaml").read_bytes() == destination
+
+
+def test_quick_auth_restore_rejects_live_gateway_before_any_write(
+    backup_home, tmp_path, monkeypatch
+):
+    import hermes_cli.backup as backup_mod
+    import gateway.status as gateway_status
+
+    passphrase = tmp_path / "quick-live-passphrase"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "config.yaml").write_text(
+        "auth:\n  authority: shared\nmarker: snapshot\n", encoding="utf-8"
+    )
+    snapshot_id = backup_mod.create_quick_snapshot(
+        label="live-gateway",
+        hermes_home=backup_home,
+        auth_mode="include-encrypted",
+        auth_passphrase_file=str(passphrase),
+    )
+    assert snapshot_id is not None
+    destination = b"auth:\n  authority: shared\nmarker: destination\n"
+    (backup_home / "config.yaml").write_bytes(destination)
+    monkeypatch.setattr(
+        gateway_status,
+        "get_running_pid",
+        lambda *_args, **_kwargs: os.getpid(),
+    )
+
+    assert backup_mod.restore_quick_snapshot(
+        snapshot_id,
+        hermes_home=backup_home,
+        include_auth=True,
+        auth_action="restore-shared",
+        auth_passphrase_file=str(passphrase),
+    ) is False
+    assert (backup_home / "config.yaml").read_bytes() == destination
+
+
+def test_full_restore_refuses_running_shared_gateway_before_any_write(
+    backup_home, monkeypatch
+):
+    import hermes_cli.backup as backup_mod
+    from gateway import status as gateway_status
+
+    passphrase = backup_home.parent / "passphrase-running"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "MEMORY.md").write_text("archive value", encoding="utf-8")
+    backup_mod.run_backup(
+        _backup_args(
+            backup_home,
+            auth_mode="include-encrypted",
+            auth_passphrase_file=str(passphrase),
+        )
+    )
+    archive = backup_home / "backups.zip"
+    (backup_home / "MEMORY.md").write_text("destination value", encoding="utf-8")
+    monkeypatch.setattr(
+        gateway_status,
+        "get_running_pid",
+        lambda *_args, **_kwargs: os.getpid(),
+    )
+
+    with pytest.raises(SystemExit):
+        backup_mod.run_import(
+            SimpleNamespace(
+                zipfile=str(archive),
+                force=True,
+                clean=False,
+                auth_action="restore-shared",
+                auth_passphrase_file=str(passphrase),
+            )
+        )
+
+    assert (backup_home / "MEMORY.md").read_text() == "destination value"
 
 
 def test_full_backup_wrong_passphrase_and_legacy_auth_fail_closed(

@@ -493,14 +493,15 @@ def test_provider_state_transaction_locks_global_fallback_before_use(
         assert state == {"access_token": "global-token"}
         assert source == profile_env["global"] / "auth.json"
 
-    assert entered[:2] == [
-        profile_env["profile"] / "auth.lock",
+    assert entered == [
+        profile_env["global"] / "auth-transition.lock",
         profile_env["global"] / "auth.lock",
+        profile_env["profile"] / "auth.lock",
     ]
 
 
-def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
-    """Changing profile context cannot inherit another store's lock depth."""
+def test_auth_transaction_remains_pinned_after_profile_context_switch(profile_env):
+    """A context switch cannot retarget an already-pinned auth transaction."""
     import hermes_cli.auth as auth
     from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 
@@ -522,12 +523,21 @@ def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env
             assert not profile_b_lock.exists()
 
             with auth._auth_store_lock():
-                assert profile_b_lock.exists()
-                assert getattr(holder_b, "depth", 0) == 1
+                assert not profile_b_lock.exists()
+                assert getattr(holder_a, "depth", 0) == 2
+                assert getattr(holder_b, "depth", 0) == 0
         finally:
             reset_hermes_home_override(token)
 
     assert getattr(holder_a, "depth", 0) == 0
+
+    token = set_hermes_home_override(profile_b)
+    try:
+        with auth._auth_store_lock():
+            assert profile_b_lock.exists()
+            assert getattr(holder_b, "depth", 0) == 1
+    finally:
+        reset_hermes_home_override(token)
 
 
 # ---------------------------------------------------------------------------

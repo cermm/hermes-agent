@@ -10,6 +10,8 @@ from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
+import sys
 from pathlib import Path
 
 # Import the stdlib-only boot helper by path (it lives under scripts/, not an
@@ -69,6 +71,70 @@ def test_reseeds_terminal_entry(tmp_path):
     store = json.loads(Path(auth).read_text())
     assert store["providers"]["nous"]["refresh_token"] == "FRESH-rt"
     assert "last_auth_error" not in store["providers"]["nous"]
+
+
+def test_profile_reseed_uses_docker_canonical_shared_authority(
+    tmp_path, monkeypatch
+):
+    """Rebootstrap must share Docker bootstrap's resolver and lock domain."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    shared = root / "auth.json"
+    shared.write_text(
+        json.dumps({"version": 1, "providers": {"nous": _terminal_nous_state()}}),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(_SCRIPT.parent))
+    sys.modules.pop("docker_auth_authority", None)
+
+    assert mod.reseed_profile_if_terminal(profile, _FRESH_SEED) == "reseeded"
+    assert json.loads(shared.read_text())["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+    assert not (profile / "auth.json").exists()
+
+
+def test_rebootstrap_serializes_with_regular_auth_writer(tmp_path):
+    from scripts.docker_auth_authority import update_auth_store
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    auth = _write_auth(home, {"nous": _terminal_nous_state()})
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    release = context.Event()
+    results = context.Queue()
+
+    def regular_writer() -> None:
+        def update(store):
+            entered.set()
+            assert release.wait(timeout=5)
+            store.setdefault("providers", {})["openai-codex"] = {"account": "peer"}
+            return "written", store
+
+        update_auth_store(str(home), update)
+
+    writer = context.Process(target=regular_writer)
+    writer.start()
+    assert entered.wait(timeout=5)
+    reseeder = context.Process(
+        target=lambda: results.put(mod.reseed_if_terminal(auth, _FRESH_SEED))
+    )
+    reseeder.start()
+    release.set()
+    writer.join(timeout=5)
+    reseeder.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reseeder.is_alive()
+    assert writer.exitcode == 0
+    assert reseeder.exitcode == 0
+    assert results.get(timeout=1) == "reseeded"
+    store = json.loads(Path(auth).read_text(encoding="utf-8"))
+    assert store["providers"]["openai-codex"] == {"account": "peer"}
+    assert store["providers"]["nous"]["refresh_token"] == "FRESH-rt"
 
 
 def test_does_not_clobber_healthy_entry(tmp_path):

@@ -23,7 +23,7 @@ def _load_module():
 def _seed_worker(home: str, source: str, start, results) -> None:
     module = _load_module()
     start.wait()
-    results.put(module.seed_auth(Path(home), Path(source), force=False))
+    results.put(module.seed_auth(Path(home), Path(source)))
 
 
 def test_seed_resolves_shared_authority_and_preserves_existing_destination(
@@ -39,13 +39,13 @@ def test_seed_resolves_shared_authority_and_preserves_existing_destination(
     source = tmp_path / "seed.json"
     source.write_text(json.dumps({"token": "seed"}))
 
-    result = module.seed_auth(profile, source, force=False)
+    result = module.seed_auth(profile, source)
 
     assert result["status"] == "preserved"
     assert json.loads(destination.read_text()) == {"token": "current"}
 
 
-def test_legacy_force_seed_cannot_replace_runtime_credentials(tmp_path: Path) -> None:
+def test_seed_api_has_no_inert_force_control(tmp_path: Path) -> None:
     module = _load_module()
     home = tmp_path / ".hermes"
     home.mkdir()
@@ -54,10 +54,26 @@ def test_legacy_force_seed_cannot_replace_runtime_credentials(tmp_path: Path) ->
     source = tmp_path / "seed.json"
     source.write_text("new")
 
-    result = module.seed_auth(home, source, force=True)
-
-    assert result["status"] == "preserved"
+    with pytest.raises(TypeError, match="force"):
+        module.seed_auth(home, source, force=True)
     assert destination.read_text() == "old"
+
+
+def test_seed_cli_has_no_inert_force_control(monkeypatch, tmp_path: Path) -> None:
+    module = _load_module()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "nix_auth_authority.py",
+            str(tmp_path / ".hermes"),
+            str(tmp_path / "seed.json"),
+            "--force",
+            "true",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        module.main()
 
 
 def test_concurrent_non_force_seed_has_one_writer_and_no_partial_json(
@@ -104,7 +120,7 @@ def test_seed_rejects_source_symlink(tmp_path: Path) -> None:
     linked.symlink_to(actual)
 
     with pytest.raises(RuntimeError, match="source.*symlink"):
-        module.seed_auth(profile, linked, force=False)
+        module.seed_auth(profile, linked)
 
 
 def test_seed_rejects_non_object_json(tmp_path: Path) -> None:
@@ -114,4 +130,4 @@ def test_seed_rejects_non_object_json(tmp_path: Path) -> None:
     seed.write_text("[]", encoding="utf-8")
 
     with pytest.raises(RuntimeError, match="JSON object"):
-        module.seed_auth(profile, seed, force=False)
+        module.seed_auth(profile, seed)

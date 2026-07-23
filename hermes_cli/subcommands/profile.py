@@ -64,8 +64,8 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
     )
     profile_create.add_argument(
         "--auth-mode",
-        choices=["retain", "shared", "profile"],
-        default="retain",
+        choices=["shared", "profile"],
+        default="shared",
         help="Auth authority for the new profile; profile mode explicitly copies source auth",
     )
 

@@ -12602,7 +12602,7 @@ def cmd_profile(args):
                 clone_config=clone_config,
                 no_alias=no_alias,
                 no_skills=no_skills,
-                auth_mode=getattr(args, "auth_mode", "retain"),
+                auth_mode=getattr(args, "auth_mode", "shared"),
                 description=getattr(args, "description", None),
             )
             print(f"\nProfile '{name}' created at {profile_dir}")

@@ -42,6 +42,15 @@ def test_clone_profile_requires_explicit_auth_mode_for_local_credentials(profile
     assert yaml.safe_load((shared / "config.yaml").read_text())["auth"]["authority"] == "shared"
 
 
+def test_new_profile_defaults_to_explicit_shared_authority(profile_root):
+    from hermes_cli.profiles import create_profile
+
+    created = create_profile("fresh", no_alias=True)
+
+    assert yaml.safe_load((created / "config.yaml").read_text())["auth"]["authority"] == "shared"
+    assert not (created / "auth.json").exists()
+
+
 def test_delete_profile_local_auth_requires_purge_or_archive(profile_root):
     from hermes_cli.profiles import create_profile, delete_profile
 
@@ -89,3 +98,67 @@ def test_rename_moves_profile_local_authority_without_touching_shared(profile_ro
     assert (renamed / "auth.json").is_file()
     assert yaml.safe_load((renamed / "config.yaml").read_text())["auth"]["authority"] == "profile"
     assert (profile_root / "auth.json").read_text() == shared_raw
+
+
+def test_rename_stops_profile_backends_before_moving_local_authority(profile_root):
+    from hermes_cli.profiles import create_profile, rename_profile
+
+    local = create_profile("before", auth_mode="profile", no_alias=True)
+    (local / "auth.json").write_text('{"providers":{}}', encoding="utf-8")
+    events = []
+    real_rename = Path.rename
+
+    with patch(
+        "hermes_cli.profiles._stop_profile_backends",
+        side_effect=lambda *_args: events.append("backends-stopped"),
+    ), patch(
+        "hermes_cli.profiles._cleanup_gateway_service",
+        side_effect=lambda *_args, **_kwargs: events.append("gateway-stopped"),
+    ), patch.object(
+        Path,
+        "rename",
+        autospec=True,
+        side_effect=lambda source, destination: (
+            events.append("renamed"),
+            real_rename(source, destination),
+        )[1],
+    ):
+        rename_profile("before", "after")
+
+    assert events.index("backends-stopped") < events.index("renamed")
+    assert events.index("gateway-stopped") < events.index("renamed")
+
+
+def test_delete_archives_profile_auth_only_after_writers_stop(
+    tmp_path, monkeypatch
+) -> None:
+    import hermes_cli.profiles as profiles
+
+    root = tmp_path / ".hermes"
+    target = root / "profiles" / "local"
+    target.mkdir(parents=True)
+    (target / "config.yaml").write_text(
+        "auth:\n  authority: profile\n", encoding="utf-8"
+    )
+    (target / "auth.json").write_text('{"providers": {}}', encoding="utf-8")
+    events: list[str] = []
+
+    monkeypatch.setattr(Path, "home", lambda: tmp_path)
+    monkeypatch.setenv("HERMES_HOME", str(root))
+    monkeypatch.setattr(
+        profiles,
+        "_stop_profile_backends",
+        lambda *_args, **_kwargs: events.append("stop"),
+    )
+    monkeypatch.setattr(
+        profiles, "_cleanup_gateway_service", lambda *_args, **_kwargs: None
+    )
+    monkeypatch.setattr(profiles, "_stop_gateway_process", lambda *_args: None)
+    monkeypatch.setattr(
+        profiles,
+        "_archive_profile_auth",
+        lambda *_args, **_kwargs: events.append("archive") or (root / "archived"),
+    )
+
+    assert profiles.delete_profile("local", yes=True, auth_action="archive") == target
+    assert events.index("stop") < events.index("archive")
