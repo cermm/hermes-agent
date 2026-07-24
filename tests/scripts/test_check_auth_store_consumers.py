@@ -119,6 +119,49 @@ def test_audit_rejects_constructed_auth_store_paths(
     assert stale == []
 
 
+def test_audit_rejects_direct_builtin_open_of_auth_store(tmp_path: Path) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        'open("auth.json", "rb")\n', encoding="utf-8"
+    )
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", 1, "open")
+    ]
+    assert stale == []
+
+
+@pytest.mark.parametrize(
+    ("method", "arguments"),
+    [
+        ("read_text", ""),
+        ("read_bytes", ""),
+        ("write_text", '"replacement"'),
+        ("write_bytes", 'b"replacement"'),
+        ("open", '"rb"'),
+    ],
+)
+def test_audit_rejects_constant_bound_path_io_consumer(
+    tmp_path: Path, method: str, arguments: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        "from pathlib import Path\n"
+        'AUTH_STORE = "auth.json"\n'
+        f"Path(AUTH_STORE).{method}({arguments})\n",
+        encoding="utf-8",
+    )
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", 3, method)
+    ]
+    assert stale == []
+
+
 def test_inventory_rejects_unapproved_category(tmp_path: Path) -> None:
     module = _load_module()
     inventory = _inventory(

@@ -25,6 +25,7 @@ _EXCLUDED_PARTS = {
 }
 _TEST_NAME_RE = re.compile(r"(?:^test_|_test\.py$|\.test\.[^.]+$|\.spec\.[^.]+$)")
 _AUTH_BASENAME = "auth.json"
+_PATH_IO_METHODS = {"open", "read_bytes", "read_text", "write_bytes", "write_text"}
 
 # Reviewed exception contracts from the issue-380 consumer inventory. Reasons
 # are machine values on purpose: free-form prose would let an inventory edit
@@ -75,25 +76,29 @@ def _is_auth_store_reference(value: str) -> bool:
     return normalized == _AUTH_BASENAME or normalized.endswith(f"/{_AUTH_BASENAME}")
 
 
-def _static_string(node: ast.AST) -> Optional[str]:
+def _static_string(
+    node: ast.AST, bindings: Optional[dict[str, str]] = None
+) -> Optional[str]:
     """Fold common static string/path forms without evaluating source code."""
     if isinstance(node, ast.Constant) and isinstance(node.value, str):
         return node.value
+    if isinstance(node, ast.Name) and bindings is not None:
+        return bindings.get(node.id)
     if isinstance(node, ast.JoinedStr):
         parts: list[str] = []
         for value in node.values:
             if isinstance(value, ast.FormattedValue):
-                folded = _static_string(value.value)
+                folded = _static_string(value.value, bindings)
                 parts.append(folded if folded is not None else "<dynamic>")
             else:
-                folded = _static_string(value)
+                folded = _static_string(value, bindings)
                 if folded is None:
                     return None
                 parts.append(folded)
         return "".join(parts)
     if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Add):
-        left = _static_string(node.left)
-        right = _static_string(node.right)
+        left = _static_string(node.left, bindings)
+        right = _static_string(node.right, bindings)
         if left is not None or right is not None:
             return (left if left is not None else "<dynamic>") + (
                 right if right is not None else "<dynamic>"
@@ -107,7 +112,7 @@ def _static_string(node: ast.AST) -> Optional[str]:
         ):
             parts: list[str] = []
             for arg in node.args:
-                folded = _static_string(arg)
+                folded = _static_string(arg, bindings)
                 parts.append(folded if folded is not None else "<dynamic>")
             return "/".join(parts)
         if (
@@ -115,11 +120,50 @@ def _static_string(node: ast.AST) -> Optional[str]:
             and node.func.attr == "with_suffix"
             and len(node.args) == 1
         ):
-            base = _static_string(node.func.value)
-            suffix = _static_string(node.args[0])
+            base = _static_string(node.func.value, bindings)
+            suffix = _static_string(node.args[0], bindings)
             if base is not None and suffix is not None:
                 return str(Path(base).with_suffix(suffix))
     return None
+
+
+def _module_static_string_bindings(tree: ast.Module) -> dict[str, str]:
+    """Resolve names assigned exactly once to fully static module-level strings."""
+    assignments: dict[str, list[ast.AST]] = {}
+    invalidated: set[str] = set()
+    for statement in tree.body:
+        if isinstance(statement, ast.Assign):
+            for target in statement.targets:
+                if isinstance(target, ast.Name):
+                    assignments.setdefault(target.id, []).append(statement.value)
+        elif isinstance(statement, ast.AnnAssign) and isinstance(
+            statement.target, ast.Name
+        ):
+            if statement.value is not None:
+                assignments.setdefault(statement.target.id, []).append(statement.value)
+        elif isinstance(statement, ast.AugAssign) and isinstance(
+            statement.target, ast.Name
+        ):
+            invalidated.add(statement.target.id)
+
+    unresolved = {
+        name: values[0]
+        for name, values in assignments.items()
+        if len(values) == 1 and name not in invalidated
+    }
+    bindings: dict[str, str] = {}
+    while unresolved:
+        resolved_names: list[str] = []
+        for name, value in unresolved.items():
+            folded = _static_string(value, bindings)
+            if folded is not None and "<dynamic>" not in folded:
+                bindings[name] = folded
+                resolved_names.append(name)
+        if not resolved_names:
+            break
+        for name in resolved_names:
+            del unresolved[name]
+    return bindings
 
 
 def _python_findings(path: Path, relative: str) -> list[Finding]:
@@ -127,6 +171,7 @@ def _python_findings(path: Path, relative: str) -> list[Finding]:
         tree = ast.parse(path.read_text(encoding="utf-8"), filename=relative)
     except (OSError, UnicodeError, SyntaxError):
         return []
+    bindings = _module_static_string_bindings(tree)
     findings: list[Finding] = []
     seen_lines: set[int] = set()
     for node in ast.walk(tree):
@@ -134,6 +179,25 @@ def _python_findings(path: Path, relative: str) -> list[Finding]:
         if line is None:
             continue
         if (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Name)
+            and node.func.id == "open"
+            and node.args
+            and (target := _static_string(node.args[0], bindings)) is not None
+            and _is_auth_store_reference(target)
+        ):
+            findings.append(Finding(relative, line, "open"))
+            seen_lines.add(line)
+        elif (
+            isinstance(node, ast.Call)
+            and isinstance(node.func, ast.Attribute)
+            and node.func.attr in _PATH_IO_METHODS
+            and (target := _static_string(node.func.value, bindings)) is not None
+            and _is_auth_store_reference(target)
+        ):
+            findings.append(Finding(relative, line, node.func.attr))
+            seen_lines.add(line)
+        elif (
             isinstance(node, ast.BinOp)
             and isinstance(node.op, ast.Div)
             and isinstance(node.right, ast.Constant)
@@ -151,7 +215,7 @@ def _python_findings(path: Path, relative: str) -> list[Finding]:
         if line not in seen_lines and isinstance(
             node, (ast.Call, ast.JoinedStr, ast.BinOp)
         ):
-            folded = _static_string(node)
+            folded = _static_string(node, bindings)
             if folded is not None and _is_auth_store_reference(folded):
                 findings.append(Finding(relative, line, "constructed_path"))
                 seen_lines.add(line)
