@@ -11,6 +11,8 @@ from __future__ import annotations
 import importlib.util
 import json
 import multiprocessing
+import os
+import subprocess
 import sys
 from pathlib import Path
 
@@ -391,3 +393,62 @@ def test_terminal_entry_missing_marker_is_not_terminal(tmp_path):
     entry) → not terminal, no re-seed."""
     auth = _write_auth(tmp_path, {"nous": {"client_id": "hermes-cli-vps"}})
     assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "not_terminal"
+
+
+def test_stage2_bootstrap_restart_and_rebootstrap_script_chain(tmp_path):
+    """Exercise the repository-owned stage2 auth subprocess chain end to end."""
+    scripts = _SCRIPT.parent
+    authority_script = scripts / "docker_auth_authority.py"
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env["HERMES_AUTH_JSON_BOOTSTRAP"] = _FRESH_SEED
+
+    seeded = subprocess.run(
+        [sys.executable, str(authority_script), str(profile), "seed"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert seeded.stdout.strip() == "seeded"
+    shared = home / "auth.json"
+    assert shared.is_file()
+    assert not (profile / "auth.json").exists()
+
+    store = json.loads(shared.read_text(encoding="utf-8"))
+    store["providers"]["openai-codex"] = {"account": "survives-restart"}
+    shared.write_text(json.dumps(store), encoding="utf-8")
+    shared.chmod(0o600)
+    preserved = subprocess.run(
+        [sys.executable, str(authority_script), str(profile), "seed"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert preserved.stdout.strip() == "exists"
+
+    store = json.loads(shared.read_text(encoding="utf-8"))
+    store["providers"]["nous"] = _terminal_nous_state()
+    shared.write_text(json.dumps(store), encoding="utf-8")
+    shared.chmod(0o600)
+    env["HERMES_AUTH_JSON_REBOOTSTRAP"] = _FRESH_SEED
+    reseeded = subprocess.run(
+        [sys.executable, str(_SCRIPT), str(shared)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "re-seeded auth.json" in reseeded.stdout
+    final = json.loads(shared.read_text(encoding="utf-8"))
+    assert final["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+    assert final["providers"]["openai-codex"] == {"account": "survives-restart"}
+    assert shared.stat().st_mode & 0o777 == 0o600
+    assert (home / "auth.lock").stat().st_mode & 0o777 == 0o600

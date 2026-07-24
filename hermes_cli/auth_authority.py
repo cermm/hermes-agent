@@ -224,6 +224,12 @@ def resolve_auth_authority(
             effective_mode = "profile"
             legacy = True
 
+    for candidate in (profile_path, shared_path):
+        if candidate.is_symlink():
+            raise AuthAuthorityConfigError(
+                f"Authentication authority path must not be a symlink: {candidate}"
+            )
+
     auth_path = auth_path.resolve(strict=False)
     if auth_path.exists() and not auth_path.is_file():
         raise AuthAuthorityConfigError(

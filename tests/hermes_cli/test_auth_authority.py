@@ -200,3 +200,22 @@ def test_incomplete_restore_skips_unstatable_journal_candidate(profile_layout):
         "operation_id": "valid-operation",
         "phase": "auth_written",
     }
+
+
+@pytest.mark.parametrize("mode", ["shared", "profile"])
+def test_authority_rejects_auth_store_symlinks(profile_layout, mode):
+    from hermes_cli.auth_authority import (
+        AuthAuthorityConfigError,
+        resolve_auth_authority,
+    )
+
+    _write_config(profile_layout["profile"], {"authority": mode})
+    outside = profile_layout["root"].parent / f"outside-{mode}.json"
+    outside.write_text("{}", encoding="utf-8")
+    target_home = (
+        profile_layout["root"] if mode == "shared" else profile_layout["profile"]
+    )
+    (target_home / "auth.json").symlink_to(outside)
+
+    with pytest.raises(AuthAuthorityConfigError, match="must not be a symlink"):
+        resolve_auth_authority()

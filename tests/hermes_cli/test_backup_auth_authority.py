@@ -558,3 +558,59 @@ def test_auth_restore_holds_transition_gate_through_target_write(
     )
 
     assert competing_result == ["blocked"]
+
+
+def test_encrypted_backup_snapshot_serializes_against_auth_writer(
+    backup_home, monkeypatch
+):
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.backup as backup_mod
+
+    passphrase = backup_home.parent / "passphrase-concurrent-writer"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    before = b'{"providers":{"nous":{"generation":"before-backup"}}}'
+    (backup_home / "auth.json").write_bytes(before)
+    writer_timed_out = threading.Event()
+    retry_writer = threading.Event()
+    writer_finished = threading.Event()
+    captured: list[bytes] = []
+
+    def writer() -> None:
+        try:
+            with auth_mod._auth_store_lock(timeout_seconds=0.1):
+                pytest.fail("writer acquired auth lock during encrypted snapshot")
+        except TimeoutError:
+            writer_timed_out.set()
+        assert retry_writer.wait(5)
+        with auth_mod._auth_store_lock(timeout_seconds=2):
+            store = auth_mod._load_auth_store()
+            store["providers"]["nous"]["generation"] = "after-backup"
+            auth_mod._save_auth_store(store)
+        writer_finished.set()
+
+    worker = threading.Thread(target=writer)
+
+    def controlled_encrypt(raw: bytes, _passphrase: str):
+        captured.append(raw)
+        worker.start()
+        assert writer_timed_out.wait(3)
+        return b"test-encrypted-envelope", {"version": 2, "sha256": "test"}
+
+    monkeypatch.setattr(backup_mod, "_encrypt_auth", controlled_encrypt)
+    backup_mod.run_backup(
+        _backup_args(
+            backup_home,
+            auth_mode="include-encrypted",
+            auth_passphrase_file=str(passphrase),
+        )
+    )
+    retry_writer.set()
+    worker.join(5)
+
+    assert not worker.is_alive()
+    assert writer_finished.is_set()
+    assert captured == [before]
+    final = json.loads((backup_home / "auth.json").read_text(encoding="utf-8"))
+    assert final["providers"]["nous"]["generation"] == "after-backup"
+    with zipfile.ZipFile(backup_home / "backups.zip") as zf:
+        assert zf.read("_auth/authority.enc") == b"test-encrypted-envelope"

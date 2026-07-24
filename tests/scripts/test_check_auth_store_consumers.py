@@ -5,6 +5,8 @@ import json
 import sys
 from pathlib import Path
 
+import pytest
+
 
 _SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "check_auth_store_consumers.py"
 
@@ -18,10 +20,14 @@ def _load_module():
     return module
 
 
-def _inventory(path: Path, consumers: dict[str, str]) -> Path:
+def _entry(category: str, reason: str) -> dict[str, str]:
+    return {"category": category, "reason": reason}
+
+
+def _inventory(path: Path, consumers: dict[str, dict[str, str]]) -> Path:
     inventory = path / "inventory.json"
     inventory.write_text(
-        json.dumps({"version": 1, "consumers": consumers}), encoding="utf-8"
+        json.dumps({"version": 2, "consumers": consumers}), encoding="utf-8"
     )
     return inventory
 
@@ -54,8 +60,13 @@ def test_audit_accepts_reviewed_category_and_rejects_stale_entries(
     inventory = _inventory(
         tmp_path,
         {
-            "adapter.py": "whole_store_deployment_adapter",
-            "removed.py": "canonical_authority_owner",
+            "adapter.py": _entry(
+                "whole_store_deployment_adapter",
+                "canonical_locked_deployment_seed",
+            ),
+            "removed.py": _entry(
+                "canonical_authority_owner", "canonical_auth_authority"
+            ),
         },
     )
 
@@ -81,3 +92,54 @@ def test_scan_ignores_tests_but_covers_non_python_deployment_adapters(
     assert [(item.path, item.line, item.kind) for item in findings] == [
         ("stage2-hook.sh", 1, "text_reference")
     ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        'AUTH_STORE = Path("auth.json")\n',
+        'AUTH_STORE = Path(f"{home}/auth.json")\n',
+        'AUTH_STORE = Path("auth" + ".json")\n',
+        'AUTH_STORE = str(home) + "/auth.json"\n',
+        'AUTH_STORE = Path(home, "auth.json")\n',
+        'AUTH_STORE = Path("auth").with_suffix(".json")\n',
+    ],
+)
+def test_audit_rejects_constructed_auth_store_paths(
+    tmp_path: Path, source: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        "from pathlib import Path\n" + source, encoding="utf-8"
+    )
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line) for item in unclassified] == [("consumer.py", 2)]
+    assert stale == []
+
+
+def test_inventory_rejects_unapproved_category(tmp_path: Path) -> None:
+    module = _load_module()
+    inventory = _inventory(
+        tmp_path,
+        {"consumer.py": _entry("looks_safe", "canonical_auth_authority")},
+    )
+
+    with pytest.raises(ValueError, match="unapproved category"):
+        module.load_inventory(inventory)
+
+
+def test_inventory_rejects_unapproved_reason(tmp_path: Path) -> None:
+    module = _load_module()
+    inventory = _inventory(
+        tmp_path,
+        {
+            "consumer.py": _entry(
+                "canonical_authority_owner", "reviewed_by_someone"
+            )
+        },
+    )
+
+    with pytest.raises(ValueError, match="unapproved reason"):
+        module.load_inventory(inventory)

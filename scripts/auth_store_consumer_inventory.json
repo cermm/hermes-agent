@@ -1,18 +1,19 @@
 {
-  "version": 1,
+  "version": 2,
   "consumers": {
-    "agent/credential_pool.py": "non_io_security_guard",
-    "hermes_cli/auth.py": "canonical_authority_owner",
-    "hermes_cli/auth_authority.py": "canonical_authority_owner",
-    "hermes_cli/auth_migration.py": "whole_store_migration_adapter",
-    "hermes_cli/backup.py": "whole_store_backup_restore_adapter",
-    "hermes_cli/profiles.py": "profile_clone_export_adapter",
-    "scripts/docker_auth_authority.py": "whole_store_boot_adapter",
-    "scripts/nix_auth_authority.py": "whole_store_deployment_adapter",
-    "scripts/tool_search_livetest.py": "explicit_credential_copy_harness",
-    "plugins/google_meet/cli.py": "provider_native_store",
-    "docker/hermes-exec-shim.sh": "whole_store_boot_adapter",
-    "docker/stage2-hook.sh": "whole_store_boot_adapter",
-    "nix/nixosModules.nix": "whole_store_deployment_adapter"
+    "agent/credential_pool.py": {"category": "non_io_security_guard", "reason": "non_io_guard_no_store_access"},
+    "hermes_cli/auth.py": {"category": "canonical_authority_owner", "reason": "canonical_auth_authority"},
+    "hermes_cli/auth_authority.py": {"category": "canonical_authority_owner", "reason": "canonical_auth_authority"},
+    "hermes_cli/auth_migration.py": {"category": "whole_store_migration_adapter", "reason": "canonical_locked_migration"},
+    "hermes_cli/backup.py": {"category": "whole_store_backup_restore_adapter", "reason": "canonical_locked_backup_restore"},
+    "hermes_cli/profiles.py": {"category": "profile_clone_export_adapter", "reason": "explicit_profile_clone_export"},
+    "nix/checks.nix": {"category": "repository_integration_harness", "reason": "build_time_authority_contract_check"},
+    "scripts/docker_auth_authority.py": {"category": "whole_store_boot_adapter", "reason": "canonical_locked_bootstrap"},
+    "scripts/nix_auth_authority.py": {"category": "whole_store_deployment_adapter", "reason": "canonical_locked_deployment_seed"},
+    "scripts/tool_search_livetest.py": {"category": "explicit_credential_copy_harness", "reason": "isolated_opt_in_credential_copy"},
+    "plugins/google_meet/cli.py": {"category": "provider_native_store", "reason": "provider_native_non_hermes_store"},
+    "docker/hermes-exec-shim.sh": {"category": "whole_store_boot_adapter", "reason": "canonical_locked_bootstrap"},
+    "docker/stage2-hook.sh": {"category": "whole_store_boot_adapter", "reason": "canonical_locked_bootstrap"},
+    "nix/nixosModules.nix": {"category": "whole_store_deployment_adapter", "reason": "canonical_locked_deployment_seed"}
   }
 }

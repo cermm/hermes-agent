@@ -1018,6 +1018,14 @@ def _auth_lock_holder_for(target_path: Path) -> threading.local:
         return _auth_target_lock_holders.setdefault(key, threading.local())
 
 
+def _validate_locked_store_path(path: Path) -> None:
+    """Fail closed if a locked transaction target was replaced by a link."""
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlink auth transaction path: {path}")
+    if path.exists() and not path.is_file():
+        raise RuntimeError(f"Auth transaction path must be a regular file: {path}")
+
+
 @contextmanager
 def _file_lock(
     lock_path: Path,
@@ -1124,7 +1132,10 @@ def _auth_store_locks(
         if target_paths is None:
             paths = {Path(pinned_path).resolve(strict=False)}
         else:
-            paths = {Path(path).resolve(strict=False) for path in target_paths}
+            raw_paths = {Path(path) for path in target_paths}
+            for path in raw_paths:
+                _validate_locked_store_path(path)
+            paths = {path.resolve(strict=False) for path in raw_paths}
         held_paths = getattr(_auth_transaction_target, "locked_paths", frozenset())
         if not paths.issubset(held_paths):
             raise RuntimeError(
@@ -1141,6 +1152,8 @@ def _auth_store_locks(
                         "Timed out waiting for auth store lock",
                     )
                 )
+            for path in paths:
+                _validate_locked_store_path(path)
             yield active_path, getattr(_auth_transaction_target, "fallback_path", None)
         return
 
@@ -1156,7 +1169,10 @@ def _auth_store_locks(
                     if fallback_path is not None:
                         paths.add(fallback_path)
             else:
-                paths = {Path(path).resolve(strict=False) for path in target_paths}
+                raw_paths = {Path(path) for path in target_paths}
+                for path in raw_paths:
+                    _validate_locked_store_path(path)
+                paths = {path.resolve(strict=False) for path in raw_paths}
                 if not paths:
                     raise ValueError("at least one auth-store target is required")
                 active_path = Path(
@@ -1172,6 +1188,8 @@ def _auth_store_locks(
                         "Timed out waiting for auth store lock",
                     )
                 )
+            for path in paths:
+                _validate_locked_store_path(path)
 
         previous = getattr(_auth_transaction_target, "path", None)
         _auth_transaction_target.path = active_path

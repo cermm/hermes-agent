@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import multiprocessing
 import os
+from contextlib import contextmanager
 from pathlib import Path
 import threading
 
@@ -19,6 +20,22 @@ def _write_provider(profile_home: str, provider: str, ready, start) -> None:
         with _auth_store_lock():
             store = _load_auth_store()
             store.setdefault("providers", {})[provider] = {"sequence": sequence}
+            _save_auth_store(store)
+
+
+def _increment_provider(
+    profile_home: str, provider: str, iterations: int, ready, start
+) -> None:
+    os.environ["HERMES_HOME"] = profile_home
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
+    ready.put(profile_home)
+    start.wait(10)
+    for _ in range(iterations):
+        with _auth_store_lock():
+            store = _load_auth_store()
+            state = store.setdefault("providers", {}).setdefault(provider, {})
+            state["rotations"] = int(state.get("rotations", 0)) + 1
             _save_auth_store(store)
 
 
@@ -92,6 +109,172 @@ def test_shared_authority_lock_is_released_when_writer_crashes(tmp_path: Path) -
         _save_auth_store({"providers": {"after-crash": {}}}, target_path=path)
 
     assert "after-crash" in json.loads(path.read_text())["providers"]
+
+
+def test_shared_authority_serializes_same_provider_rotation(tmp_path: Path) -> None:
+    root = tmp_path / "hermes"
+    profiles = [root / "profiles" / name for name in ("alpha", "beta")]
+    for profile in profiles:
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text(
+            "auth:\n  authority: shared\n", encoding="utf-8"
+        )
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    start = context.Event()
+    workers = [
+        context.Process(
+            target=_increment_provider,
+            args=(str(profile), "nous", 20, ready, start),
+        )
+        for profile in profiles
+    ]
+    for worker in workers:
+        worker.start()
+    assert {ready.get(timeout=10), ready.get(timeout=10)} == {
+        str(profile) for profile in profiles
+    }
+    start.set()
+    for worker in workers:
+        worker.join(20)
+        assert worker.exitcode == 0
+
+    store = json.loads((root / "auth.json").read_text(encoding="utf-8"))
+    assert store["providers"]["nous"]["rotations"] == 40
+    assert (root / "auth.lock").is_file()
+    assert not any((profile / "auth.lock").exists() for profile in profiles)
+
+
+def test_explicit_profile_authorities_remain_isolated_under_same_workload(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "hermes"
+    profiles = [root / "profiles" / name for name in ("alpha", "beta")]
+    for profile in profiles:
+        profile.mkdir(parents=True)
+        (profile / "config.yaml").write_text(
+            "auth:\n  authority: profile\n", encoding="utf-8"
+        )
+
+    context = multiprocessing.get_context("spawn")
+    ready = context.Queue()
+    start = context.Event()
+    workers = [
+        context.Process(
+            target=_increment_provider,
+            args=(str(profile), "nous", 20, ready, start),
+        )
+        for profile in profiles
+    ]
+    for worker in workers:
+        worker.start()
+    assert {ready.get(timeout=10), ready.get(timeout=10)} == {
+        str(profile) for profile in profiles
+    }
+    start.set()
+    for worker in workers:
+        worker.join(20)
+        assert worker.exitcode == 0
+
+    for profile in profiles:
+        store = json.loads((profile / "auth.json").read_text(encoding="utf-8"))
+        assert store["providers"]["nous"]["rotations"] == 20
+        assert (profile / "auth.json").stat().st_mode & 0o777 == 0o600
+        assert (profile / "auth.lock").is_file()
+    assert not (root / "auth.json").exists()
+    assert not (root / "auth.lock").exists()
+
+
+@pytest.mark.parametrize("failure_point", ["before-temp", "after-temp"])
+def test_atomic_save_failure_preserves_store_and_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    import hermes_cli.auth as auth_mod
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    auth_file = home / "auth.json"
+    original = b'{"version":1,"providers":{"nous":{"generation":"old"}}}\n'
+    auth_file.write_bytes(original)
+    auth_file.chmod(0o600)
+    backup = home / "auth.json.backup"
+    backup.write_bytes(original)
+    backup.chmod(0o600)
+    monkeypatch.setenv("HERMES_HOME", str(home))
+
+    if failure_point == "before-temp":
+        real_open = auth_mod.os.open
+
+        def fail_temp_open(path, flags, mode=0o777):
+            if ".tmp." in os.fspath(path):
+                raise OSError("failure before temporary-file creation")
+            return real_open(path, flags, mode)
+
+        monkeypatch.setattr(auth_mod.os, "open", fail_temp_open)
+    else:
+        def fail_replace(*_args):
+            raise OSError("failure after temporary-file creation")
+
+        monkeypatch.setattr(auth_mod, "atomic_replace", fail_replace)
+
+    with pytest.raises(OSError, match="temporary-file creation"):
+        with auth_mod._auth_store_lock():
+            auth_mod._save_auth_store(
+                {"providers": {"nous": {"generation": "new"}}}
+            )
+
+    assert json.loads(auth_file.read_text(encoding="utf-8"))["providers"]["nous"] == {
+        "generation": "old"
+    }
+    assert json.loads(backup.read_text(encoding="utf-8"))["providers"]["nous"] == {
+        "generation": "old"
+    }
+    assert not list(home.glob("auth.json.tmp.*"))
+    assert auth_file.stat().st_mode & 0o777 == 0o600
+
+
+def test_store_symlink_substitution_while_acquiring_lock_fails_closed(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    import hermes_cli.auth as auth_mod
+
+    home = tmp_path / "hermes"
+    home.mkdir()
+    (home / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    outside = tmp_path / "outside.json"
+    outside.write_text('{"providers":{"outside":{}}}', encoding="utf-8")
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    real_file_lock = auth_mod._file_lock
+    substituted = False
+
+    @contextmanager
+    def substitute_after_lock(lock_path, holder, timeout_seconds, timeout_message):
+        nonlocal substituted
+        with real_file_lock(lock_path, holder, timeout_seconds, timeout_message):
+            if Path(lock_path) == home / "auth.lock" and not substituted:
+                substituted = True
+                (home / "auth.json").symlink_to(outside)
+            yield
+
+    monkeypatch.setattr(auth_mod, "_file_lock", substitute_after_lock)
+
+    with pytest.raises(RuntimeError, match="symlink auth transaction path"):
+        with auth_mod._auth_store_lock():
+            auth_mod._save_auth_store({"providers": {"replacement": {}}})
+
+    assert substituted is True
+    assert (home / "auth.json").is_symlink()
+    assert json.loads(outside.read_text(encoding="utf-8")) == {
+        "providers": {"outside": {}}
+    }
 
 
 def test_implicit_auth_transaction_pins_the_resolved_authority(
