@@ -433,6 +433,72 @@ def test_starred_path_constructor_fails_closed_on_sequence_overflow(
     ]
 
 
+def _starred_path_product_source(*, alternatives: int, auth_first: bool) -> str:
+    lead = (
+        '("auth.json",) if lead_enabled else ("other.json",)'
+        if auth_first
+        else '("other.json",) if lead_enabled else ("auth.json",)'
+    )
+    definitions = ["from pathlib import Path\n", f"lead = {lead}\n"]
+    arguments = ["*lead"]
+    for index in range(alternatives):
+        definitions.append(
+            f'pad_{index} = ("",) if pad_{index}_enabled else ("", "")\n'
+        )
+        arguments.append(f"*pad_{index}")
+    return "".join(definitions) + f"Path({', '.join(arguments)})\n"
+
+
+def test_starred_path_constructor_fails_closed_when_default_cap_omits_auth_ordering(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        _starred_path_product_source(alternatives=7, auth_first=False),
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.kind) for item in findings] == [
+        ("consumer.py", "constructed_path")
+    ]
+
+
+@pytest.mark.parametrize("auth_first", [True, False])
+def test_starred_path_constructor_cap_is_order_independent(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, auth_first: bool
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_FLOW_ALTERNATIVES", 2)
+    (tmp_path / "consumer.py").write_text(
+        _starred_path_product_source(alternatives=1, auth_first=auth_first),
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.kind) for item in findings] == [
+        ("consumer.py", "constructed_path")
+    ]
+
+
+@pytest.mark.parametrize("alternatives", [1, 2])
+def test_starred_non_auth_path_at_or_below_cap_does_not_fail_closed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    alternatives: int,
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_FLOW_ALTERNATIVES", 4)
+    source = _starred_path_product_source(
+        alternatives=alternatives, auth_first=False
+    ).replace('("auth.json",)', '("other.json",)')
+    (tmp_path / "harmless.py").write_text(source, encoding="utf-8")
+
+    assert module.scan_repository(tmp_path) == []
+
+
 def test_nested_sequence_unpacking_fails_closed_on_structured_product_overflow(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

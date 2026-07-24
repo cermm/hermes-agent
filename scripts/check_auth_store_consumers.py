@@ -883,6 +883,9 @@ class _PythonFlowAnalyzer:
                     tuple(self._resolve_flow_value(item) for item in option)
                     for option in options
                 )
+                overflowed = overflowed or (
+                    len(signatures) * len(options) > _MAX_FLOW_ALTERNATIVES
+                )
                 expanded = []
                 for positional, keywords in signatures:
                     for option in options:
