@@ -12,9 +12,9 @@
 // spent regardless of the isolated backend.
 
 import { spawn } from 'node:child_process'
-import { copyFileSync, existsSync, mkdtempSync, rmSync } from 'node:fs'
+import { copyFileSync, existsSync, mkdtempSync, readFileSync, rmSync } from 'node:fs'
 import { createRequire } from 'node:module'
-import { tmpdir } from 'node:os'
+import { homedir, tmpdir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
@@ -64,9 +64,13 @@ export function seedConfigFrom(sourceHome, targetHome) {
   }
 }
 
+export function defaultHermesSourceHome() {
+  return join(homedir(), '.hermes')
+}
+
 // Resolve the vite CLI entry via its package.json `bin` (Vite 8's `exports`
 // blocks importing `vite/bin/vite.js` directly).
-function resolveViteBin() {
+export function resolveViteBin() {
   const pkgPath = require.resolve('vite/package.json')
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
   const rel = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.vite
@@ -183,7 +187,7 @@ export async function startIsolatedInstance({
   const devUrl = prod ? null : `http://127.0.0.1:${devPort}`
 
   if (seedConfig && !hermesHome) {
-    seedConfigFrom(join(homedir(), '.hermes'), home)
+    seedConfigFrom(defaultHermesSourceHome(), home)
   }
 
   const teardown = () => {
@@ -336,7 +340,7 @@ export async function coldStartSamples({ runs = 3, port = 9222, devPort = 5174, 
     // runs 1..N are the representative warm samples.
     const home = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-home-'))
     const userDataDir = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-ud-'))
-    seedConfigFrom(join(homedir(), '.hermes'), home)
+    seedConfigFrom(defaultHermesSourceHome(), home)
 
     try {
       for (let i = 0; i <= runs; i++) {

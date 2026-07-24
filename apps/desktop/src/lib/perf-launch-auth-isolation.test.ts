@@ -1,10 +1,10 @@
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs'
-import { tmpdir } from 'node:os'
-import { join } from 'node:path'
+import { homedir, tmpdir } from 'node:os'
+import { basename, dirname, join } from 'node:path'
 
 import { afterEach, describe, expect, it } from 'vitest'
 
-import { seedConfigFrom } from '../../scripts/perf/lib/launch.mjs'
+import { defaultHermesSourceHome, resolveViteBin, seedConfigFrom } from '../../scripts/perf/lib/launch.mjs'
 
 const roots: string[] = []
 
@@ -22,6 +22,18 @@ afterEach(() => {
 })
 
 describe('desktop isolated perf launch', () => {
+  it('resolves the installed Vite CLI entry', () => {
+    const viteBin = resolveViteBin()
+
+    expect(existsSync(viteBin)).toBe(true)
+    expect(basename(viteBin)).toBe('vite.js')
+    expect(basename(dirname(viteBin))).toBe('bin')
+  })
+
+  it('uses the current OS home for the default Hermes config source', () => {
+    expect(defaultHermesSourceHome()).toBe(join(homedir(), '.hermes'))
+  })
+
   it('copies only non-secret config and leaves auth acquisition to the backend', () => {
     const root = tempRoot()
     const source = join(root, 'source')
