@@ -527,6 +527,32 @@ class _PythonFlowAnalyzer:
                 )
         return frozenset(symbols)
 
+    def _sequence_value(
+        self, node: ast.Tuple | ast.List, scope: _FlowScope
+    ) -> _FlowValue:
+        alternatives: tuple[tuple[_FlowValue, ...], ...] = ((),)
+        overflowed = False
+        for item in node.elts:
+            if isinstance(item, ast.Starred):
+                value = self._expression_value(item.value, scope)
+                options = value.sequences or ((_UNKNOWN_VALUE,),)
+                overflowed = overflowed or _FLOW_OVERFLOW in value.strings
+            else:
+                options = ((self._expression_value(item, scope),),)
+            alternatives, product_overflow = _merge_structures(
+                (),
+                tuple(
+                    (*prefix, *option)
+                    for prefix in alternatives
+                    for option in options
+                ),
+            )
+            overflowed = overflowed or product_overflow
+        return _FlowValue(
+            strings=frozenset({_FLOW_OVERFLOW}) if overflowed else frozenset(),
+            sequences=alternatives,
+        )
+
     def _expression_value(self, node: ast.AST, scope: _FlowScope) -> _FlowValue:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return _FlowValue(strings=frozenset({node.value}))
@@ -536,11 +562,7 @@ class _PythonFlowAnalyzer:
         if isinstance(node, ast.Starred):
             return self._expression_value(node.value, scope)
         if isinstance(node, (ast.Tuple, ast.List)):
-            return _FlowValue(
-                sequences=(
-                    tuple(self._expression_value(item, scope) for item in node.elts),
-                )
-            )
+            return self._sequence_value(node, scope)
         if isinstance(node, ast.Dict) and all(
             isinstance(key, ast.Constant) and isinstance(key.value, str)
             for key in node.keys

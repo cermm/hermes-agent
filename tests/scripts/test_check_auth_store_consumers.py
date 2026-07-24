@@ -372,6 +372,26 @@ def test_audit_rejects_auth_path_constructed_by_wrapper(
             4,
             id="wrapper-path-star-args",
         ),
+        pytest.param(
+            "from pathlib import Path\n"
+            'Path(*(*(\"auth.json\",),))\n',
+            2,
+            id="direct-nested-sequence-unpacking",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            'parts = (*(\"auth.json\",),)\n'
+            "Path(*parts)\n",
+            3,
+            id="assigned-tuple-nested-sequence-unpacking",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            'parts = [*(\"auth.json\",)]\n'
+            "Path(*parts)\n",
+            3,
+            id="assigned-list-nested-sequence-unpacking",
+        ),
     ],
 )
 def test_audit_rejects_static_auth_store_in_starred_path_constructor(
@@ -410,6 +430,27 @@ def test_starred_path_constructor_fails_closed_on_sequence_overflow(
 
     assert [(item.path, item.line, item.kind) for item in findings] == [
         ("consumer.py", 3, "constructed_path")
+    ]
+
+
+def test_nested_sequence_unpacking_fails_closed_on_structured_product_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_STRUCTURED_ALTERNATIVES", 2)
+    (tmp_path / "consumer.py").write_text(
+        "from pathlib import Path\n"
+        'left = ("left-a",) if first else ("left-b",)\n'
+        'right = ("right-a",) if second else ("right-b",)\n'
+        "parts = (*left, *right)\n"
+        "Path(*parts)\n",
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", 5, "constructed_path")
     ]
 
 
@@ -1141,6 +1182,15 @@ def test_scan_ignores_deferred_function_from_impossible_sibling_branch(
             "else:\n"
             '    parts = {"stem": "auth", "suffix": "json"}\n',
             id="mapping-percent-binding",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "if enabled:\n"
+            '    parts = (*(\"other.json\",),)\n'
+            "    Path(*parts)\n"
+            "else:\n"
+            '    parts = (*(\"auth.json\",),)\n',
+            id="nested-sequence-unpacking",
         ),
     ],
 )
