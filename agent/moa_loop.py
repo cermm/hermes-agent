@@ -281,7 +281,7 @@ def _maybe_apply_moa_cache_control(
 
 
 def _run_reference(
-    slot: dict[str, str],
+    slot: dict[str, Any],
     ref_messages: list[dict[str, Any]],
     *,
     temperature: float | None = None,
@@ -333,12 +333,37 @@ def _run_reference(
         # (their caching is automatic; markers are ignored harmlessly, but we
         # only decorate when the policy says the route honors them).
         messages = _maybe_apply_moa_cache_control(messages, runtime)
+        # Per-slot max_tokens takes precedence over the preset-level
+        # reference_max_tokens passed in by the caller. This lets each
+        # reference model have its own output cap independently.
+        _slot_max_tokens: int | None = slot.get("max_tokens")
+        _effective_max_tokens = _slot_max_tokens if _slot_max_tokens is not None else max_tokens
+        extra_headers = None
+        # Normalize provider aliases (github, github-copilot, github-models,
+        # ...) through the auxiliary client's canonical alias table so slot
+        # configs that spell Copilot differently still get the header.
+        from agent.auxiliary_client import _normalize_aux_provider
+
+        if _normalize_aux_provider(str(runtime.get("provider") or "")) in (
+            "copilot",
+            "copilot-acp",
+        ):
+            # Copilot Pro/Pro+ gates some premium chat models on request
+            # attribution. The main agent marks the first API request of a
+            # user turn as ``x-initiator: user``; MoA reference fan-out is also
+            # directly serving the user's current turn, not a background agent
+            # task, so mirror that header here. Without it, Claude/Gemini
+            # Copilot advisors can be rejected as unavailable to the
+            # ``copilot-language-server`` integrator even though standalone
+            # Copilot calls work.
+            extra_headers = {"x-initiator": "user"}
         response = call_llm(
             task="moa_reference",
             messages=messages,
             temperature=temperature,
-            max_tokens=max_tokens,
+            max_tokens=_effective_max_tokens,
             reasoning_config=_slot_reasoning_config(slot),
+            extra_headers=extra_headers,
             **runtime,
         )
         usage = CanonicalUsage()
@@ -398,7 +423,7 @@ def _run_reference(
 
 
 def _run_references_parallel(
-    reference_models: list[dict[str, str]],
+    reference_models: list[dict[str, Any]],
     ref_messages: list[dict[str, Any]],
     *,
     temperature: float | None = None,
@@ -683,27 +708,30 @@ def aggregate_moa_context(
     *,
     user_prompt: str,
     api_messages: list[dict[str, Any]],
-    reference_models: list[dict[str, str]],
-    aggregator: dict[str, str],
+    reference_models: list[dict[str, Any]],
+    aggregator: dict[str, Any],
     temperature: float | None = None,
     aggregator_temperature: float | None = None,
-    max_tokens: int | None = None,
+    reference_max_tokens: int | None = None,
 ) -> str:
     """Run configured reference models and synthesize their advice.
 
     Failures are returned as model-specific notes instead of aborting the normal
     agent loop; the main model can still act with partial context.
 
-    ``max_tokens`` is ``None`` by default: MoA does not cap reference or
-    aggregator output, so each model uses its own maximum. ``call_llm`` omits
-    the parameter entirely when it is ``None`` (see its docstring), which also
-    sidesteps providers that reject ``max_tokens`` outright. A hardcoded cap
-    here previously truncated long aggregator syntheses.
+    ``reference_max_tokens`` applies ONLY to the reference fan-out — the
+    aggregator's own synthesis call is never capped, so it always uses its
+    model's own maximum. ``call_llm`` omits the parameter entirely when it
+    is ``None`` (see its docstring), which also sidesteps providers that
+    reject ``max_tokens`` outright. A hardcoded cap on the aggregator call
+    previously truncated long aggregator syntheses (#53580) — passing
+    ``reference_max_tokens`` to both calls here would silently reintroduce
+    that regression.
 
     ``temperature`` / ``aggregator_temperature`` are ``None`` by default:
-    like max_tokens, ``call_llm`` omits temperature when None so the
-    provider default applies — matching single-model agent behavior. Presets
-    may still pin explicit values.
+    like ``reference_max_tokens``, ``call_llm`` omits temperature when None
+    so the provider default applies — matching single-model agent behavior.
+    Presets may still pin explicit values.
     """
     reference_outputs: list[tuple[str, str, Any]] = []
     ref_messages = _reference_messages(api_messages)
@@ -711,7 +739,7 @@ def aggregate_moa_context(
         reference_models,
         ref_messages,
         temperature=temperature,
-        max_tokens=max_tokens,
+        max_tokens=reference_max_tokens,
     )
 
     joined = "\n\n".join(
@@ -748,7 +776,6 @@ def aggregate_moa_context(
             task="moa_aggregator",
             messages=agg_messages,
             temperature=aggregator_temperature,
-            max_tokens=max_tokens,
             reasoning_config=_aggregator_reasoning_config(aggregator),
             **agg_runtime,
         )
@@ -1261,3 +1288,58 @@ class MoAClient:
         return self.chat.completions.consume_and_save_trace(
             session_id, aggregator_output_fallback=aggregator_output_fallback
         )
+
+
+def build_moa_facade(agent, preset_name: Any = None) -> MoAClient:
+    """Build the MoA facade client for ``agent``, wiring the reference relay.
+
+    Single construction point for ``MoAClient`` wherever the agent's shared
+    client is (re)built: initial setup (``agent_init``), turn-start fallback
+    restore (``restore_primary_runtime``), transient transport recovery
+    (``try_recover_primary_transport``), and mid-session model switches
+    (``switch_model``).
+
+    Constructing a bare ``MoAClient(preset)`` at any of those sites silently
+    drops the ``reference_callback`` relay that ``agent_init`` wires to
+    ``agent.tool_progress_callback`` — after a fallback+restore cycle the
+    facade would still work, but every frontend (CLI spinner, TUI, desktop,
+    gateway) would stop receiving ``moa.reference`` / ``moa.aggregating``
+    display events for the rest of the session (#53802).
+
+    The relay reads ``agent.tool_progress_callback`` at *emit* time, so a
+    callback attached after client construction is picked up automatically.
+    Best-effort and display-only — it never raises into the model call.
+    """
+    def _moa_reference_relay(event: str, **kwargs: Any) -> None:
+        cb = getattr(agent, "tool_progress_callback", None)
+        if cb is None:
+            return
+        try:
+            if event == "moa.reference":
+                label = str(kwargs.get("label") or "")
+                text = str(kwargs.get("text") or "")
+                idx = kwargs.get("index")
+                count = kwargs.get("count")
+                cb(
+                    "moa.reference",
+                    label,
+                    text,
+                    None,
+                    moa_index=idx,
+                    moa_count=count,
+                )
+            elif event == "moa.aggregating":
+                cb(
+                    "moa.aggregating",
+                    str(kwargs.get("aggregator") or ""),
+                    None,
+                    None,
+                    moa_ref_count=kwargs.get("ref_count"),
+                )
+        except Exception:
+            pass
+
+    return MoAClient(
+        str(preset_name or getattr(agent, "model", None) or "default"),
+        reference_callback=_moa_reference_relay,
+    )

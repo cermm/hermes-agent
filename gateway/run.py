@@ -13927,7 +13927,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # large to process.  Auto-reset it so the next message starts
             # fresh instead of replaying the same oversized context in an
             # infinite fail loop.  (#9893)
-            if agent_result.get("compression_exhausted") and session_entry and session_key:
+            #
+            # A lock-contended defer is the OPPOSITE case: the session is
+            # temporarily uncompressible only because a concurrent path holds
+            # the compression lock and is actively shrinking it. Never wipe
+            # the session for that — retry-next-message semantics apply
+            # (#69870 lock-skip consumer; salvaged from #49874).
+            if agent_result.get("compression_deferred"):
+                logger.info(
+                    "Compression deferred for session %s — the compression "
+                    "lock is held by a concurrent compressor. Keeping the "
+                    "session intact; the next message retries normally.",
+                    session_entry.session_id if session_entry else "?",
+                )
+            elif agent_result.get("compression_exhausted") and session_entry and session_key:
                 logger.info(
                     "Auto-resetting session %s after compression exhaustion.",
                     session_entry.session_id,
@@ -18121,6 +18134,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ("compression", "codex_app_server_auto"),
         ("compression", "target_ratio"),
         ("compression", "protect_last_n"),
+        ("compression", "proactive_prune_tokens"),
+        ("compression", "proactive_prune_min_result_chars"),
+        ("compression", "proactive_prune_min_reclaim_tokens"),
+        ("compression", "min_tail_user_messages"),
         ("agent", "disabled_toolsets"),
         ("memory", "provider"),
         ("checkpoints", "enabled"),
@@ -22008,6 +22025,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "interrupt_message": result.get("interrupt_message"),
                     "error": result.get("error"),
                     "compression_exhausted": result.get("compression_exhausted", False),
+                    "compression_deferred": result.get("compression_deferred", False),
                     "tools": tools_holder[0] or [],
                     "history_offset": _effective_history_offset,
                     "compacted_in_place": _compacted_in_place,
@@ -22125,6 +22143,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "partial": result_holder[0].get("partial", False) if result_holder[0] else False,
                 "error": result_holder[0].get("error") if result_holder[0] else None,
                 "interrupt_message": result_holder[0].get("interrupt_message") if result_holder[0] else None,
+                # Soft lock-contention defer (#69870 consumer): distinct from
+                # compression_exhausted so the gateway never auto-resets a
+                # session that a concurrent compressor is about to shrink.
+                "compression_deferred": (
+                    result_holder[0].get("compression_deferred", False)
+                    if result_holder[0] else False
+                ),
                 "tools": tools_holder[0] or [],
                 "history_offset": _effective_history_offset,
                 "compacted_in_place": _compacted_in_place,
