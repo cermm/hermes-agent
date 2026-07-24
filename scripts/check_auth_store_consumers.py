@@ -691,14 +691,22 @@ class _PythonFlowAnalyzer:
                 )
             )
         if _PATH_CONSTRUCTOR in callable_value.symbols and node.args:
+            path_values = {
+                value
+                for positional, _ in self._call_signatures(node, scope)
+                for value in _join_string_parts(
+                    [argument.strings for argument in positional], "/"
+                )
+            }
+            if any(
+                isinstance(argument, ast.Starred)
+                and _FLOW_OVERFLOW
+                in self._resolved_expression_value(argument.value, scope).strings
+                for argument in node.args
+            ):
+                path_values.add(_FLOW_OVERFLOW)
             return _FlowValue(
-                strings=_join_string_parts(
-                    [
-                        self._resolved_expression_value(arg, scope).strings
-                        for arg in node.args
-                    ],
-                    "/",
-                ),
+                strings=_bounded_strings(path_values),
                 symbols=frozenset({_CONSTRUCTED_PATH_VALUE}),
             )
         if not isinstance(node.func, ast.Attribute):

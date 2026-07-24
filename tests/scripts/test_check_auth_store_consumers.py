@@ -355,6 +355,64 @@ def test_audit_rejects_auth_path_constructed_by_wrapper(
     assert module.scan_repository(tmp_path) == []
 
 
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        pytest.param(
+            "from pathlib import Path\n"
+            'Path(*(\"auth.json\",))\n',
+            2,
+            id="direct-path-star-args",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "def consume(parts):\n"
+            "    return Path(*parts)\n"
+            'consume((\"auth.json\",))\n',
+            4,
+            id="wrapper-path-star-args",
+        ),
+    ],
+)
+def test_audit_rejects_static_auth_store_in_starred_path_constructor(
+    tmp_path: Path, source: str, expected_line: int
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", expected_line, "constructed_path")
+    ]
+
+    (tmp_path / "consumer.py").unlink()
+    (tmp_path / "harmless.py").write_text(
+        source.replace('"auth.json"', '"other.json"'),
+        encoding="utf-8",
+    )
+    assert module.scan_repository(tmp_path) == []
+
+
+def test_starred_path_constructor_fails_closed_on_sequence_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_STRUCTURED_ALTERNATIVES", 1)
+    (tmp_path / "consumer.py").write_text(
+        "from pathlib import Path\n"
+        'parts = ("other.json",) if enabled else ("auth.json",)\n'
+        "Path(*parts)\n",
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", 3, "constructed_path")
+    ]
+
+
 def test_scan_ignores_user_call_that_only_returns_auth_filename(
     tmp_path: Path,
 ) -> None:
