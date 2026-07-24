@@ -13,7 +13,6 @@
     "scripts/nix_auth_authority.py": {"category": "whole_store_deployment_adapter", "reason": "canonical_locked_deployment_seed"},
     "scripts/tool_search_livetest.py": {"category": "explicit_credential_copy_harness", "reason": "isolated_opt_in_credential_copy"},
     "plugins/google_meet/cli.py": {"category": "provider_native_store", "reason": "provider_native_non_hermes_store"},
-    "docker/hermes-exec-shim.sh": {"category": "whole_store_boot_adapter", "reason": "canonical_locked_bootstrap"},
     "docker/stage2-hook.sh": {"category": "whole_store_boot_adapter", "reason": "canonical_locked_bootstrap"},
     "nix/nixosModules.nix": {"category": "whole_store_deployment_adapter", "reason": "canonical_locked_deployment_seed"}
   }
