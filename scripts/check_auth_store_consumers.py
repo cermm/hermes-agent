@@ -30,6 +30,7 @@ _FLOW_OVERFLOW = "<too-many-static-alternatives>"
 _MAX_FLOW_ALTERNATIVES = 128
 _MAX_FORMAT_ATTEMPTS = 4096
 _MAX_DIRECT_CALL_WORK = 256
+_MAX_DIRECT_CALL_DEPTH = 21
 _MAX_STRUCTURED_ALTERNATIVES = 16
 _MAX_TEXT_FRAGMENT_CHAIN = 64
 _PATH_IO_METHODS = {"open", "read_bytes", "read_text", "write_bytes", "write_text"}
@@ -106,6 +107,7 @@ def _is_concrete_auth_store_reference(value: str) -> bool:
 _BUILTIN_OPEN = "builtin_open"
 _BUILTINS_MODULE = "builtins_module"
 _PATH_CONSTRUCTOR = "path_constructor"
+_CONSTRUCTED_PATH_VALUE = "constructed_path_value"
 _PATHLIB_MODULE = "pathlib_module"
 _DYNAMIC_PART = "<dynamic>"
 
@@ -412,6 +414,7 @@ class _PythonFlowAnalyzer:
         self.function_templates: dict[str, _DeferredFunction] = {}
         self.lambda_templates: dict[int, _DeferredFunction] = {}
         self.class_methods: dict[tuple[str, str], tuple[str, str]] = {}
+        self.class_bases: dict[str, tuple[str, ...]] = {}
         self.deferred_call_results: dict[str, tuple[ast.Call, _FlowScope]] = {}
         self.active_function_calls: set[str] = set()
         self.function_call_cache: dict[tuple[object, ...], _FlowValue] = {}
@@ -489,6 +492,41 @@ class _PythonFlowAnalyzer:
     ) -> _FlowValue:
         return self._resolve_flow_value(self._expression_value(node, scope))
 
+    def _class_method_candidates(
+        self, class_symbol: str, name: str, seen: frozenset[str] = frozenset()
+    ) -> tuple[tuple[str, str], ...]:
+        if class_symbol in seen:
+            return ()
+        direct = self.class_methods.get((class_symbol, name))
+        if direct is not None:
+            return (direct,)
+        next_seen = seen | {class_symbol}
+        for base_symbol in self.class_bases.get(class_symbol, ()):
+            inherited = self._class_method_candidates(base_symbol, name, next_seen)
+            if inherited:
+                return inherited
+        return ()
+
+    def _user_callable_symbols(self, value: _FlowValue) -> frozenset[str]:
+        symbols = {
+            symbol
+            for symbol in value.symbols
+            if symbol.startswith((_FUNCTION_SYMBOL_PREFIX, _BOUND_METHOD_SYMBOL_PREFIX))
+        }
+        for owner_symbol in value.symbols:
+            if not owner_symbol.startswith(_INSTANCE_SYMBOL_PREFIX):
+                continue
+            class_symbol = owner_symbol.removeprefix(_INSTANCE_SYMBOL_PREFIX)
+            for function_symbol, method_kind in self._class_method_candidates(
+                class_symbol, "__call__"
+            ):
+                symbols.add(
+                    function_symbol
+                    if method_kind == "staticmethod"
+                    else f"{_BOUND_METHOD_SYMBOL_PREFIX}{function_symbol}"
+                )
+        return frozenset(symbols)
+
     def _expression_value(self, node: ast.AST, scope: _FlowScope) -> _FlowValue:
         if isinstance(node, ast.Constant) and isinstance(node.value, str):
             return _FlowValue(strings=frozenset({node.value}))
@@ -534,9 +572,9 @@ class _PythonFlowAnalyzer:
             symbols: set[str] = set()
             for owner_symbol in owner.symbols:
                 if owner_symbol.startswith(_CLASS_SYMBOL_PREFIX):
-                    method = self.class_methods.get((owner_symbol, node.attr))
-                    if method is not None:
-                        function_symbol, method_kind = method
+                    for function_symbol, method_kind in self._class_method_candidates(
+                        owner_symbol, node.attr
+                    ):
                         symbols.add(
                             f"{_BOUND_METHOD_SYMBOL_PREFIX}{function_symbol}"
                             if method_kind == "classmethod"
@@ -544,9 +582,9 @@ class _PythonFlowAnalyzer:
                         )
                 elif owner_symbol.startswith(_INSTANCE_SYMBOL_PREFIX):
                     class_symbol = owner_symbol.removeprefix(_INSTANCE_SYMBOL_PREFIX)
-                    method = self.class_methods.get((class_symbol, node.attr))
-                    if method is not None:
-                        function_symbol, method_kind = method
+                    for function_symbol, method_kind in self._class_method_candidates(
+                        class_symbol, node.attr
+                    ):
                         symbols.add(
                             function_symbol
                             if method_kind == "staticmethod"
@@ -563,34 +601,44 @@ class _PythonFlowAnalyzer:
             ]
             return _FlowValue(strings=_join_string_parts(parts, ""))
         if isinstance(node, ast.BinOp) and isinstance(node.op, (ast.Add, ast.Div)):
+            left = self._resolved_expression_value(node.left, scope)
+            right = self._resolved_expression_value(node.right, scope)
             return _FlowValue(
                 strings=_combine_strings(
-                    self._resolved_expression_value(node.left, scope).strings,
-                    self._resolved_expression_value(node.right, scope).strings,
+                    left.strings,
+                    right.strings,
                     "/" if isinstance(node.op, ast.Div) else "",
-                )
+                ),
+                symbols=frozenset({_CONSTRUCTED_PATH_VALUE})
+                if _CONSTRUCTED_PATH_VALUE in left.symbols | right.symbols
+                else frozenset(),
             )
         if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
             templates = self._resolved_expression_value(node.left, scope).strings
-            if isinstance(node.right, ast.Dict) and all(
-                isinstance(key, ast.Constant) and isinstance(key.value, str)
-                for key in node.right.keys
-            ):
-                keys = [
-                    key.value
-                    for key in node.right.keys
-                    if isinstance(key, ast.Constant) and isinstance(key.value, str)
-                ]
-                option_sets = [
-                    self._resolved_expression_value(item, scope).strings
-                    or frozenset({_DYNAMIC_PART})
-                    for item in node.right.values
-                ]
+            mappings = self._resolved_expression_value(node.right, scope).mappings
+            if mappings:
+                mapping_products: list[
+                    tuple[list[str], Iterable[tuple[str, ...]]]
+                ] = []
+                for mapping in mappings:
+                    keys = [key for key, _ in mapping]
+                    option_sets = [
+                        self._resolve_flow_value(value).strings
+                        or frozenset({_DYNAMIC_PART})
+                        for _, value in mapping
+                    ]
+                    mapping_products.append(
+                        (
+                            keys,
+                            itertools.product(
+                                *(sorted(options) for options in option_sets)
+                            ),
+                        )
+                    )
                 operands: Iterable[object] = (
                     dict(zip(keys, values))
-                    for values in itertools.product(
-                        *(sorted(options) for options in option_sets)
-                    )
+                    for keys, products in mapping_products
+                    for values in products
                 )
             elif isinstance(node.right, ast.Tuple):
                 option_sets = [
@@ -627,10 +675,7 @@ class _PythonFlowAnalyzer:
             return _UNKNOWN_VALUE
 
         callable_value = self._expression_value(node.func, scope)
-        if any(
-            symbol.startswith((_FUNCTION_SYMBOL_PREFIX, _BOUND_METHOD_SYMBOL_PREFIX))
-            for symbol in callable_value.symbols
-        ):
+        if self._user_callable_symbols(callable_value):
             symbol = f"{_CALL_RESULT_SYMBOL_PREFIX}{id(node)}"
             self.deferred_call_results[symbol] = (node, scope)
             return _FlowValue(symbols=frozenset({symbol}))
@@ -653,15 +698,20 @@ class _PythonFlowAnalyzer:
                         for arg in node.args
                     ],
                     "/",
-                )
+                ),
+                symbols=frozenset({_CONSTRUCTED_PATH_VALUE}),
             )
         if not isinstance(node.func, ast.Attribute):
             return _UNKNOWN_VALUE
 
         method = node.func.attr
-        owner_strings = self._resolved_expression_value(
-            node.func.value, scope
-        ).strings
+        owner = self._resolved_expression_value(node.func.value, scope)
+        owner_strings = owner.strings
+        path_symbols = (
+            frozenset({_CONSTRUCTED_PATH_VALUE})
+            if _CONSTRUCTED_PATH_VALUE in owner.symbols
+            else frozenset()
+        )
         if method == "with_suffix" and len(node.args) == 1:
             suffixes = self._resolved_expression_value(node.args[0], scope).strings
             suffix_values: list[str] = []
@@ -671,7 +721,9 @@ class _PythonFlowAnalyzer:
                         suffix_values.append(str(Path(base).with_suffix(suffix)))
                     except ValueError:
                         continue
-            return _FlowValue(strings=_bounded_strings(suffix_values))
+            return _FlowValue(
+                strings=_bounded_strings(suffix_values), symbols=path_symbols
+            )
         if method == "joinpath":
             return _FlowValue(
                 strings=_join_string_parts(
@@ -681,7 +733,8 @@ class _PythonFlowAnalyzer:
                         for arg in node.args
                     ],
                     "/",
-                )
+                ),
+                symbols=path_symbols,
             )
         if (
             method == "join"
@@ -905,7 +958,7 @@ class _PythonFlowAnalyzer:
                 raw_symbol.removeprefix(_BOUND_METHOD_SYMBOL_PREFIX),
                 raw_symbol.startswith(_BOUND_METHOD_SYMBOL_PREFIX),
             )
-            for raw_symbol in sorted(callable_value.symbols)
+            for raw_symbol in sorted(self._user_callable_symbols(callable_value))
             if raw_symbol.removeprefix(_BOUND_METHOD_SYMBOL_PREFIX)
             not in self.active_function_calls
         ]
@@ -932,7 +985,10 @@ class _PythonFlowAnalyzer:
             if cached is not None:
                 result = result.merged(cached)
                 continue
-            if self.direct_function_work_budgets[-1] >= _MAX_DIRECT_CALL_WORK:
+            if (
+                self.direct_function_depth >= _MAX_DIRECT_CALL_DEPTH
+                or self.direct_function_work_budgets[-1] >= _MAX_DIRECT_CALL_WORK
+            ):
                 self._record(node, "analysis_overflow")
                 result = result.merged(
                     _FlowValue(strings=frozenset({_FLOW_OVERFLOW}))
@@ -975,7 +1031,7 @@ class _PythonFlowAnalyzer:
         if not any(
             symbol.removeprefix(_BOUND_METHOD_SYMBOL_PREFIX)
             in self.function_templates
-            for symbol in callable_value.symbols
+            for symbol in self._user_callable_symbols(callable_value)
         ):
             return
         if not any(
@@ -1036,17 +1092,23 @@ class _PythonFlowAnalyzer:
             )
         ):
             return "path_division"
+        user_callable = False
         if isinstance(node, ast.Call):
             callable_value = self._expression_value(node.func, scope)
-            if any(
-                symbol.startswith(
-                    (_FUNCTION_SYMBOL_PREFIX, _BOUND_METHOD_SYMBOL_PREFIX)
-                )
-                for symbol in callable_value.symbols
-            ):
-                return None
+            user_callable = bool(self._user_callable_symbols(callable_value))
+            if user_callable and (node.args or node.keywords):
+                arguments = [
+                    value
+                    for positional, keywords in self._call_signatures(node, scope)
+                    for value in [*positional, *(item for _, item in keywords)]
+                ]
+                if arguments and all(value == _UNKNOWN_VALUE for value in arguments):
+                    return None
         if isinstance(node, (ast.Call, ast.JoinedStr, ast.BinOp)):
-            values = self._resolved_expression_value(node, scope).strings
+            resolved = self._resolved_expression_value(node, scope)
+            if user_callable and _CONSTRUCTED_PATH_VALUE not in resolved.symbols:
+                return None
+            values = resolved.strings
             reference_match = (
                 _is_auth_store_reference
                 if isinstance(node, ast.Call)
@@ -1073,14 +1135,14 @@ class _PythonFlowAnalyzer:
         ):
             self._analyze_comprehension(node, scope)
             return
+        if isinstance(node, ast.Call):
+            self._analyze_direct_function_calls(node, scope)
         kind = self._finding_kind(node, scope)
         if kind is not None and not (
             self.direct_function_depth
             and kind in _DIRECT_CALL_NON_IO_FINDINGS
         ):
             self._record(node, kind)
-        if isinstance(node, ast.Call):
-            self._analyze_direct_function_calls(node, scope)
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 self._scan_expression(child, scope)
@@ -1413,6 +1475,10 @@ class _PythonFlowAnalyzer:
         saved_versions = [dict(item.versions) for item in chain]
         if isinstance(node, ast.Lambda):
             self._scan_expression(node.body, child)
+            if self.return_value_stack:
+                self.return_value_stack[-1].append(
+                    self._expression_value(node.body, child)
+                )
         else:
             self._analyze_block(node.body, child)
         self._flush_functions(child)
@@ -1477,6 +1543,12 @@ class _PythonFlowAnalyzer:
             for expression in [*node.decorator_list, *node.bases]:
                 self._scan_expression(expression, scope)
             class_symbol = f"{_CLASS_SYMBOL_PREFIX}{id(node)}"
+            self.class_bases[class_symbol] = tuple(
+                symbol
+                for base in node.bases
+                for symbol in sorted(self._expression_value(base, scope).symbols)
+                if symbol.startswith(_CLASS_SYMBOL_PREFIX)
+            )
             scope.assign(node.name, _FlowValue(symbols=frozenset({class_symbol})))
             declarations = _scope_declarations(node.body)
             child = _FlowScope(
