@@ -134,6 +134,62 @@ def test_audit_rejects_direct_builtin_open_of_auth_store(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    ("source", "expected_line", "expected_kind"),
+    [
+        pytest.param(
+            "from builtins import open as auth_open\n"
+            'auth_open("auth.json", "rb")\n',
+            2,
+            "open",
+            id="imported-builtin-open-alias",
+        ),
+        pytest.param(
+            "import builtins as builtin_api\n"
+            'builtin_api.open("auth.json", "rb")\n',
+            2,
+            "open",
+            id="builtins-module-alias",
+        ),
+        pytest.param(
+            "from pathlib import Path as AuthPath\n"
+            'AuthPath("auth.json").read_text()\n',
+            2,
+            "read_text",
+            id="imported-path-alias",
+        ),
+        pytest.param(
+            "import pathlib as path_api\n"
+            'path_api.Path("auth.json").read_text()\n',
+            2,
+            "read_text",
+            id="pathlib-module-alias",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "def load_auth():\n"
+            '    auth_store = "auth.json"\n'
+            "    return Path(auth_store).read_text()\n",
+            4,
+            "read_text",
+            id="function-local-auth-store-binding",
+        ),
+    ],
+)
+def test_audit_rejects_aliased_or_function_local_auth_store_consumers(
+    tmp_path: Path, source: str, expected_line: int, expected_kind: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, expected_kind)
+    ]
+    assert stale == []
+
+
+@pytest.mark.parametrize(
     ("method", "arguments"),
     [
         ("read_text", ""),
