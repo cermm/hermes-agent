@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import datetime
-import json
+
 import os
 import uuid
 from typing import Any, Dict, Optional
@@ -39,12 +39,13 @@ def has_xai_credentials() -> bool:
     if os.environ.get("XAI_API_KEY", "").strip():
         return True
     try:
-        from hermes_constants import get_hermes_home
+        from hermes_cli.auth import _load_auth_store
+        from hermes_cli.auth_authority import get_auth_store_path
 
-        auth_path = get_hermes_home() / "auth.json"
+        auth_path = get_auth_store_path()
         if not auth_path.exists():
             return False
-        store = json.loads(auth_path.read_text())
+        store = _load_auth_store(auth_path)
         providers = store.get("providers") if isinstance(store, dict) else None
         xai_state = providers.get("xai-oauth") if isinstance(providers, dict) else None
         tokens = xai_state.get("tokens") if isinstance(xai_state, dict) else None

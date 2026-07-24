@@ -1,0 +1,157 @@
+from __future__ import annotations
+
+import importlib.util
+import json
+import multiprocessing
+import os
+from pathlib import Path
+
+import pytest
+
+
+_SCRIPT = Path(__file__).resolve().parents[2] / "scripts" / "nix_auth_authority.py"
+
+
+def _load_module():
+    spec = importlib.util.spec_from_file_location("nix_auth_authority", _SCRIPT)
+    assert spec and spec.loader
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _seed_worker(home: str, source: str, start, results) -> None:
+    module = _load_module()
+    start.wait()
+    results.put(module.seed_auth(Path(home), Path(source)))
+
+
+def test_seed_resolves_shared_authority_and_preserves_existing_destination(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text("auth:\n  authority: shared\n")
+    destination = root / "auth.json"
+    destination.write_text(json.dumps({"token": "current"}))
+    destination.chmod(0o600)
+    source = tmp_path / "seed.json"
+    source.write_text(json.dumps({"token": "seed"}))
+
+    result = module.seed_auth(profile, source)
+
+    assert result["status"] == "preserved"
+    assert json.loads(destination.read_text()) == {"token": "current"}
+    assert destination.stat().st_mode & 0o777 == 0o600
+    assert (root / "auth.lock").stat().st_mode & 0o777 == 0o600
+
+
+def test_seed_rejects_insecure_existing_destination_without_modifying_it(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    destination = home / "auth.json"
+    destination.write_text(json.dumps({"token": "current"}))
+    destination.chmod(0o644)
+    source = tmp_path / "seed.json"
+    source.write_text(json.dumps({"token": "seed"}))
+
+    with pytest.raises(RuntimeError, match="mode 0600"):
+        module.seed_auth(home, source, uid=os.getuid(), gid=os.getgid())
+
+    assert json.loads(destination.read_text()) == {"token": "current"}
+    assert destination.stat().st_mode & 0o777 == 0o644
+
+
+def test_seed_api_has_no_inert_force_control(tmp_path: Path) -> None:
+    module = _load_module()
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    destination = home / "auth.json"
+    destination.write_text("old")
+    source = tmp_path / "seed.json"
+    source.write_text("new")
+
+    with pytest.raises(TypeError, match="force"):
+        module.seed_auth(home, source, force=True)
+    assert destination.read_text() == "old"
+
+
+def test_seed_cli_has_no_inert_force_control(monkeypatch, tmp_path: Path) -> None:
+    module = _load_module()
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "nix_auth_authority.py",
+            str(tmp_path / ".hermes"),
+            str(tmp_path / "seed.json"),
+            "--force",
+            "true",
+        ],
+    )
+
+    with pytest.raises(SystemExit, match="2"):
+        module.main()
+
+
+def test_concurrent_non_force_seed_has_one_writer_and_no_partial_json(
+    tmp_path: Path,
+) -> None:
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    sources = []
+    for index in range(2):
+        source = tmp_path / f"seed-{index}.json"
+        source.write_text(json.dumps({"writer": index, "payload": "x" * 10000}))
+        sources.append(source)
+
+    context = multiprocessing.get_context("fork")
+    start = context.Event()
+    results = context.Queue()
+    workers = [
+        context.Process(
+            target=_seed_worker,
+            args=(str(home), str(source), start, results),
+        )
+        for source in sources
+    ]
+    for worker in workers:
+        worker.start()
+    start.set()
+    for worker in workers:
+        worker.join(timeout=10)
+        assert worker.exitcode == 0
+
+    statuses = sorted(results.get(timeout=2)["status"] for _ in workers)
+    assert statuses == ["created", "preserved"]
+    assert json.loads((home / "auth.json").read_text())["writer"] in {0, 1}
+    assert (home / "auth.json").stat().st_mode & 0o777 == 0o600
+    assert (home / "auth.lock").stat().st_mode & 0o777 == 0o600
+    assert not list(home.glob("auth.json.tmp.*"))
+
+
+def test_seed_rejects_source_symlink(tmp_path: Path) -> None:
+    module = _load_module()
+    profile = tmp_path / ".hermes"
+    profile.mkdir()
+    actual = tmp_path / "seed.json"
+    actual.write_text("{}", encoding="utf-8")
+    linked = tmp_path / "linked.json"
+    linked.symlink_to(actual)
+
+    with pytest.raises(RuntimeError, match="source.*symlink"):
+        module.seed_auth(profile, linked)
+
+
+def test_seed_rejects_non_object_json(tmp_path: Path) -> None:
+    module = _load_module()
+    profile = tmp_path / ".hermes"
+    seed = tmp_path / "seed.json"
+    seed.write_text("[]", encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="JSON object"):
+        module.seed_auth(profile, seed)

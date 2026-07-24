@@ -520,8 +520,13 @@ hermes auth add openrouter --api-key sk-or-v1-xxx        # Add API key
 hermes auth add anthropic --type oauth                   # Add OAuth credential
 hermes auth remove openrouter 2                          # Remove by index
 hermes auth reset openrouter                             # Clear cooldowns
-hermes auth status anthropic                             # Show auth status for a provider
-hermes auth logout anthropic                             # Log out and clear stored auth state
+hermes auth status                              # Show canonical auth authority and migration state
+hermes auth status anthropic                   # Show auth status for a provider
+hermes auth logout anthropic                   # Log out and clear stored auth state
+hermes auth migrate-shared --profile coder --dry-run
+hermes auth migrate-shared --profile coder --apply --plan-id <id> --plan-digest <digest> --conflict-policy abort
+hermes auth migrate-shared --rollback --plan-id <id>
+hermes auth migrate-recover --plan-id <id>
 hermes auth spotify                                      # Authenticate Hermes with Spotify via PKCE
 ```
 

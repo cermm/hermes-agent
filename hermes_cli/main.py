@@ -1015,20 +1015,18 @@ def _has_any_provider_configured() -> bool:
     except Exception:
         pass
 
-    # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
-    if auth_file.exists():
-        try:
-            import json
+    # Check for configured auth credentials through the canonical authority.
+    try:
+        from hermes_cli.auth import get_auth_status, _load_auth_store
+        from hermes_cli.auth_authority import get_auth_store_path
 
-            auth = json.loads(auth_file.read_text())
-            active = auth.get("active_provider")
-            if active:
-                status = get_auth_status(active)
-                if status.get("logged_in"):
-                    return True
-        except Exception:
-            pass
+        auth_file = get_auth_store_path()
+        auth = _load_auth_store(auth_file)
+        active = auth.get("active_provider")
+        if active and get_auth_status(active).get("logged_in"):
+            return True
+    except Exception:
+        pass
 
     # Check config.yaml — if model is a dict with an explicit provider set,
     # the user has gone through setup (fresh installs have model as a plain
@@ -12616,6 +12614,7 @@ def cmd_profile(args):
                 clone_config=clone_config,
                 no_alias=no_alias,
                 no_skills=no_skills,
+                auth_mode=getattr(args, "auth_mode", "shared"),
                 description=getattr(args, "description", None),
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
@@ -12713,8 +12712,9 @@ def cmd_profile(args):
     elif action == "delete":
         name = args.profile_name
         yes = getattr(args, "yes", False)
+        auth_action = getattr(args, "auth_action", None)
         try:
-            delete_profile(name, yes=yes)
+            delete_profile(name, yes=yes, auth_action=auth_action)
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)

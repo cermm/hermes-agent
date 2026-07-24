@@ -62,11 +62,23 @@ def build_profile_parser(subparsers, *, cmd_profile: Callable) -> None:
              "Used by the kanban decomposer to route tasks based on role instead "
              "of profile name alone. Skip and add later via `hermes profile describe`.",
     )
+    profile_create.add_argument(
+        "--auth-mode",
+        choices=["shared", "profile"],
+        default="shared",
+        help="Auth authority for the new profile; profile mode explicitly copies source auth",
+    )
 
     profile_delete = profile_subparsers.add_parser("delete", help="Delete a profile")
     profile_delete.add_argument("profile_name", help="Profile to delete")
     profile_delete.add_argument(
         "-y", "--yes", action="store_true", help="Skip confirmation prompt"
+    )
+    profile_delete.add_argument(
+        "--auth-action",
+        choices=["archive", "purge"],
+        default=None,
+        help="Required for profile-local credentials: archive privately or purge",
     )
 
     profile_describe = profile_subparsers.add_parser(

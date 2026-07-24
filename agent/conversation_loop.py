@@ -3484,7 +3484,11 @@ def run_conversation(
                     print(f"{agent.log_prefix}   Troubleshooting:")
                     print(f"{agent.log_prefix}     • Re-authenticate: hermes auth add nous")
                     print(f"{agent.log_prefix}     • Check credits / billing: https://portal.nousresearch.com")
-                    print(f"{agent.log_prefix}     • Verify stored credentials: {_dhh}/auth.json")
+                    from hermes_cli.auth_authority import describe_auth_store
+                    print(
+                        f"{agent.log_prefix}     • Verify stored credentials in the "
+                        f"{describe_auth_store()}"
+                    )
                     print(f"{agent.log_prefix}     • Switch providers temporarily: /model <model> --provider openrouter")
                 if (
                     agent.provider == "copilot"
