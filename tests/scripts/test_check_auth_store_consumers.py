@@ -454,6 +454,115 @@ def test_nested_sequence_unpacking_fails_closed_on_structured_product_overflow(
     ]
 
 
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from pathlib import Path\n"
+            "def provide():\n"
+            '    return ("auth.json",)\n'
+            "Path(*(*provide(),))\n",
+            id="function-return-nested-star",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            'provide = lambda: ["auth.json"]\n'
+            "Path(*[*provide()])\n",
+            id="lambda-return-nested-star",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "def provide():\n"
+            '    return ("auth.json",)\n'
+            "parts = provide()\n"
+            "Path(*parts)\n",
+            id="assigned-call-result",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "def provide(inner):\n"
+            "    return (*inner,)\n"
+            'Path(*provide(("auth.json",)))\n',
+            id="bounded-wrapper-return",
+        ),
+    ],
+)
+def test_callable_returned_sequences_reach_starred_path_constructor(
+    tmp_path: Path, source: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.kind) for item in findings] == [
+        ("consumer.py", "constructed_path")
+    ]
+
+
+@pytest.mark.parametrize(
+    "source",
+    [
+        pytest.param(
+            "from pathlib import Path\n"
+            "def provide():\n"
+            '    return ("other.json",)\n'
+            "Path(*(*provide(),))\n",
+            id="non-auth-return",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "if enabled:\n"
+            "    def provide():\n"
+            '        return ("other.json",)\n'
+            "    Path(*provide())\n"
+            "else:\n"
+            '    parts = ("auth.json",)\n',
+            id="impossible-sibling",
+        ),
+    ],
+)
+def test_callable_returned_sequences_do_not_create_false_positive(
+    tmp_path: Path, source: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "harmless.py").write_text(source, encoding="utf-8")
+
+    assert module.scan_repository(tmp_path) == []
+
+
+def test_callable_returned_sequence_fails_closed_on_overflow(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_STRUCTURED_ALTERNATIVES", 1)
+    (tmp_path / "consumer.py").write_text(
+        "from pathlib import Path\n"
+        "def provide():\n"
+        '    return ("other.json",) if enabled else ("auth.json",)\n'
+        "Path(*provide())\n",
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", 4, "constructed_path")
+    ]
+
+
+@pytest.mark.parametrize("size", [1000, 3000, 6000])
+def test_large_flat_sequence_analysis_has_linear_work(size: int) -> None:
+    module = _load_module()
+    source = "parts = [" + ",".join(f"'part-{index}'" for index in range(size)) + "]\n"
+    analyzer = module._PythonFlowAnalyzer("harmless.py")
+
+    findings = analyzer.analyze(ast.parse(source))
+
+    assert findings == []
+    assert analyzer.sequence_expansion_work <= size * 2
+
+
 def test_scan_ignores_user_call_that_only_returns_auth_filename(
     tmp_path: Path,
 ) -> None:

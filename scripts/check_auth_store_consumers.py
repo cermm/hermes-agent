@@ -419,6 +419,7 @@ class _PythonFlowAnalyzer:
         self.active_function_calls: set[str] = set()
         self.function_call_cache: dict[tuple[object, ...], _FlowValue] = {}
         self.direct_function_work = 0
+        self.sequence_expansion_work = 0
         self.direct_function_work_budgets: list[int] = []
         self.return_value_stack: list[list[_FlowValue]] = []
         self.direct_function_depth = 0
@@ -530,27 +531,46 @@ class _PythonFlowAnalyzer:
     def _sequence_value(
         self, node: ast.Tuple | ast.List, scope: _FlowScope
     ) -> _FlowValue:
-        alternatives: tuple[tuple[_FlowValue, ...], ...] = ((),)
+        alternatives: list[list[_FlowValue]] = [[]]
         overflowed = False
         for item in node.elts:
             if isinstance(item, ast.Starred):
-                value = self._expression_value(item.value, scope)
+                value = self._resolved_expression_value(item.value, scope)
                 options = value.sequences or ((_UNKNOWN_VALUE,),)
                 overflowed = overflowed or _FLOW_OVERFLOW in value.strings
+                if len(options) == 1:
+                    option = options[0]
+                    for prefix in alternatives:
+                        prefix.extend(option)
+                        self.sequence_expansion_work += len(option)
+                    continue
+
+                expanded: list[list[_FlowValue]] = []
+                seen: set[tuple[_FlowValue, ...]] = set()
+                product_overflow = False
+                for prefix in alternatives:
+                    for option in options:
+                        candidate = (*prefix, *option)
+                        self.sequence_expansion_work += len(candidate)
+                        if candidate in seen:
+                            continue
+                        seen.add(candidate)
+                        if len(expanded) >= _MAX_STRUCTURED_ALTERNATIVES:
+                            product_overflow = True
+                            break
+                        expanded.append(list(candidate))
+                    if product_overflow:
+                        break
+                alternatives = expanded
+                overflowed = overflowed or product_overflow
             else:
-                options = ((self._expression_value(item, scope),),)
-            alternatives, product_overflow = _merge_structures(
-                (),
-                tuple(
-                    (*prefix, *option)
-                    for prefix in alternatives
-                    for option in options
-                ),
-            )
-            overflowed = overflowed or product_overflow
+                value = self._expression_value(item, scope)
+                for prefix in alternatives:
+                    prefix.append(value)
+                    self.sequence_expansion_work += 1
         return _FlowValue(
             strings=frozenset({_FLOW_OVERFLOW}) if overflowed else frozenset(),
-            sequences=alternatives,
+            sequences=tuple(tuple(option) for option in alternatives),
         )
 
     def _expression_value(self, node: ast.AST, scope: _FlowScope) -> _FlowValue:
@@ -855,18 +875,23 @@ class _PythonFlowAnalyzer:
         overflowed = False
         for argument in node.args:
             if isinstance(argument, ast.Starred):
-                options = self._expression_value(argument.value, scope).sequences
+                value = self._resolved_expression_value(argument.value, scope)
+                options = value.sequences
                 if not options:
                     options = ((_UNKNOWN_VALUE,),)
                 options = tuple(
                     tuple(self._resolve_flow_value(item) for item in option)
                     for option in options
                 )
-                expanded = [
-                    ([*positional, *option], dict(keywords))
-                    for positional, keywords in signatures
-                    for option in options
-                ]
+                expanded = []
+                for positional, keywords in signatures:
+                    for option in options:
+                        if len(expanded) >= _MAX_FLOW_ALTERNATIVES:
+                            overflowed = True
+                            break
+                        expanded.append(([*positional, *option], dict(keywords)))
+                    if len(expanded) >= _MAX_FLOW_ALTERNATIVES:
+                        break
             else:
                 value = self._resolved_expression_value(argument, scope)
                 expanded = [
@@ -882,7 +907,7 @@ class _PythonFlowAnalyzer:
                 for _, keywords in signatures:
                     keywords[keyword.arg] = value
                 continue
-            options = self._expression_value(keyword.value, scope).mappings
+            options = self._resolved_expression_value(keyword.value, scope).mappings
             if not options:
                 options = ((('', _UNKNOWN_VALUE),),)
             options = tuple(
