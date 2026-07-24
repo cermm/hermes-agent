@@ -134,6 +134,46 @@ def test_audit_rejects_direct_builtin_open_of_auth_store(tmp_path: Path) -> None
 
 
 @pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        ('open(file="auth.json", mode="rb")\n', 1),
+        ('import builtins\nbuiltins.open(file="auth.json", mode="rb")\n', 2),
+    ],
+)
+def test_audit_rejects_builtin_open_file_keyword(
+    tmp_path: Path, source: str, expected_line: int
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, "open")
+    ]
+    assert stale == []
+
+
+def test_audit_rejects_direct_wrapper_receiving_static_auth_store(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        "def consume(path):\n"
+        '    return open(path, "r").read()\n'
+        'consume("auth.json")\n',
+        encoding="utf-8",
+    )
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", 2, "open")
+    ]
+    assert stale == []
+
+
+@pytest.mark.parametrize(
     ("source", "expected_line", "expected_kind"),
     [
         pytest.param(
@@ -386,6 +426,51 @@ def test_audit_rejects_joined_and_formatted_auth_store_paths(
 
 
 @pytest.mark.parametrize(
+    ("source", "expected_line", "expected_kind"),
+    [
+        (
+            "auth_open = open if enabled else helper\n"
+            'auth_open("auth.json", "rb")\n',
+            2,
+            "open",
+        ),
+        (
+            "from pathlib import Path\n"
+            "AuthPath = Path if enabled else Factory\n"
+            'AuthPath("auth.json").read_text()\n',
+            3,
+            "read_text",
+        ),
+        (
+            "from pathlib import Path\n"
+            'target = "auth.json" if enabled else "other.json"\n'
+            "Path(target).read_text()\n",
+            3,
+            "read_text",
+        ),
+        (
+            "from pathlib import Path\n"
+            'Path("%s.%s" % ("auth", "json")).read_text()\n',
+            2,
+            "read_text",
+        ),
+    ],
+)
+def test_audit_rejects_conditional_and_percent_formatted_auth_paths(
+    tmp_path: Path, source: str, expected_line: int, expected_kind: str
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, expected_kind)
+    ]
+    assert stale == []
+
+
+@pytest.mark.parametrize(
     ("source", "expected_line"),
     [
         pytest.param(
@@ -531,6 +616,24 @@ def test_scan_ignores_scope_shadowed_or_unrelated_callables(
 ) -> None:
     module = _load_module()
     (tmp_path / "harmless.py").write_text(source, encoding="utf-8")
+
+    assert module.scan_repository(tmp_path) == []
+
+
+def test_scan_ignores_deferred_function_from_impossible_sibling_branch(
+    tmp_path: Path,
+) -> None:
+    module = _load_module()
+    (tmp_path / "harmless.py").write_text(
+        "from pathlib import Path\n"
+        "if enabled:\n"
+        "    def read_auth():\n"
+        "        return Path(AUTH).read_text()\n"
+        '    AUTH = "other.json"\n'
+        "else:\n"
+        '    AUTH = "auth.json"\n',
+        encoding="utf-8",
+    )
 
     assert module.scan_repository(tmp_path) == []
 

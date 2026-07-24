@@ -146,6 +146,84 @@ def test_profile_location_label_is_normalized(profile_layout):
     )
 
 
+@pytest.mark.parametrize("provider_id", ["openai-codex", "xai-oauth"])
+@pytest.mark.parametrize(
+    ("authority_mode", "expected_store"),
+    [
+        ("shared", "shared auth store (~/.hermes/auth.json)"),
+        (
+            "profile",
+            "profile-local auth store (~/.hermes/profiles/coder/auth.json)",
+        ),
+        (
+            "legacy",
+            "legacy profile-local auth store (~/.hermes/profiles/coder/auth.json)",
+        ),
+    ],
+)
+def test_oauth_login_success_reports_effective_redacted_auth_authority(
+    profile_layout,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+    provider_id: str,
+    authority_mode: str,
+    expected_store: str,
+) -> None:
+    from types import SimpleNamespace
+
+    from hermes_cli import auth as auth_module
+
+    if authority_mode == "legacy":
+        (profile_layout["profile"] / "auth.json").write_text("{}", encoding="utf-8")
+    else:
+        _write_config(profile_layout["profile"], {"authority": authority_mode})
+
+    monkeypatch.setattr(
+        auth_module,
+        "_update_config_for_provider",
+        lambda *args, **kwargs: "~/.hermes/profiles/coder/config.yaml",
+    )
+    if provider_id == "openai-codex":
+        monkeypatch.setattr(
+            auth_module,
+            "_codex_device_code_login",
+            lambda: {
+                "tokens": {"access_token": "test", "refresh_token": "refresh"},
+                "base_url": auth_module.DEFAULT_CODEX_BASE_URL,
+            },
+        )
+        monkeypatch.setattr(auth_module, "_save_codex_tokens", lambda *args: None)
+        auth_module._login_openai_codex(
+            SimpleNamespace(),
+            auth_module.PROVIDER_REGISTRY[provider_id],
+            force_new_login=True,
+        )
+    else:
+        monkeypatch.setattr(
+            auth_module,
+            "_xai_oauth_device_code_login",
+            lambda **kwargs: {
+                "tokens": {"access_token": "test", "refresh_token": "refresh"},
+                "base_url": auth_module.DEFAULT_XAI_OAUTH_BASE_URL,
+            },
+        )
+        monkeypatch.setattr(
+            auth_module, "_save_xai_oauth_tokens", lambda *args, **kwargs: None
+        )
+        monkeypatch.setattr(
+            auth_module, "unsuppress_credential_source", lambda *args: None
+        )
+        auth_module._login_xai_oauth(
+            SimpleNamespace(no_browser=True, timeout=1),
+            auth_module.PROVIDER_REGISTRY[provider_id],
+            force_new_login=True,
+        )
+
+    output = capsys.readouterr().out
+    assert f"Auth state: {expected_store}" in output
+    assert str(profile_layout["root"]) not in output
+
+
 def test_auth_status_without_provider_reports_authority(profile_layout, capsys):
     from types import SimpleNamespace
 

@@ -50,7 +50,7 @@ from hermes_cli.config import (
     require_readable_config_before_write,
 )
 from hermes_constants import OPENROUTER_BASE_URL, get_default_hermes_root, secure_parent_dir
-from hermes_cli.auth_authority import resolve_auth_authority
+from hermes_cli.auth_authority import describe_auth_store, resolve_auth_authority
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -7630,8 +7630,7 @@ def _login_openai_codex(
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
-    from hermes_constants import display_hermes_home as _dhh
-    print(f"  Auth state: {_dhh()}/auth.json")
+    print(f"  Auth state: {describe_auth_store()}")
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
@@ -7698,8 +7697,7 @@ def _login_xai_oauth(
     config_path = _update_config_for_provider("xai-oauth", creds.get("base_url", DEFAULT_XAI_OAUTH_BASE_URL))
     print()
     print("Login successful!")
-    from hermes_constants import display_hermes_home as _dhh
-    print(f"  Auth state: {_dhh()}/auth.json")
+    print(f"  Auth state: {describe_auth_store()}")
     print(f"  Config updated: {config_path} (model.provider=xai-oauth)")
 
 

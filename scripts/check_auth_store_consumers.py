@@ -32,6 +32,13 @@ _MAX_FORMAT_ATTEMPTS = 4096
 _MAX_TEXT_FRAGMENT_CHAIN = 64
 _PATH_IO_METHODS = {"open", "read_bytes", "read_text", "write_bytes", "write_text"}
 _PATH_CONSTRUCTORS = {"Path", "PurePath", "PurePosixPath", "PureWindowsPath"}
+_FUNCTION_SYMBOL_PREFIX = "user_function:"
+_DIRECT_CALL_NON_IO_FINDINGS = {
+    "constructed_path",
+    "join",
+    "joinpath",
+    "path_division",
+}
 
 # Reviewed exception contracts from the issue-380 consumer inventory. Reasons
 # are machine values on purpose: free-form prose would let an inventory edit
@@ -85,6 +92,11 @@ def _is_auth_store_reference(value: str) -> bool:
     return normalized == _AUTH_BASENAME or normalized.endswith(f"/{_AUTH_BASENAME}")
 
 
+def _is_concrete_auth_store_reference(value: str) -> bool:
+    """Match a known auth-store path without treating string overflow as I/O."""
+    return _FLOW_OVERFLOW not in value and _is_auth_store_reference(value)
+
+
 _BUILTIN_OPEN = "builtin_open"
 _BUILTINS_MODULE = "builtins_module"
 _PATH_CONSTRUCTOR = "path_constructor"
@@ -136,6 +148,7 @@ class _FlowScope:
             name: _UNKNOWN_VALUE
             for name in (local_names or set()) - self.global_names - self.nonlocal_names
         }
+        self.versions = {name: 0 for name in self.bindings}
 
     def _root(self) -> "_FlowScope":
         scope = self
@@ -159,7 +172,9 @@ class _FlowScope:
         return self
 
     def assign(self, name: str, value: _FlowValue) -> None:
-        self._target(name).bindings[name] = value
+        target = self._target(name)
+        target.bindings[name] = value
+        target.versions[name] = target.versions.get(name, 0) + 1
 
     def assign_named_expression(self, name: str, value: _FlowValue) -> None:
         (self.named_expression_scope or self).assign(name, value)
@@ -190,6 +205,17 @@ class _FlowScope:
         if name in _PATH_CONSTRUCTORS:
             return _FlowValue(symbols=frozenset({_PATH_CONSTRUCTOR}))
         return _UNKNOWN_VALUE
+
+
+@dataclass
+class _DeferredFunction:
+    owner: _FlowScope
+    node: ast.FunctionDef | ast.AsyncFunctionDef
+    child: _FlowScope
+    symbol: str
+    branch_chain: list[_FlowScope] | None = None
+    branch_bindings: list[dict[str, _FlowValue]] | None = None
+    branch_versions: list[dict[str, int]] | None = None
 
 
 def _match_pattern_names(pattern: ast.pattern) -> set[str]:
@@ -338,10 +364,11 @@ class _PythonFlowAnalyzer:
         self.relative = relative
         self.findings: list[Finding] = []
         self.seen_lines: set[int] = set()
-        self.deferred_functions: list[
-            tuple[_FlowScope, ast.FunctionDef | ast.AsyncFunctionDef, _FlowScope]
-        ] = []
+        self.deferred_functions: list[_DeferredFunction] = []
         self.deferred_lambdas: list[tuple[_FlowScope, ast.Lambda, _FlowScope]] = []
+        self.function_templates: dict[str, _DeferredFunction] = {}
+        self.active_function_calls: set[str] = set()
+        self.direct_function_depth = 0
 
     def analyze(self, tree: ast.Module) -> list[Finding]:
         scope = _FlowScope()
@@ -364,6 +391,10 @@ class _PythonFlowAnalyzer:
             return scope.resolve(node.id)
         if isinstance(node, ast.NamedExpr):
             return self._expression_value(node.value, scope)
+        if isinstance(node, ast.IfExp):
+            return self._expression_value(node.body, scope).merged(
+                self._expression_value(node.orelse, scope)
+            )
         if isinstance(node, ast.Attribute):
             owner = self._expression_value(node.value, scope)
             if node.attr == "open" and _BUILTINS_MODULE in owner.symbols:
@@ -388,6 +419,37 @@ class _PythonFlowAnalyzer:
                     "/" if isinstance(node.op, ast.Div) else "",
                 )
             )
+        if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+            templates = self._expression_value(node.left, scope).strings
+            if isinstance(node.right, ast.Tuple):
+                option_sets = [
+                    self._expression_value(item, scope).strings
+                    or frozenset({_DYNAMIC_PART})
+                    for item in node.right.elts
+                ]
+                combinations = itertools.product(
+                    *(sorted(options) for options in option_sets)
+                )
+            else:
+                options = (
+                    self._expression_value(node.right, scope).strings
+                    or frozenset({_DYNAMIC_PART})
+                )
+                combinations = ((item,) for item in sorted(options))
+            values: set[str] = set()
+            for attempt, arguments in enumerate(combinations, start=1):
+                if attempt > _MAX_FORMAT_ATTEMPTS:
+                    values.add(_FLOW_OVERFLOW)
+                    break
+                operand: object = arguments if len(arguments) != 1 else arguments[0]
+                for template in sorted(templates):
+                    try:
+                        values.add(template % operand)
+                    except (TypeError, ValueError):
+                        continue
+                    if len(values) > _MAX_FLOW_ALTERNATIVES:
+                        return _FlowValue(strings=_bounded_strings(values))
+            return _FlowValue(strings=_bounded_strings(values))
         if not isinstance(node, ast.Call):
             return _UNKNOWN_VALUE
 
@@ -499,15 +561,96 @@ class _PythonFlowAnalyzer:
             return _FlowValue(strings=frozenset(values))
         return _UNKNOWN_VALUE
 
+    @staticmethod
+    def _call_argument(
+        node: ast.Call, position: int, keyword: str
+    ) -> ast.expr | None:
+        if len(node.args) > position:
+            return node.args[position]
+        return next(
+            (item.value for item in node.keywords if item.arg == keyword),
+            None,
+        )
+
+    @staticmethod
+    def _clone_function_scope(template: _FlowScope) -> _FlowScope:
+        cloned = _FlowScope(
+            template.parent,
+            local_names=set(template.bindings),
+            global_names=set(template.global_names),
+            nonlocal_names=set(template.nonlocal_names),
+            named_expression_scope=template.named_expression_scope,
+        )
+        cloned.bindings = dict(template.bindings)
+        cloned.versions = dict(template.versions)
+        return cloned
+
+    def _bind_call_arguments(
+        self,
+        call: ast.Call,
+        deferred: _DeferredFunction,
+        caller: _FlowScope,
+        child: _FlowScope,
+    ) -> None:
+        positional = [
+            *deferred.node.args.posonlyargs,
+            *deferred.node.args.args,
+        ]
+        for argument, value_node in zip(positional, call.args):
+            if isinstance(value_node, ast.Starred):
+                child.assign(argument.arg, _UNKNOWN_VALUE)
+            else:
+                child.assign(
+                    argument.arg, self._expression_value(value_node, caller)
+                )
+        parameter_names = {
+            item.arg
+            for item in [*positional, *deferred.node.args.kwonlyargs]
+        }
+        for keyword in call.keywords:
+            if keyword.arg in parameter_names:
+                child.assign(
+                    keyword.arg, self._expression_value(keyword.value, caller)
+                )
+
+    def _analyze_direct_function_calls(
+        self, node: ast.Call, scope: _FlowScope
+    ) -> None:
+        arguments = [
+            *node.args,
+            *(keyword.value for keyword in node.keywords),
+        ]
+        if not any(
+            _is_auth_store_reference(value)
+            for argument in arguments
+            for value in self._expression_value(argument, scope).strings
+        ):
+            return
+        callable_value = self._expression_value(node.func, scope)
+        for symbol in callable_value.symbols:
+            deferred = self.function_templates.get(symbol)
+            if deferred is None or symbol in self.active_function_calls:
+                continue
+            child = self._clone_function_scope(deferred.child)
+            self._bind_call_arguments(node, deferred, scope, child)
+            self.active_function_calls.add(symbol)
+            self.direct_function_depth += 1
+            try:
+                self._analyze_deferred_function(deferred, child)
+            finally:
+                self.direct_function_depth -= 1
+                self.active_function_calls.remove(symbol)
+
     def _finding_kind(self, node: ast.AST, scope: _FlowScope) -> Optional[str]:
         if isinstance(node, ast.Call):
             callable_value = self._expression_value(node.func, scope)
+            open_path = self._call_argument(node, 0, "file")
             if (
                 _BUILTIN_OPEN in callable_value.symbols
-                and node.args
+                and open_path is not None
                 and any(
                     _is_auth_store_reference(value)
-                    for value in self._expression_value(node.args[0], scope).strings
+                    for value in self._expression_value(open_path, scope).strings
                 )
             ):
                 return "open"
@@ -542,11 +685,15 @@ class _PythonFlowAnalyzer:
             )
         ):
             return "path_division"
-        if isinstance(node, (ast.Call, ast.JoinedStr, ast.BinOp)) and any(
-            _is_auth_store_reference(value)
-            for value in self._expression_value(node, scope).strings
-        ):
-            return "constructed_path"
+        if isinstance(node, (ast.Call, ast.JoinedStr, ast.BinOp)):
+            values = self._expression_value(node, scope).strings
+            reference_match = (
+                _is_auth_store_reference
+                if isinstance(node, ast.Call)
+                else _is_concrete_auth_store_reference
+            )
+            if any(reference_match(value) for value in values):
+                return "constructed_path"
         return None
 
     def _scan_expression(self, node: ast.AST, scope: _FlowScope) -> None:
@@ -567,8 +714,13 @@ class _PythonFlowAnalyzer:
             self._analyze_comprehension(node, scope)
             return
         kind = self._finding_kind(node, scope)
-        if kind is not None:
+        if kind is not None and not (
+            self.direct_function_depth
+            and kind in _DIRECT_CALL_NON_IO_FINDINGS
+        ):
             self._record(node, kind)
+        if isinstance(node, ast.Call):
+            self._analyze_direct_function_calls(node, scope)
         for child in ast.iter_child_nodes(node):
             if isinstance(child, ast.expr):
                 self._scan_expression(child, scope)
@@ -708,17 +860,33 @@ class _PythonFlowAnalyzer:
         original = self._capture_bindings(chain)
         outcomes: list[list[dict[str, _FlowValue]]] = []
         branch_bindings = initial_bindings or [{} for _ in branches]
+        constrained: list[_DeferredFunction] = []
         for branch, initial in zip(branches, branch_bindings):
             self._restore_bindings(chain, original)
             for name, value in initial.items():
                 scope.assign(name, value)
+            known_functions = {id(item) for item in self.deferred_functions}
             self._analyze_block(branch, scope)
-            outcomes.append(self._capture_bindings(chain))
+            outcome = self._capture_bindings(chain)
+            outcomes.append(outcome)
+            for item in self.deferred_functions:
+                if id(item) in known_functions or item.owner not in chain:
+                    continue
+                item.branch_chain = list(chain)
+                item.branch_bindings = [dict(bindings) for bindings in outcome]
+                constrained.append(item)
         self._restore_bindings(chain, self._merge_binding_snapshots(outcomes))
+        baseline = self._capture_versions(chain)
+        for item in constrained:
+            item.branch_versions = [dict(versions) for versions in baseline]
 
     @staticmethod
     def _capture_bindings(chain: list[_FlowScope]) -> list[dict[str, _FlowValue]]:
         return [dict(item.bindings) for item in chain]
+
+    @staticmethod
+    def _capture_versions(chain: list[_FlowScope]) -> list[dict[str, int]]:
+        return [dict(item.versions) for item in chain]
 
     @staticmethod
     def _restore_bindings(
@@ -825,17 +993,21 @@ class _PythonFlowAnalyzer:
 
     def _prepare_function(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef, scope: _FlowScope
-    ) -> _FlowScope:
+    ) -> _DeferredFunction:
         expressions = [*node.decorator_list, *node.args.defaults] + [
             item for item in node.args.kw_defaults if item is not None
         ]
         for expression in expressions:
             self._scan_expression(expression, scope)
-        scope.assign(node.name, _UNKNOWN_VALUE)
         body_parent = scope
         while body_parent.is_class_namespace and body_parent.parent is not None:
             body_parent = body_parent.parent
-        return self._function_scope(node, body_parent)
+        child = self._function_scope(node, body_parent)
+        symbol = f"{_FUNCTION_SYMBOL_PREFIX}{id(node)}"
+        deferred = _DeferredFunction(body_parent, node, child, symbol)
+        self.function_templates[symbol] = deferred
+        scope.assign(node.name, _FlowValue(symbols=frozenset({symbol})))
+        return deferred
 
     def _analyze_function_body(
         self,
@@ -845,24 +1017,65 @@ class _PythonFlowAnalyzer:
     ) -> None:
         chain = self._scope_chain(scope)
         saved_bindings = [dict(item.bindings) for item in chain]
+        saved_versions = [dict(item.versions) for item in chain]
         self._analyze_block(node.body, child)
         self._flush_functions(child)
         self._flush_lambdas(child)
-        for item, bindings in zip(chain, saved_bindings):
+        for item, bindings, versions in zip(
+            chain, saved_bindings, saved_versions
+        ):
             item.bindings = bindings
+            item.versions = versions
+
+    def _analyze_deferred_function(
+        self, deferred: _DeferredFunction, child: _FlowScope
+    ) -> None:
+        if (
+            deferred.branch_chain is None
+            or deferred.branch_bindings is None
+            or deferred.branch_versions is None
+        ):
+            self._analyze_function_body(
+                deferred.node, child, deferred.owner
+            )
+            return
+
+        chain = deferred.branch_chain
+        saved_bindings = self._capture_bindings(chain)
+        saved_versions = self._capture_versions(chain)
+        for scope, branch_bindings, baseline_versions in zip(
+            chain, deferred.branch_bindings, deferred.branch_versions
+        ):
+            current_bindings = dict(scope.bindings)
+            current_versions = dict(scope.versions)
+            names = set(branch_bindings) | set(current_bindings)
+            scope.bindings = {
+                name: (
+                    current_bindings.get(name, _UNKNOWN_VALUE)
+                    if current_versions.get(name, 0)
+                    > baseline_versions.get(name, 0)
+                    else branch_bindings.get(name, _UNKNOWN_VALUE)
+                )
+                for name in names
+            }
+        self._analyze_function_body(deferred.node, child, deferred.owner)
+        for scope, bindings, versions in zip(
+            chain, saved_bindings, saved_versions
+        ):
+            scope.bindings = bindings
+            scope.versions = versions
 
     def _flush_functions(self, owner: _FlowScope) -> None:
-        pending = [item for item in self.deferred_functions if item[0] is owner]
+        pending = [item for item in self.deferred_functions if item.owner is owner]
         self.deferred_functions = [
-            item for item in self.deferred_functions if item[0] is not owner
+            item for item in self.deferred_functions if item.owner is not owner
         ]
-        for _, node, child in pending:
-            self._analyze_function_body(node, child, owner)
+        for item in pending:
+            self._analyze_deferred_function(item, item.child)
 
     def _analyze_statement(self, node: ast.stmt, scope: _FlowScope) -> None:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
-            child = self._prepare_function(node, scope)
-            self.deferred_functions.append((child.parent or scope, node, child))
+            self.deferred_functions.append(self._prepare_function(node, scope))
             return
         if isinstance(node, ast.ClassDef):
             for expression in [*node.decorator_list, *node.bases]:
@@ -962,9 +1175,8 @@ class _PythonFlowAnalyzer:
     def _analyze_block(self, statements: list[ast.stmt], scope: _FlowScope) -> None:
         for statement in statements:
             if isinstance(statement, (ast.FunctionDef, ast.AsyncFunctionDef)):
-                child = self._prepare_function(statement, scope)
                 self.deferred_functions.append(
-                    (child.parent or scope, statement, child)
+                    self._prepare_function(statement, scope)
                 )
             else:
                 self._analyze_statement(statement, scope)
