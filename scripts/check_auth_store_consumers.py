@@ -125,11 +125,13 @@ class _FlowScope:
         global_names: set[str] | None = None,
         nonlocal_names: set[str] | None = None,
         is_class_namespace: bool = False,
+        named_expression_scope: "_FlowScope | None" = None,
     ) -> None:
         self.parent = parent
         self.global_names = global_names or set()
         self.nonlocal_names = nonlocal_names or set()
         self.is_class_namespace = is_class_namespace
+        self.named_expression_scope = named_expression_scope
         self.bindings = {
             name: _UNKNOWN_VALUE
             for name in (local_names or set()) - self.global_names - self.nonlocal_names
@@ -159,6 +161,9 @@ class _FlowScope:
     def assign(self, name: str, value: _FlowValue) -> None:
         self._target(name).bindings[name] = value
 
+    def assign_named_expression(self, name: str, value: _FlowValue) -> None:
+        (self.named_expression_scope or self).assign(name, value)
+
     def resolve(self, name: str) -> _FlowValue:
         if name in self.global_names:
             return self._root()._resolve_local_or_builtin(name)
@@ -187,6 +192,24 @@ class _FlowScope:
         return _UNKNOWN_VALUE
 
 
+def _match_pattern_names(pattern: ast.pattern) -> set[str]:
+    names: set[str] = set()
+    for item in ast.walk(pattern):
+        if isinstance(item, (ast.MatchAs, ast.MatchStar)) and item.name is not None:
+            names.add(item.name)
+        elif isinstance(item, ast.MatchMapping) and item.rest is not None:
+            names.add(item.rest)
+    return names
+
+
+def _is_irrefutable_match_pattern(pattern: ast.pattern) -> bool:
+    if isinstance(pattern, ast.MatchAs):
+        return pattern.pattern is None or _is_irrefutable_match_pattern(pattern.pattern)
+    if isinstance(pattern, ast.MatchOr):
+        return any(_is_irrefutable_match_pattern(item) for item in pattern.patterns)
+    return False
+
+
 class _ScopeDeclarations(ast.NodeVisitor):
     def __init__(self) -> None:
         self.local_names: set[str] = set()
@@ -212,6 +235,7 @@ class _ScopeDeclarations(ast.NodeVisitor):
 
     def visit_NamedExpr(self, node: ast.NamedExpr) -> None:
         self._bind_target(node.target)
+        self.visit(node.value)
 
     def visit_For(self, node: ast.For) -> None:
         self._bind_target(node.target)
@@ -234,6 +258,23 @@ class _ScopeDeclarations(ast.NodeVisitor):
         for item in node.items:
             if item.optional_vars is not None:
                 self._bind_target(item.optional_vars)
+        for statement in node.body:
+            self.visit(statement)
+
+    def visit_Match(self, node: ast.Match) -> None:
+        self.visit(node.subject)
+        for case in node.cases:
+            self.local_names.update(_match_pattern_names(case.pattern))
+            if case.guard is not None:
+                self.visit(case.guard)
+            for statement in case.body:
+                self.visit(statement)
+
+    def visit_ExceptHandler(self, node: ast.ExceptHandler) -> None:
+        if node.name is not None:
+            self.local_names.add(node.name)
+        if node.type is not None:
+            self.visit(node.type)
         for statement in node.body:
             self.visit(statement)
 
@@ -511,9 +552,11 @@ class _PythonFlowAnalyzer:
     def _scan_expression(self, node: ast.AST, scope: _FlowScope) -> None:
         if isinstance(node, ast.NamedExpr):
             self._scan_expression(node.value, scope)
-            self._assign_target(
-                node.target, self._expression_value(node.value, scope), scope
-            )
+            value = self._expression_value(node.value, scope)
+            if isinstance(node.target, ast.Name):
+                scope.assign_named_expression(node.target.id, value)
+            else:
+                self._assign_target(node.target, value, scope)
             return
         if isinstance(node, ast.Lambda):
             self._analyze_lambda(node, scope)
@@ -552,11 +595,20 @@ class _PythonFlowAnalyzer:
         local_names = set().union(
             *(self._target_names(generator.target) for generator in generators)
         )
-        child = _FlowScope(scope, local_names=local_names)
+        child = _FlowScope(
+            scope,
+            local_names=local_names,
+            named_expression_scope=scope.named_expression_scope or scope,
+        )
         for index, generator in enumerate(generators):
+            iteration_scope = scope if index == 0 else child
             if index:
-                self._scan_expression(generator.iter, child)
-            self._assign_target(generator.target, _UNKNOWN_VALUE, child)
+                self._scan_expression(generator.iter, iteration_scope)
+            self._assign_target(
+                generator.target,
+                self._iterated_value(generator.iter, iteration_scope),
+                child,
+            )
             for condition in generator.ifs:
                 self._scan_expression(condition, child)
         if isinstance(node, ast.DictComp):
@@ -581,6 +633,9 @@ class _PythonFlowAnalyzer:
             local_names.add(node.args.vararg.arg)
         if node.args.kwarg is not None:
             local_names.add(node.args.kwarg.arg)
+        declarations = _ScopeDeclarations()
+        declarations.visit(node.body)
+        local_names.update(declarations.local_names)
         body_parent = scope
         while body_parent.is_class_namespace and body_parent.parent is not None:
             body_parent = body_parent.parent
@@ -650,17 +705,34 @@ class _PythonFlowAnalyzer:
         initial_bindings: list[dict[str, _FlowValue]] | None = None,
     ) -> None:
         chain = self._scope_chain(scope)
-        original = [dict(item.bindings) for item in chain]
+        original = self._capture_bindings(chain)
         outcomes: list[list[dict[str, _FlowValue]]] = []
         branch_bindings = initial_bindings or [{} for _ in branches]
         for branch, initial in zip(branches, branch_bindings):
-            for item, saved in zip(chain, original):
-                item.bindings = dict(saved)
+            self._restore_bindings(chain, original)
             for name, value in initial.items():
                 scope.assign(name, value)
             self._analyze_block(branch, scope)
-            outcomes.append([dict(item.bindings) for item in chain])
-        for index, item in enumerate(chain):
+            outcomes.append(self._capture_bindings(chain))
+        self._restore_bindings(chain, self._merge_binding_snapshots(outcomes))
+
+    @staticmethod
+    def _capture_bindings(chain: list[_FlowScope]) -> list[dict[str, _FlowValue]]:
+        return [dict(item.bindings) for item in chain]
+
+    @staticmethod
+    def _restore_bindings(
+        chain: list[_FlowScope], snapshot: list[dict[str, _FlowValue]]
+    ) -> None:
+        for item, bindings in zip(chain, snapshot):
+            item.bindings = dict(bindings)
+
+    @staticmethod
+    def _merge_binding_snapshots(
+        outcomes: list[list[dict[str, _FlowValue]]],
+    ) -> list[dict[str, _FlowValue]]:
+        merged_snapshot: list[dict[str, _FlowValue]] = []
+        for index in range(len(outcomes[0])):
             names = set().union(*(outcome[index].keys() for outcome in outcomes))
             merged: dict[str, _FlowValue] = {}
             for name in names:
@@ -668,7 +740,58 @@ class _PythonFlowAnalyzer:
                 for outcome in outcomes:
                     value = value.merged(outcome[index].get(name, _UNKNOWN_VALUE))
                 merged[name] = value
-            item.bindings = merged
+            merged_snapshot.append(merged)
+        return merged_snapshot
+
+    def _analyze_try(
+        self, node: ast.Try | ast.TryStar, scope: _FlowScope
+    ) -> None:
+        chain = self._scope_chain(scope)
+        original = self._capture_bindings(chain)
+
+        try_prefixes = [original]
+        for statement in node.body:
+            self._analyze_block([statement], scope)
+            try_prefixes.append(self._capture_bindings(chain))
+        body_endpoint = self._capture_bindings(chain)
+        self._analyze_block(node.orelse, scope)
+        outcomes = [self._capture_bindings(chain)]
+
+        handler_entry = self._merge_binding_snapshots(try_prefixes)
+        for handler in node.handlers:
+            self._restore_bindings(chain, handler_entry)
+            if handler.type is not None:
+                self._scan_expression(handler.type, scope)
+            if handler.name is not None:
+                scope.assign(handler.name, _UNKNOWN_VALUE)
+            self._analyze_block(handler.body, scope)
+            outcomes.append(self._capture_bindings(chain))
+
+        self._restore_bindings(chain, self._merge_binding_snapshots(outcomes))
+        self._analyze_block(node.finalbody, scope)
+
+    def _analyze_match(self, node: ast.Match, scope: _FlowScope) -> None:
+        self._scan_expression(node.subject, scope)
+        branches: list[list[ast.stmt]] = []
+        initial_bindings: list[dict[str, _FlowValue]] = []
+        for case in node.cases:
+            for item in ast.walk(case.pattern):
+                if isinstance(item, ast.expr):
+                    self._scan_expression(item, scope)
+            branch = list(case.body)
+            if case.guard is not None:
+                branch.insert(0, ast.Expr(value=case.guard))
+            branches.append(branch)
+            initial_bindings.append(
+                {name: _UNKNOWN_VALUE for name in _match_pattern_names(case.pattern)}
+            )
+        if not any(
+            case.guard is None and _is_irrefutable_match_pattern(case.pattern)
+            for case in node.cases
+        ):
+            branches.append([])
+            initial_bindings.append({})
+        self._analyze_branches(scope, branches, initial_bindings)
 
     def _function_scope(
         self, node: ast.FunctionDef | ast.AsyncFunctionDef, parent: _FlowScope
@@ -813,6 +936,9 @@ class _PythonFlowAnalyzer:
             self._analyze_branches(scope, [node.body, []])
             self._analyze_block(node.orelse, scope)
             return
+        if isinstance(node, ast.Match):
+            self._analyze_match(node, scope)
+            return
         if isinstance(node, (ast.With, ast.AsyncWith)):
             for item in node.items:
                 self._scan_expression(item.context_expr, scope)
@@ -820,21 +946,8 @@ class _PythonFlowAnalyzer:
                     self._assign_target(item.optional_vars, _UNKNOWN_VALUE, scope)
             self._analyze_block(node.body, scope)
             return
-        if isinstance(node, ast.Try):
-            for handler in node.handlers:
-                if handler.type is not None:
-                    self._scan_expression(handler.type, scope)
-            handler_bindings = [
-                {handler.name: _UNKNOWN_VALUE} if handler.name else {}
-                for handler in node.handlers
-            ]
-            self._analyze_branches(
-                scope,
-                [node.body, *[handler.body for handler in node.handlers]],
-                [{}, *handler_bindings],
-            )
-            self._analyze_block(node.orelse, scope)
-            self._analyze_block(node.finalbody, scope)
+        if isinstance(node, (ast.Try, ast.TryStar)):
+            self._analyze_try(node, scope)
             return
         if isinstance(
             node, (ast.Global, ast.Nonlocal, ast.Pass, ast.Break, ast.Continue)
@@ -955,9 +1068,12 @@ def _split_auth_store_reference_lines(source: str, suffix: str) -> set[int]:
         )
         for offset, following in enumerate(following_fragments, start=1):
             separator = source[previous_end : following.start()]
-            concatenates = separator == "" if suffix == ".sh" else bool(
-                re.fullmatch(r"\s*\+\s*", separator)
-            )
+            if suffix == ".sh":
+                concatenates = separator == "" or bool(
+                    re.fullmatch(r"\\\r?\n[ \t]*", separator)
+                )
+            else:
+                concatenates = bool(re.fullmatch(r"\s*\+\s*", separator))
             if not concatenates:
                 break
             if offset > _MAX_TEXT_FRAGMENT_CHAIN:

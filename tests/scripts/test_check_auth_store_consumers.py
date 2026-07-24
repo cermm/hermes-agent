@@ -419,6 +419,35 @@ def test_audit_rejects_joined_and_formatted_auth_store_paths(
             6,
             id="format-preserves-all-branch-alternatives",
         ),
+        pytest.param(
+            'match value:\n    case _:\n        open("auth.json", "rb")\n',
+            3,
+            id="match-case-consumer",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            '[Path(target).read_text() for target in ("auth.json",)]\n',
+            2,
+            id="comprehension-static-path",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            '[(target := "auth.json") for _ in values]\n'
+            "Path(target).read_text()\n",
+            3,
+            id="comprehension-walrus-binds-containing-scope",
+        ),
+        pytest.param(
+            "from pathlib import Path\n"
+            "try:\n"
+            '    target = "auth.json"\n'
+            "    operation()\n"
+            "    target = input()\n"
+            "except Exception:\n"
+            "    Path(target).read_text()\n",
+            7,
+            id="except-handler-sees-try-prefix-binding",
+        ),
     ],
 )
 def test_audit_rejects_static_assignment_expression_variants(
@@ -484,6 +513,17 @@ def test_static_alternative_overflow_is_bounded_and_fails_closed(
         "    operation()\n"
         "except Exception as Path:\n"
         '    Path("auth.json").read_text()\n',
+        "def harmless():\n"
+        '    open("auth.json", "rb")\n'
+        "    try:\n"
+        "        operation()\n"
+        "    except Exception as open:\n"
+        "        pass\n",
+        'consumer = lambda: (open("auth.json", "rb"), (open := factory()))\n',
+        "match value:\n"
+        "    case open:\n"
+        "        pass\n"
+        'open("auth.json", "rb")\n',
     ],
 )
 def test_scan_ignores_scope_shadowed_or_unrelated_callables(
@@ -502,6 +542,7 @@ def test_scan_ignores_scope_shadowed_or_unrelated_callables(
         ("consumer.ts", "const p = `auth` + `.json`;\n", 1),
         ("consumer.cjs", "const p = 'auth' +\n  '.json';\n", 1),
         ("consumer.sh", "target=$HERMES_HOME/'auth'\".json\"\n", 1),
+        ("continued.sh", "target=$HERMES_HOME/'auth'\\\n'.json'\n", 1),
         ("consumer.nix", 'target = stateDir + "/auth" + ".json";\n', 1),
     ],
 )
