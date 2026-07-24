@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import importlib.util
 import json
 import sys
@@ -94,6 +95,23 @@ def test_scan_ignores_tests_but_covers_non_python_deployment_adapters(
     ]
 
 
+def test_scan_normalizes_relative_and_absolute_roots(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        'open("auth.json", "rb")\n', encoding="utf-8"
+    )
+    monkeypatch.chdir(tmp_path)
+
+    relative_findings = module.scan_repository(Path("."))
+    absolute_findings = module.scan_repository(tmp_path.resolve())
+
+    assert relative_findings == absolute_findings == [
+        module.Finding("consumer.py", 1, "open")
+    ]
+
+
 @pytest.mark.parametrize(
     "source",
     [
@@ -171,6 +189,221 @@ def test_audit_rejects_direct_wrapper_receiving_static_auth_store(
         ("consumer.py", 2, "open")
     ]
     assert stale == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        pytest.param(
+            'open(*("auth.json", "rb"))\n',
+            1,
+            id="builtin-open-star-args",
+        ),
+        pytest.param(
+            'open(**{"file": "auth.json", "mode": "rb"})\n',
+            1,
+            id="builtin-open-star-star-kwargs",
+        ),
+        pytest.param(
+            "def consume(path):\n"
+            '    return open(path, "rb")\n'
+            'consume(*(\"auth.json\",))\n',
+            2,
+            id="wrapper-call-star-args",
+        ),
+        pytest.param(
+            "def consume(path):\n"
+            '    return open(path, "rb")\n'
+            'consume(**{"path": "auth.json"})\n',
+            2,
+            id="wrapper-call-star-star-kwargs",
+        ),
+        pytest.param(
+            "def consume(*args):\n"
+            "    return open(*args)\n"
+            'consume("auth.json", "rb")\n',
+            2,
+            id="wrapper-forwards-varargs",
+        ),
+        pytest.param(
+            "def consume(**kwargs):\n"
+            "    return open(**kwargs)\n"
+            'consume(file="auth.json", mode="rb")\n',
+            2,
+            id="wrapper-forwards-kwargs",
+        ),
+    ],
+)
+def test_audit_rejects_static_auth_store_through_argument_unpacking(
+    tmp_path: Path, source: str, expected_line: int
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, "open")
+    ]
+    assert stale == []
+
+    (tmp_path / "consumer.py").unlink()
+    (tmp_path / "harmless.py").write_text(
+        source.replace('"auth.json"', '"other.json"'),
+        encoding="utf-8",
+    )
+    assert module.scan_repository(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        pytest.param(
+            "class Consumer:\n"
+            "    @staticmethod\n"
+            "    def read(path):\n"
+            '        return open(path, "rb")\n'
+            'Consumer.read("auth.json")\n',
+            4,
+            id="staticmethod-wrapper",
+        ),
+        pytest.param(
+            "class Consumer:\n"
+            "    def read(self, path):\n"
+            '        return open(path, "rb")\n'
+            "consumer = Consumer()\n"
+            'consumer.read("auth.json")\n',
+            3,
+            id="instance-method-wrapper",
+        ),
+        pytest.param(
+            'consume = lambda path: open(path, "rb")\n'
+            'consume("auth.json")\n',
+            1,
+            id="lambda-wrapper",
+        ),
+    ],
+)
+def test_audit_rejects_static_auth_store_through_callable_wrappers(
+    tmp_path: Path, source: str, expected_line: int
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, "open")
+    ]
+    assert stale == []
+
+    (tmp_path / "consumer.py").unlink()
+    (tmp_path / "harmless.py").write_text(
+        source.replace('"auth.json"', '"other.json"'),
+        encoding="utf-8",
+    )
+    assert module.scan_repository(tmp_path) == []
+
+
+@pytest.mark.parametrize(
+    ("source", "expected_line"),
+    [
+        pytest.param(
+            'def target():\n    return "auth.json"\n'
+            "target().read_text()\n",
+            3,
+            id="literal-return",
+        ),
+        pytest.param(
+            "def target(stem, suffix):\n"
+            '    return f"{stem}.{suffix}"\n'
+            'target("auth", "json").read_text()\n',
+            3,
+            id="constructed-return",
+        ),
+    ],
+)
+def test_audit_rejects_io_on_auth_store_returned_by_wrapper(
+    tmp_path: Path, source: str, expected_line: int
+) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(source, encoding="utf-8")
+
+    unclassified, stale = module.audit(tmp_path, _inventory(tmp_path, {}))
+
+    assert [(item.path, item.line, item.kind) for item in unclassified] == [
+        ("consumer.py", expected_line, "read_text")
+    ]
+    assert stale == []
+
+    (tmp_path / "consumer.py").unlink()
+    (tmp_path / "harmless.py").write_text(
+        source.replace('"auth.json"', '"other.json"').replace('"auth"', '"other"'),
+        encoding="utf-8",
+    )
+    assert module.scan_repository(tmp_path) == []
+
+
+def test_direct_wrapper_analysis_memoizes_duplicated_depth_twenty_graph() -> None:
+    module = _load_module()
+    depth = 20
+    definitions = []
+    for index in range(depth):
+        definitions.append(
+            f"def hop_{index}(path):\n"
+            f"    hop_{index + 1}(path)\n"
+            f"    hop_{index + 1}(path)\n"
+        )
+    definitions.append(
+        f"def hop_{depth}(path):\n"
+        '    return open(path, "rb")\n'
+    )
+    source = "".join(definitions) + 'hop_0("auth.json")\n'
+    analyzer = module._PythonFlowAnalyzer("consumer.py")
+
+    findings = analyzer.analyze(ast.parse(source))
+
+    assert [(item.path, item.kind) for item in findings] == [
+        ("consumer.py", "open")
+    ]
+    assert analyzer.direct_function_work <= depth + 1
+
+
+def test_direct_wrapper_analysis_fails_closed_when_work_budget_is_exhausted(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    module = _load_module()
+    monkeypatch.setattr(module, "_MAX_DIRECT_CALL_WORK", 0)
+    (tmp_path / "consumer.py").write_text(
+        'def consume(path):\n    return open(path, "rb")\n'
+        'consume("auth.json")\n',
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", 3, "analysis_overflow")
+    ]
+
+
+def test_direct_wrapper_memoization_includes_environment_state(tmp_path: Path) -> None:
+    module = _load_module()
+    (tmp_path / "consumer.py").write_text(
+        'target_name = "other.json"\n'
+        "def target():\n"
+        "    return target_name\n"
+        "target().read_text()\n"
+        'target_name = "auth.json"\n'
+        "target().read_text()\n",
+        encoding="utf-8",
+    )
+
+    findings = module.scan_repository(tmp_path)
+
+    assert [(item.path, item.line, item.kind) for item in findings] == [
+        ("consumer.py", 6, "read_text")
+    ]
 
 
 @pytest.mark.parametrize(
@@ -454,6 +687,14 @@ def test_audit_rejects_joined_and_formatted_auth_store_paths(
             2,
             "read_text",
         ),
+        pytest.param(
+            "from pathlib import Path\n"
+            'Path("%(stem)s.%(suffix)s" % '
+            '{"stem": "auth", "suffix": "json"}).read_text()\n',
+            2,
+            "read_text",
+            id="mapping-percent-format",
+        ),
     ],
 )
 def test_audit_rejects_conditional_and_percent_formatted_auth_paths(
@@ -468,6 +709,18 @@ def test_audit_rejects_conditional_and_percent_formatted_auth_paths(
         ("consumer.py", expected_line, expected_kind)
     ]
     assert stale == []
+
+
+def test_scan_ignores_mapping_percent_format_of_other_path(tmp_path: Path) -> None:
+    module = _load_module()
+    (tmp_path / "harmless.py").write_text(
+        "from pathlib import Path\n"
+        'Path("%(stem)s.%(suffix)s" % '
+        '{"stem": "other", "suffix": "json"}).read_text()\n',
+        encoding="utf-8",
+    )
+
+    assert module.scan_repository(tmp_path) == []
 
 
 @pytest.mark.parametrize(
