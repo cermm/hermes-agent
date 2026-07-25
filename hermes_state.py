@@ -29,6 +29,9 @@ from pathlib import Path
 from agent.memory_manager import sanitize_context
 from agent.message_sanitization import _sanitize_surrogates
 from hermes_constants import get_hermes_home
+from hermes_cli.sqlite_runtime import (
+    is_sqlite_wal_reset_vulnerable as _is_sqlite_wal_reset_vulnerable,
+)
 from typing import Any, Callable, Dict, List, Optional, Tuple, TypeVar
 
 try:  # Hard dependency, but tolerate scaffold-phase imports before pip install.
@@ -491,16 +494,7 @@ def is_sqlite_wal_reset_vulnerable(
     Pre-WAL libraries (< 3.7.0) cannot hit the race and are treated as safe.
     """
     info = version_info if version_info is not None else sqlite3.sqlite_version_info
-    if info < (3, 7, 0):
-        return False
-    if info >= (3, 51, 3):
-        return False
-    # Backports of the same fix on older release lines.
-    if (3, 50, 7) <= info < (3, 51, 0):
-        return False
-    if (3, 44, 6) <= info < (3, 45, 0):
-        return False
-    return True
+    return _is_sqlite_wal_reset_vulnerable(info)
 
 
 def sqlite_source_id() -> str:
@@ -639,9 +633,9 @@ def _log_wal_reset_bug_once(
         "%s: linked SQLite %s is vulnerable to the WAL-reset corruption "
         "bug (https://sqlite.org/wal.html#walresetbug) — %s. "
         "Upgrade to SQLite 3.51.3+ (or backports 3.50.7 / 3.44.6); "
-        "`hermes update` alone may not change python-build-standalone's "
-        "embedded SQLite. See `hermes doctor`. This warning fires once "
-        "per process per database.",
+        "Hermes-managed installs can repair the embedded runtime with "
+        "`hermes update`. See `hermes doctor`. This warning fires once per "
+        "process per database.",
         db_label,
         sqlite3.sqlite_version,
         action,
@@ -1564,6 +1558,21 @@ CREATE TRIGGER IF NOT EXISTS messages_fts_trigram_update AFTER UPDATE ON message
     );
 END;
 """
+
+
+class CompressionSessionClosedError(RuntimeError):
+    """A durable write targeted a parent already closed by compression."""
+
+    def __init__(self, session_id: str):
+        self.session_id = session_id
+        super().__init__(
+            f"Session {session_id!r} is closed by compression; "
+            "adopt its live continuation before appending messages"
+        )
+
+
+class CompressionSessionBusyError(RuntimeError):
+    """A non-owner tried to write while compression owns the session."""
 
 
 class SessionDB:
@@ -3851,6 +3860,146 @@ class SessionDB:
             ).fetchone()
         return dict(row) if row else None
 
+    def find_live_compression_child(
+        self, parent_session_id: str
+    ) -> Optional[Dict[str, Any]]:
+        """Return the unique live direct child of a compression-ended session.
+
+        A stale agent may observe that another compression path already rotated
+        its parent. Recovery is safe only when the durable lineage identifies
+        exactly one live direct continuation. Multiple children are treated as
+        ambiguous and fail closed rather than guessing which transcript owns
+        subsequent messages.
+        """
+        if not parent_session_id:
+            return None
+        with self._lock:
+            parent = self._conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if (
+                parent is None
+                or parent["ended_at"] is None
+                or parent["end_reason"] != "compression"
+            ):
+                return None
+            rows = self._conn.execute(
+                """
+                SELECT * FROM sessions
+                WHERE parent_session_id = ?
+                  AND ended_at IS NULL
+                  AND json_extract(COALESCE(model_config, '{}'), '$._branched_from') IS NULL
+                  AND json_extract(COALESCE(model_config, '{}'), '$._delegate_from') IS NULL
+                  AND COALESCE(source, '') != 'tool'
+                ORDER BY started_at ASC
+                LIMIT 2
+                """,
+                (parent_session_id,),
+            ).fetchall()
+        return dict(rows[0]) if len(rows) == 1 else None
+
+    def publish_compression_child(
+        self,
+        *,
+        parent_session_id: str,
+        child_session_id: str,
+        source: str,
+        messages: List[Dict[str, Any]],
+        model: str = None,
+        model_config: Dict[str, Any] = None,
+        system_prompt: str = None,
+        cwd: str = None,
+        profile_name: str = None,
+        compression_lock_holder: str = None,
+        require_compression_lease: bool = True,
+    ) -> None:
+        """Atomically close a parent and publish its durable compression child.
+
+        The parent closure, child row, and compacted handoff become visible in
+        one transaction. Readers can therefore observe either the live parent or
+        a complete child, never an ended parent with a missing/empty child.
+        """
+        def _do(conn):
+            lock_row = conn.execute(
+                "SELECT holder, expires_at FROM compression_locks WHERE session_id = ?",
+                (parent_session_id,),
+            ).fetchone()
+            if require_compression_lease and (
+                lock_row is None
+                or not compression_lock_holder
+                or lock_row["holder"] != compression_lock_holder
+                or float(lock_row["expires_at"]) <= time.time()
+            ):
+                raise CompressionSessionBusyError(
+                    f"Compression lease lost before publication: {parent_session_id}"
+                )
+            parent = conn.execute(
+                """SELECT ended_at, cwd, git_branch, git_repo_root,
+                          user_id, session_key, chat_id, chat_type,
+                          thread_id, display_name, origin_json, profile_name
+                   FROM sessions WHERE id = ?""",
+                (parent_session_id,),
+            ).fetchone()
+            if parent is None:
+                raise RuntimeError(f"Compression parent not found: {parent_session_id}")
+            if parent["ended_at"] is not None:
+                raise RuntimeError(f"Compression parent already ended: {parent_session_id}")
+            if not messages:
+                raise RuntimeError("Compression child handoff must not be empty")
+
+            conn.execute(
+                """INSERT INTO sessions (
+                   id, source, model, model_config, system_prompt,
+                   parent_session_id, cwd, git_branch, git_repo_root,
+                   profile_name, user_id, session_key, chat_id, chat_type,
+                   thread_id, display_name, origin_json, started_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    child_session_id,
+                    source,
+                    model,
+                    json.dumps(model_config) if model_config else None,
+                    system_prompt,
+                    parent_session_id,
+                    cwd or parent["cwd"],
+                    parent["git_branch"],
+                    parent["git_repo_root"],
+                    # Same inheritance contract as _insert_session_row's
+                    # compression-fork backfill (#59527 / cross-profile jump
+                    # fix): the child stays on the parent's profile and keeps
+                    # the gateway routing/origin columns so peer recovery
+                    # still works after a crash at the boundary.
+                    profile_name or parent["profile_name"],
+                    parent["user_id"],
+                    parent["session_key"],
+                    parent["chat_id"],
+                    parent["chat_type"],
+                    parent["thread_id"],
+                    parent["display_name"],
+                    parent["origin_json"],
+                    time.time(),
+                ),
+            )
+            total_messages, total_tool_calls = self._insert_message_rows(
+                conn, child_session_id, messages
+            )
+            conn.execute(
+                "UPDATE sessions SET message_count = ?, tool_call_count = ? WHERE id = ?",
+                (total_messages, total_tool_calls, child_session_id),
+            )
+            updated = conn.execute(
+                "UPDATE sessions SET ended_at = ?, end_reason = 'compression' "
+                "WHERE id = ? AND ended_at IS NULL",
+                (time.time(), parent_session_id),
+            )
+            if updated.rowcount != 1:
+                raise RuntimeError(
+                    f"Compression parent changed during publication: {parent_session_id}"
+                )
+
+        self._execute_write(_do)
+
     def end_session(self, session_id: str, end_reason: str) -> None:
         """Mark a session as ended.
 
@@ -4366,11 +4515,78 @@ class SessionDB:
         Unlike ``update_token_counts`` which uses ``COALESCE(model, ?)``
         (only filling in NULL), this unconditionally sets the model column
         so that the dashboard reflects the user's latest /model choice.
+        Also nulls ``system_prompt`` so stale ``Model:`` / ``Provider:``
+        footer metadata is rebuilt on the next turn. A successful /model
+        switch explicitly replaces any confirmed Browser runtime lock while
+        preserving unrelated lineage markers in ``model_config``.
         """
         def _do(conn):
             conn.execute(
-                "UPDATE sessions SET model = ? WHERE id = ?",
+                """UPDATE sessions SET
+                   model = ?,
+                   model_config = CASE
+                       WHEN model_config IS NULL THEN NULL
+                       WHEN json_valid(model_config)
+                           THEN json_remove(model_config, '$.browser_model_lock')
+                       ELSE model_config
+                   END,
+                   system_prompt = NULL
+                   WHERE id = ?""",
                 (model, session_id),
+            )
+        self._execute_write(_do)
+
+    def update_session_runtime_lock(
+        self,
+        session_id: str,
+        *,
+        model: Optional[str] = None,
+        provider: Optional[str] = None,
+        model_options: Optional[Dict[str, Any]] = None,
+        route_source: Optional[str] = None,
+        confirmed: bool = False,
+    ) -> None:
+        """Persist a Browser / API client runtime lock without clobbering lineage markers.
+
+        Merges ``browser_model_lock`` into the existing ``model_config`` JSON so
+        ``_branched_from`` / ``_delegate_from`` survive. Nulls ``system_prompt``
+        so cached ``Model:`` / ``Provider:`` footers cannot lie after a switch.
+        """
+        lock = {
+            "provider": provider or "",
+            "model": model or "",
+            "model_options": model_options or {},
+            "route_source": route_source or "",
+            "confirmed": bool(confirmed),
+            "updated_at": time.time(),
+        }
+
+        def _do(conn):
+            row = conn.execute(
+                "SELECT model_config FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return
+            raw = row["model_config"] if isinstance(row, sqlite3.Row) else row[0]
+            config: Dict[str, Any] = {}
+            if isinstance(raw, str) and raw.strip():
+                try:
+                    parsed = json.loads(raw)
+                    if isinstance(parsed, dict):
+                        config = parsed
+                except Exception:
+                    config = {}
+            elif isinstance(raw, dict):
+                config = dict(raw)
+            config["browser_model_lock"] = lock
+            conn.execute(
+                """UPDATE sessions SET
+                   model_config = ?,
+                   model = COALESCE(?, model),
+                   system_prompt = NULL
+                   WHERE id = ?""",
+                (json.dumps(config), model, session_id),
             )
         self._execute_write(_do)
 
@@ -5767,6 +5983,58 @@ class SessionDB:
                 return content
         return content
 
+    @staticmethod
+    def _encode_display_metadata(display_metadata: Any) -> Optional[str]:
+        """Serialize ``display_metadata`` for its TEXT column without double-encoding.
+
+        Import/replace paths can hand us an already-serialized JSON string (the
+        same hazard ``tool_calls`` guards against above). ``json.dumps`` on that
+        string would store a quoted JSON string, and the single ``json.loads``
+        on read then yields a ``str`` instead of a dict.
+        """
+        if not display_metadata:
+            return None
+        if isinstance(display_metadata, str):
+            try:
+                parsed = json.loads(display_metadata)
+            except (json.JSONDecodeError, TypeError):
+                logger.warning("Ignoring non-JSON display metadata on write")
+                return None
+            if not isinstance(parsed, dict):
+                logger.warning("Ignoring non-object display metadata on write")
+                return None
+            return json.dumps(parsed)
+        if isinstance(display_metadata, dict):
+            return json.dumps(display_metadata)
+        logger.warning(
+            "Ignoring unexpected display metadata type on write: %s",
+            type(display_metadata).__name__,
+        )
+        return None
+
+    @staticmethod
+    def _decode_display_metadata(raw: Any) -> Optional[Dict[str, Any]]:
+        """Decode a ``display_metadata`` column into the dict every reader expects.
+
+        Every message read path must go through this. Returning the raw TEXT
+        instead reaches the desktop as a string, where ``'task_count' in meta``
+        throws and fails the whole resume. Rows written before the encode guard
+        landed are double-encoded, so unwrap a second layer when we find one.
+        """
+        if raw is None:
+            return None
+        try:
+            meta = json.loads(raw) if isinstance(raw, str) else raw
+            if isinstance(meta, str):
+                meta = json.loads(meta)
+        except (json.JSONDecodeError, TypeError):
+            logger.warning("Ignoring invalid display metadata on message row")
+            return None
+        if not isinstance(meta, dict):
+            logger.warning("Ignoring non-object display metadata on message row")
+            return None
+        return meta
+
     def append_message(
         self,
         session_id: str,
@@ -5789,6 +6057,7 @@ class SessionDB:
         api_content: Optional[str] = None,
         display_kind: Optional[str] = None,
         display_metadata: Optional[Dict[str, Any]] = None,
+        compression_lock_holder: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -5812,7 +6081,7 @@ class SessionDB:
         """
         # Display metadata is presentation-only and never changes the model
         # context role/content replayed to providers.
-        display_metadata_json = json.dumps(display_metadata) if display_metadata else None
+        display_metadata_json = self._encode_display_metadata(display_metadata)
         # Serialize structured fields to JSON before entering the write txn
         reasoning_details_json = (
             json.dumps(reasoning_details)
@@ -5855,6 +6124,28 @@ class SessionDB:
             num_tool_calls = len(tool_calls) if isinstance(tool_calls, list) else 1
 
         def _do(conn):
+            active_lock = conn.execute(
+                "SELECT holder FROM compression_locks "
+                "WHERE session_id = ? AND expires_at > ?",
+                (session_id, time.time()),
+            ).fetchone()
+            if (
+                active_lock is not None
+                and active_lock["holder"] != compression_lock_holder
+            ):
+                raise CompressionSessionBusyError(
+                    f"Session {session_id!r} is being compressed by another writer"
+                )
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
             cursor = conn.execute(
                 """INSERT INTO messages (session_id, role, content, tool_call_id,
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
@@ -5929,7 +6220,7 @@ class SessionDB:
                 "UPDATE messages SET display_kind = ?, display_metadata = ? WHERE id = ?",
                 (
                     _scrub_surrogates(display_kind),
-                    json.dumps(display_metadata) if display_metadata else None,
+                    self._encode_display_metadata(display_metadata),
                     row[0],
                 ),
             )
@@ -6023,7 +6314,7 @@ class SessionDB:
                     1,
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("display_kind")) if isinstance(msg.get("display_kind"), str) else None,
-                    json.dumps(msg["display_metadata"]) if msg.get("display_metadata") else None,
+                    self._encode_display_metadata(msg.get("display_metadata")),
                 ),
             )
             inserted += 1
@@ -6064,6 +6355,16 @@ class SessionDB:
         active_clause = " AND active = 1" if active_only else ""
 
         def _do(conn):
+            session = conn.execute(
+                "SELECT ended_at, end_reason FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if (
+                session is not None
+                and session["ended_at"] is not None
+                and session["end_reason"] == "compression"
+            ):
+                raise CompressionSessionClosedError(session_id)
             conn.execute(
                 f"DELETE FROM messages WHERE session_id = ?{active_clause}",
                 (session_id,),
@@ -6227,6 +6528,8 @@ class SessionDB:
                 except (json.JSONDecodeError, TypeError):
                     logger.warning("Failed to deserialize tool_calls in get_messages, falling back to []")
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
         return result
 
@@ -6296,6 +6599,8 @@ class SessionDB:
                         "Failed to deserialize tool_calls in get_messages_around, falling back to []"
                     )
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             result.append(msg)
 
         # before_rows includes the anchor itself; subtract 1 for the count of
@@ -6418,6 +6723,8 @@ class SessionDB:
                         "Failed to deserialize tool_calls in get_anchored_view, falling back to []"
                     )
                     msg["tool_calls"] = []
+            if msg.get("display_metadata") is not None:
+                msg["display_metadata"] = self._decode_display_metadata(msg["display_metadata"])
             return msg
 
         return {
@@ -6616,10 +6923,9 @@ class SessionDB:
             if row["display_kind"]:
                 msg["display_kind"] = row["display_kind"]
             if row["display_metadata"]:
-                try:
-                    msg["display_metadata"] = json.loads(row["display_metadata"])
-                except (TypeError, json.JSONDecodeError):
-                    logger.warning("Ignoring invalid display metadata on message row")
+                decoded = self._decode_display_metadata(row["display_metadata"])
+                if decoded is not None:
+                    msg["display_metadata"] = decoded
             if row["timestamp"]:
                 msg["timestamp"] = row["timestamp"]
             if row["tool_call_id"]:
@@ -8653,10 +8959,28 @@ class SessionDB:
         except OSError:
             pass
 
+    def get_session_delete_targets(self, session_id: str) -> List[str]:
+        """Return every session row that :meth:`delete_session` would remove.
+
+        The requested session is first, followed by its recursively discovered
+        delegate/subagent children. Branch and compression children are not
+        included because deletion preserves them by orphaning their parent
+        reference.
+        """
+        with self._lock:
+            exists = self._conn.execute(
+                "SELECT 1 FROM sessions WHERE id = ? LIMIT 1", (session_id,)
+            ).fetchone()
+            if not exists:
+                return []
+            delegate_ids = _collect_delegate_child_ids(self._conn, [session_id])
+        return [session_id, *sorted(delegate_ids)]
+
     def delete_session(
         self,
         session_id: str,
         sessions_dir: Optional[Path] = None,
+        expected_delete_ids: Optional[List[str]] = None,
     ) -> bool:
         """Delete a session and all its messages.
 
@@ -8666,9 +8990,18 @@ class SessionDB:
         (``parent_session_id → NULL``) so they remain accessible independently.
         When *sessions_dir* is provided, also removes on-disk transcript
         files (``.json`` / ``.jsonl`` / ``request_dump_*``) for every deleted
-        session. Returns True if the session was found and deleted.
+        session. When *expected_delete_ids* is provided, deletion proceeds only
+        if the parent plus delegate cascade still matches that exact set. This
+        lets export-before-delete callers fail closed if a new delegate appears
+        after they materialize their archive. The delegate tree is re-walked
+        inside the write transaction on purpose (TOCTOU guard); the cost is
+        accepted for correctness. Returns True if the session was found and
+        deleted.
         """
         removed_delegate_ids: List[str] = []
+        expected_ids = (
+            set(expected_delete_ids) if expected_delete_ids is not None else None
+        )
 
         def _do(conn):
             cursor = conn.execute(
@@ -8676,6 +9009,13 @@ class SessionDB:
             )
             if cursor.fetchone()[0] == 0:
                 return False
+            if expected_ids is not None:
+                actual_ids = {
+                    session_id,
+                    *_collect_delegate_child_ids(conn, [session_id]),
+                }
+                if actual_ids != expected_ids:
+                    return False
             removed_delegate_ids.extend(_delete_delegate_children(conn, [session_id]))
             # Orphan remaining child sessions (branches, etc.) so FK is satisfied.
             conn.execute(

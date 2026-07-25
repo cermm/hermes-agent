@@ -543,6 +543,30 @@ class TestSessionLifecycle:
                                model="xiaomi/mimo-v2.5-pro")
         assert db.get_session("s1")["model"] == "xiaomi/mimo-v2.5"
 
+    def test_update_session_model_clears_browser_lock_and_preserves_lineage(self, db):
+        """A later /model switch must replace, not compete with, a Browser lock."""
+        db.create_session(
+            session_id="s1",
+            source="hermes_browser",
+            model="x-ai/grok-4.5",
+            model_config={
+                "_branched_from": "parent-session",
+                "browser_model_lock": {
+                    "provider": "nous",
+                    "model": "x-ai/grok-4.5",
+                    "confirmed": True,
+                },
+            },
+        )
+
+        db.update_session_model("s1", "anthropic/claude-opus-4.8")
+
+        session = db.get_session("s1")
+        model_config = json.loads(session["model_config"])
+        assert session["model"] == "anthropic/claude-opus-4.8"
+        assert "browser_model_lock" not in model_config
+        assert model_config["_branched_from"] == "parent-session"
+
     def test_update_session_billing_route_overwrites_after_switch(self, db):
         """A mid-session provider switch must overwrite the billing route.
 
@@ -4669,13 +4693,13 @@ class TestListSessionsRich:
         """
         t0 = 1709500000.0
         db.create_session("root1", "cli")
+        db.append_message("root1", "user", "old ask")
         with db._lock:
             db._conn.execute("UPDATE sessions SET started_at=? WHERE id=?", (t0, "root1"))
             db._conn.execute(
                 "UPDATE sessions SET ended_at=?, end_reason=? WHERE id=?",
                 (t0 + 100, "compression", "root1"),
             )
-        db.append_message("root1", "user", "old ask")
 
         # Continuation tip created after root ended; last activity much later.
         db.create_session("tip1", "cli", parent_session_id="root1")
@@ -4792,6 +4816,39 @@ class TestListSessionsRich:
 
         assert db.delete_session("parent") is True
         assert db.get_session("delegate") is None
+        assert db.get_session("branch") is not None
+
+    def test_delete_session_expected_targets_fail_closed_on_new_delegate(self, db):
+        db.create_session("parent", "cli")
+        db.create_session(
+            "delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+        db.create_session(
+            "branch",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_branched_from": "parent"},
+        )
+
+        expected_ids = db.get_session_delete_targets("parent")
+        assert expected_ids == ["parent", "delegate"]
+
+        db.create_session(
+            "late-delegate",
+            "cli",
+            parent_session_id="parent",
+            model_config={"_delegate_from": "parent"},
+        )
+
+        assert (
+            db.delete_session("parent", expected_delete_ids=expected_ids) is False
+        )
+        assert db.get_session("parent") is not None
+        assert db.get_session("delegate") is not None
+        assert db.get_session("late-delegate") is not None
         assert db.get_session("branch") is not None
 
     def test_v16_migration_tags_linked_delegate_rows(self, tmp_path):
@@ -7399,4 +7456,111 @@ class TestDisplayMetadataPersistence:
         switched = [m for m in reloaded if m.get("display_kind") == "model_switch"]
         assert len(switched) == 1
         assert switched[0]["display_metadata"] == meta
+
+
+class TestDisplayMetadataReadPaths:
+    """Every message read path must hand back the decoded dict.
+
+    Returning the raw column instead reaches the desktop as a string, where
+    ``'task_count' in meta`` throws and fails the whole session resume.
+    """
+
+    META = {
+        "delegation_id": "deleg_0d84d484",
+        "task_count": 1,
+        "completed_count": 1,
+        "failed_count": 0,
+        "duration_seconds": 193.55,
+    }
+
+    @staticmethod
+    def _seed(db):
+        db.create_session("s1", source="desktop")
+        message_id = db.append_message(
+            "s1", "user", "event",
+            display_kind="async_delegation_complete",
+            display_metadata=TestDisplayMetadataReadPaths.META,
+        )
+        return message_id, db.append_message("s1", "assistant", "anchor")
+
+    @staticmethod
+    def _read(db, reader, message_id, anchor_id):
+        if reader == "get_messages":
+            return db.get_messages("s1")[0]
+        if reader == "get_messages_around":
+            return db.get_messages_around("s1", message_id, window=0)["window"][0]
+        if reader == "get_anchored_view":
+            view = db.get_anchored_view("s1", anchor_id, window=0, bookend=1)
+            return view["bookend_start"][0]
+        return db.get_messages_as_conversation("s1")[0]
+
+    READERS = ("get_messages", "get_messages_around", "get_anchored_view", "conversation")
+
+    @pytest.mark.parametrize("reader", READERS)
+    def test_every_reader_decodes_display_metadata(self, db, reader):
+        message_id, anchor_id = self._seed(db)
+        assert self._read(db, reader, message_id, anchor_id)["display_metadata"] == self.META
+
+    @pytest.mark.parametrize("reader", READERS)
+    def test_every_reader_unwraps_historically_double_encoded_rows(self, db, reader):
+        """Rows written before the encode guard landed carry a second JSON layer."""
+        message_id, anchor_id = self._seed(db)
+
+        def _corrupt(conn):
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (json.dumps(json.dumps(self.META)), message_id),
+            )
+
+        db._execute_write(_corrupt)
+        assert self._read(db, reader, message_id, anchor_id)["display_metadata"] == self.META
+
+    @pytest.mark.parametrize("reader", READERS)
+    @pytest.mark.parametrize("raw", ["", "{not-json", "[]", '"text"', "0"])
+    def test_every_reader_drops_unusable_display_metadata(self, db, reader, raw):
+        """Bad presentation metadata must not take the message down with it."""
+        message_id, anchor_id = self._seed(db)
+
+        def _corrupt(conn):
+            conn.execute(
+                "UPDATE messages SET display_metadata = ? WHERE id = ?",
+                (raw, message_id),
+            )
+
+        db._execute_write(_corrupt)
+        message = self._read(db, reader, message_id, anchor_id)
+        assert message.get("display_metadata") is None
+        assert message["content"] == "event"
+
+    def test_export_import_round_trip_keeps_metadata_decodable(self, db, tmp_path):
+        """The read leak used to write a permanently double-encoded row here.
+
+        ``export_session`` reads through ``get_messages``, so an undecoded
+        string went back through ``_insert_message_rows`` and got re-dumped.
+        """
+        self._seed(db)
+        blob = db.export_session("s1")
+        assert isinstance(blob["messages"][0]["display_metadata"], dict)
+
+        target = SessionDB(db_path=tmp_path / "imported.db")
+        try:
+            target.import_sessions([json.loads(json.dumps(blob))])
+            assert target.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
+            assert target.get_messages("s1")[0]["display_metadata"] == self.META
+        finally:
+            target.close()
+
+    def test_write_paths_do_not_double_encode_serialized_metadata(self, db):
+        """Import/replace can hand us metadata that is already a JSON string."""
+        db.create_session("s1", source="cli")
+        db.replace_messages(
+            "s1",
+            [{
+                "role": "user",
+                "content": "event",
+                "display_kind": "async_delegation_complete",
+                "display_metadata": json.dumps(self.META),
+            }],
+        )
+        assert db.get_messages_as_conversation("s1")[0]["display_metadata"] == self.META
 
