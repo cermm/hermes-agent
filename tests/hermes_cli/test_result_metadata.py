@@ -108,6 +108,19 @@ import pytest
         ),
         pytest.param(
             {
+                "completed": True,
+                "failed": False,
+                "partial": False,
+                "interrupted": True,
+                "api_calls": 1,
+            },
+            3,
+            "unknown_failure",
+            1,
+            id="completed-interrupted-is-contradictory",
+        ),
+        pytest.param(
+            {
                 "completed": False,
                 "failed": True,
                 "partial": False,
@@ -117,9 +130,9 @@ import pytest
                 "failure_reason": "rate_limit",
             },
             3,
-            "interrupted",
+            "unknown_failure",
             1,
-            id="interrupted-precedence",
+            id="failed-interrupted-is-contradictory",
         ),
         pytest.param(
             {
@@ -284,7 +297,7 @@ def test_failure_class_precedence_and_status_invariants(result, failure_class, e
     ) == expected_statuses
 
 
-def test_interrupted_wins_failure_class_precedence():
+def test_multiple_true_statuses_fail_closed_before_interrupted_precedence():
     from hermes_cli.result_metadata import build_result_metadata
 
     metadata = build_result_metadata(
@@ -300,7 +313,7 @@ def test_interrupted_wins_failure_class_precedence():
         max_iterations=3,
     )
 
-    assert metadata["failure_class"] == "interrupted"
+    assert metadata["failure_class"] == "unknown_failure"
     assert metadata["interrupted"] is True
     assert metadata["failed"] is True
 

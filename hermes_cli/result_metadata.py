@@ -327,10 +327,10 @@ def build_result_metadata(result: Any, *, max_iterations: int) -> dict[str, Any]
 
     failure_class = "unknown_failure"
 
-    if valid and statuses["interrupted"]:
-        failure_class = "interrupted"
-    elif valid and sum(int(value) for value in statuses.values()) > 1:
+    if valid and sum(int(value) for value in statuses.values()) > 1:
         pass
+    elif valid and statuses["interrupted"]:
+        failure_class = "interrupted"
     elif valid and statuses["failed"] and isinstance(result.get("error"), str) and result[
         "error"
     ].startswith("content_policy_blocked:"):
