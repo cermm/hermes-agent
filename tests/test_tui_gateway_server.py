@@ -8311,6 +8311,11 @@ def test_agent_build_failure_surfaces_error_and_drops_turn(monkeypatch):
 
         assert calls["run_prompt"] == 0
         assert session["running"] is False
+        # #71184 upgraded failure delivery from a bare "error" event to a
+        # terminal message.complete frame (status=error, recoverable) so
+        # failed turns are retained as replayable inflight snapshots. Pin the
+        # stronger terminal-frame contract: the build failure must reach the
+        # client visibly and exactly once, never as a silent drop.
         complete_events = [
             e for e in emitted if e and e[0] == "message.complete" and e[1] == "sid"
         ]

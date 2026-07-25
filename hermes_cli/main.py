@@ -5613,17 +5613,63 @@ _PE_MACHINE_NAMES = {
 }
 
 
+def _windows_native_machine() -> str:
+    """The Windows host OS's NATIVE machine architecture, normalized upper.
+
+    ``platform.machine()`` reports the PROCESS architecture, which lies under
+    emulation: the desktop update chain runs an x64 hermes-setup.exe (and thus
+    x64 Python) on Windows-on-ARM devices, where ``platform.machine()``
+    returns ``AMD64`` even though the OS is ARM64. The #71119 integrity gate
+    then rejected the CORRECT ARM64 rebuild as an "architecture mismatch"
+    (#69179 follow-up report). ``IsWow64Process2`` asks the OS for the true
+    native machine and works from emulated processes; the classic
+    ``PROCESSOR_ARCHITEW6432`` fallback only covers WOW64 (32-bit processes)
+    and is NOT set under x64-on-ARM64 emulation, so it cannot replace the API
+    probe — it is kept only for pre-1511 Windows 10 hosts without the API.
+    """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+
+            kernel32 = ctypes.windll.kernel32
+            process_machine = ctypes.c_ushort(0)
+            native_machine = ctypes.c_ushort(0)
+            if kernel32.IsWow64Process2(
+                kernel32.GetCurrentProcess(),
+                ctypes.byref(process_machine),
+                ctypes.byref(native_machine),
+            ):
+                name = {
+                    _PE_MACHINE_ARM64: "ARM64",
+                    _PE_MACHINE_AMD64: "AMD64",
+                    _PE_MACHINE_I386: "X86",
+                }.get(native_machine.value)
+                if name:
+                    return name
+        except (OSError, AttributeError):
+            # No IsWow64Process2 (pre-1511 Windows 10) — fall through to the
+            # documented WOW64 env vars, then the process architecture.
+            pass
+        env_arch = os.environ.get("PROCESSOR_ARCHITEW6432") or os.environ.get(
+            "PROCESSOR_ARCHITECTURE"
+        )
+        if env_arch:
+            return env_arch.upper()
+    import platform as _platform
+
+    return (_platform.machine() or "").upper()
+
+
 def _expected_windows_pe_machines() -> set:
     """PE machine values the current Windows host can natively load.
 
     AMD64 hosts run x64 and (via WOW64) x86. ARM64 hosts run ARM64 and
     (Windows 11 emulation) x64. 32-bit x86 hosts run only x86. Unknown
     machines return the permissive full set so the integrity gate can never
-    brick launch on exotic hosts.
+    brick launch on exotic hosts. Host detection uses the OS-native machine
+    (see ``_windows_native_machine``), not the process architecture.
     """
-    import platform as _platform
-
-    machine = (_platform.machine() or "").upper()
+    machine = _windows_native_machine().upper()
     if machine in ("AMD64", "X86_64", "X64"):
         return {_PE_MACHINE_AMD64, _PE_MACHINE_I386}
     if machine in ("ARM64", "AARCH64"):
@@ -5701,12 +5747,10 @@ def _desktop_exe_integrity_error(path: Path) -> Optional[str]:
         return str(exc)
     expected = _expected_windows_pe_machines()
     if machine not in expected:
-        import platform as _platform
-
         got = _PE_MACHINE_NAMES.get(machine, f"unknown machine 0x{machine:04X}")
         return (
             f"architecture mismatch: built a {got} executable but this is a "
-            f"{_platform.machine()} Windows host"
+            f"{_windows_native_machine()} Windows host"
         )
     return None
 
@@ -10282,6 +10326,19 @@ def _ensure_fhs_path_guard() -> None:
         wrote_any = True
     if wrote_any:
         print("    (reload your shell or run 'source ~/.bashrc' to pick it up)")
+
+
+def _size_delta_label(saved_mb: float) -> str:
+    """Human label for a before/after database size delta, in MB.
+
+    A negative delta means the file GREW — concurrent session writes during a
+    long optimize can outweigh what the rebuild freed. Printing
+    "reclaimed -163.0 MB" for that reads as data loss, so say "grew by"
+    instead.
+    """
+    if saved_mb >= 0:
+        return f"reclaimed {saved_mb:.1f} MB"
+    return f"grew by {-saved_mb:.1f} MB"
 
 
 _PRE_UPDATE_SNAPSHOT_KEEP = 1
@@ -16732,11 +16789,18 @@ def main():
                 if db_path.exists()
                 else 0.0
             )
+            # Same WAL caveat as optimize-storage: after a VACUUM the main file
+            # on disk lags until the WAL is checkpointed back (refused while a
+            # live gateway holds a read-mark), so stat() understates the win and
+            # can go negative. SQLite's page accounting is correct immediately.
+            logical_after = db.logical_size_bytes()
+            if logical_after is not None:
+                after_mb = logical_after / (1024 * 1024)
             saved = before_mb - after_mb
             print(f"Optimized {n} FTS index(es).")
             print(
                 f"Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(reclaimed {saved:.1f} MB)"
+                f"({_size_delta_label(saved)})"
             )
 
         elif action == "optimize-storage":
@@ -16819,11 +16883,21 @@ def main():
             after_mb = (
                 os.path.getsize(db_path) / (1024 * 1024) if db_path.exists() else 0.0
             )
+            # Prefer SQLite's own page accounting over stat(). In WAL mode a
+            # VACUUM's rewrite sits in the -wal file until a checkpoint folds it
+            # back, and that checkpoint is refused while another connection (a
+            # live gateway) holds a read-mark — so the main file on disk still
+            # reads at its pre-VACUUM size and keeps growing. stat()ing it here
+            # reported "reclaimed -3820.1 MB" on a DB that had actually shrunk
+            # 60%. page_count * page_size is correct immediately.
+            logical_after = db.logical_size_bytes()
+            if logical_after is not None:
+                after_mb = logical_after / (1024 * 1024)
             saved = before_mb - after_mb
             print(f"\n✓ Search index optimized.")
             print(
                 f"  Database size: {before_mb:.1f} MB -> {after_mb:.1f} MB "
-                f"(reclaimed {saved:.1f} MB)"
+                f"({_size_delta_label(saved)})"
             )
             if result.get("vacuumed") is False:
                 print("  (VACUUM was skipped or failed — run "
