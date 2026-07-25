@@ -31,29 +31,34 @@ _TERMINAL_MIGRATION_PHASES = frozenset(
 )
 
 
-def _newest_statable_journals(journals: Path) -> list[Path]:
-    """Return newest-first journals, ignoring entries that cannot be stat'ed."""
-    candidates: list[tuple[int, Path]] = []
+def _newest_journal_candidates(journals: Path) -> list[Path]:
+    """Return newest-first journals, retaining unreadable entries to fail closed."""
+    candidates: list[tuple[int | None, Path]] = []
     try:
         paths = list(journals.glob("*.json"))
     except OSError:
-        return []
+        return [journals / "unreadable.json"]
     for path in paths:
         try:
             candidates.append((path.stat().st_mtime_ns, path))
         except OSError:
-            continue
-    return [path for _, path in sorted(candidates, reverse=True)]
-
+            candidates.append((None, path))
+    candidates.sort(
+        key=lambda item: (item[0] is None, item[0] or 0),
+        reverse=True,
+    )
+    return [item[1] for item in candidates]
 
 def incomplete_auth_migration(shared_root: Path) -> Optional[dict[str, str]]:
     """Return the newest incomplete migration journal without exposing secrets."""
     journals = shared_root / "state-snapshots" / "auth-migrations" / "journals"
-    for path in _newest_statable_journals(journals):
+    for path in _newest_journal_candidates(journals):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            continue
+            return {"plan_id": path.stem, "phase": "unreadable"}
+        if not isinstance(raw, dict):
+            return {"plan_id": path.stem, "phase": "malformed"}
         phase = str(raw.get("phase") or "unknown")
         if phase not in _TERMINAL_MIGRATION_PHASES:
             return {"plan_id": str(raw.get("plan_id") or path.stem), "phase": phase}
@@ -66,11 +71,13 @@ _TERMINAL_RESTORE_PHASES = frozenset({"committed", "rolled_back", "aborted"})
 def incomplete_auth_restore(shared_root: Path) -> Optional[dict[str, str]]:
     """Return the newest interrupted auth/config restore journal."""
     journals = shared_root / "state-snapshots" / "auth-restores" / "journals"
-    for path in _newest_statable_journals(journals):
+    for path in _newest_journal_candidates(journals):
         try:
             raw = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
-            continue
+            return {"operation_id": path.stem, "phase": "unreadable"}
+        if not isinstance(raw, dict):
+            return {"operation_id": path.stem, "phase": "malformed"}
         phase = str(raw.get("phase") or "unknown")
         if phase not in _TERMINAL_RESTORE_PHASES:
             return {

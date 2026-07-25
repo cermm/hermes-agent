@@ -410,13 +410,11 @@ def _restore_auth_transaction_locked(
 ) -> None:
     """Durably commit auth plus topology config, recovering interrupted restores."""
     import yaml
-    from hermes_cli.auth import _auth_store_locks
+    from hermes_cli.auth import _auth_store_locks, _validate_auth_store_structure
 
     if auth_action not in {"restore-shared", "restore-profile"}:
         raise ValueError(f"unsupported auth restore action: {auth_action}")
-    decoded = json.loads(raw.decode("utf-8"))
-    if not isinstance(decoded, dict):
-        raise ValueError("restored auth payload must be a JSON object")
+    _validate_auth_store_structure(json.loads(raw.decode("utf-8")))
 
     _recover_incomplete_auth_restores()
     home = Path(config_home or get_hermes_home()).resolve(strict=False)
@@ -433,6 +431,11 @@ def _restore_auth_transaction_locked(
     )
 
     with _auth_store_locks(lock_paths, transaction_target=auth_target):
+        # Close the gateway-start window between the unlocked preflight and
+        # authority mutation. The transition gate and both store/config locks
+        # are held here, so a successful check remains authoritative through
+        # the commit below.
+        _assert_auth_restore_quiescent(home, auth_action)
         old_auth = auth_target.read_bytes() if auth_target.exists() else None
         old_config = config_path.read_bytes() if config_path.exists() else None
         config: dict[str, Any] = {}
@@ -1252,12 +1255,12 @@ def run_import(args) -> None:
                     manifest,
                     _auth_passphrase(args),
                 )
-                parsed_auth = json.loads(restored_auth_raw)
+                from hermes_cli.auth import _validate_auth_store_structure
+
+                _validate_auth_store_structure(json.loads(restored_auth_raw))
             except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
                 print(f"Error: encrypted auth restore failed: {exc}")
                 sys.exit(1)
-            if not isinstance(parsed_auth, dict):
-                raise ValueError("decrypted auth store must be a JSON object")
             expected_authority = (
                 "shared" if auth_action == "restore-shared" else "profile"
             )
@@ -1824,8 +1827,9 @@ def restore_quick_snapshot(
                 archived,
                 passphrase,
             )
-            if not isinstance(json.loads(auth_restore_raw), dict):
-                raise ValueError("decrypted auth store must be a JSON object")
+            from hermes_cli.auth import _validate_auth_store_structure
+
+            _validate_auth_store_structure(json.loads(auth_restore_raw))
             _assert_auth_restore_quiescent(home, auth_action)
         except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
             logger.error("Auth restore preflight failed: %s", exc)

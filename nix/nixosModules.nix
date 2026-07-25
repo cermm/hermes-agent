@@ -28,6 +28,7 @@
 
   let
     cfg = config.services.hermes-agent;
+    authAuthorityPython = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
     effectivePackage =
       if cfg.extraPythonPackages == [ ] && cfg.extraDependencyGroups == [ ]
       then cfg.package
@@ -845,7 +846,7 @@
 
           # Seed auth file if provided
           ${lib.optionalString (cfg.authFile != null) ''
-            ${pkgs.python3}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
               ${lib.escapeShellArg "${cfg.stateDir}/.hermes"} \
               ${lib.escapeShellArg cfg.authFile} \
               --uid "$(${pkgs.coreutils}/bin/id -u ${cfg.user})" \

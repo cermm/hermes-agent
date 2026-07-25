@@ -431,8 +431,8 @@ if [ -f "$HERMES_HOME/config.yaml" ]; then
 fi
 
 # Resolve auth topology after config migration and fail closed on invalid
-# authority config. The helper is stdlib-only because stage2 runs before app
-# imports are guaranteed usable.
+# authority config. The helper stays isolated from application imports and uses
+# the PyYAML dependency already installed in the application venv.
 AUTHORITY_AUTH_PATH="$("$INSTALL_DIR/.venv/bin/python" \
     "$INSTALL_DIR/scripts/docker_auth_authority.py" "$HERMES_HOME" auth_path)" || {
     echo "[stage2] ERROR: invalid auth authority; refusing auth bootstrap" >&2

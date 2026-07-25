@@ -155,3 +155,46 @@ def test_seed_rejects_non_object_json(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="JSON object"):
         module.seed_auth(profile, seed)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "auth: {authority: profile}\n",
+        "{auth: {authority: profile}}\n",
+    ],
+)
+def test_inline_yaml_authority_matches_block_yaml(
+    tmp_path: Path, config_text: str
+) -> None:
+    module = _load_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    result = module.resolve_auth_authority(profile)
+
+    assert result["authority"] == "profile"
+    assert result["auth_path"] == profile / "auth.json"
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "auth: []\n",
+        "auth: {authority: [profile]}\n",
+        "auth: {authority: profile\n",
+    ],
+)
+def test_malformed_authority_yaml_fails_closed(
+    tmp_path: Path, config_text: str
+) -> None:
+    module = _load_module()
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="auth authority config"):
+        module.resolve_auth_authority(profile)

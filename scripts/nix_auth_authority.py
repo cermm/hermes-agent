@@ -13,6 +13,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+try:
+    from scripts.auth_authority_config import load_configured_authority
+except ModuleNotFoundError:  # Direct execution puts scripts/ on sys.path.
+    from auth_authority_config import load_configured_authority
+
 
 def _shared_root(home: Path) -> Path:
     resolved = home.expanduser().resolve(strict=False)
@@ -22,35 +27,21 @@ def _shared_root(home: Path) -> Path:
 
 
 def _configured_authority(home: Path) -> str | None:
-    config = home / "config.yaml"
-    if not config.is_file():
-        return None
-    in_auth = False
-    for raw in config.read_text(encoding="utf-8").splitlines():
-        stripped = raw.strip()
-        if not stripped or stripped.startswith("#"):
-            continue
-        indent = len(raw) - len(raw.lstrip())
-        if indent == 0:
-            in_auth = stripped.rstrip(":") == "auth"
-            continue
-        if in_auth and indent > 0 and stripped.startswith("authority:"):
-            value = stripped.split(":", 1)[1].strip().strip("'\"")
-            return value or None
-    return None
+    return load_configured_authority(home / "config.yaml")
 
 
 def resolve_auth_authority(home: Path) -> dict[str, Any]:
     home = home.expanduser().resolve(strict=False)
     root = _shared_root(home)
-    requested = _configured_authority(home) or "shared"
+    configured = _configured_authority(home)
+    requested = configured or "shared"
     if requested not in {"shared", "profile"}:
         raise ValueError(
             "Invalid auth.authority in config.yaml; expected 'shared' or 'profile'"
         )
     profile_path = home / "auth.json"
     legacy = (
-        _configured_authority(home) is None
+        configured is None
         and home != root
         and profile_path.is_file()
     )

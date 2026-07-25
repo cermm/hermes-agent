@@ -1230,26 +1230,45 @@ def _auth_store_lock(
         yield
 
 
+def _validate_auth_store_structure(raw: Any) -> Dict[str, Any]:
+    """Reject section types that alternate auth-store loaders could misread."""
+    if not isinstance(raw, dict):
+        raise ValueError("auth store must be a JSON object")
+    for section in ("providers", "credential_pool"):
+        if section in raw and not isinstance(raw[section], dict):
+            raise ValueError(f"auth store {section} section must be a mapping")
+    return raw
+
+
+def _quarantine_auth_store(auth_file: Path, reason: Exception) -> Dict[str, Any]:
+    corrupt_path = auth_file.with_suffix(".json.corrupt")
+    try:
+        import shutil
+
+        shutil.copy2(auth_file, corrupt_path)
+    except Exception:
+        pass
+    logger.warning(
+        "auth: failed to parse %s (%s) — starting with empty store. "
+        "Corrupt file preserved at %s",
+        auth_file,
+        reason,
+        corrupt_path,
+    )
+    return {"version": AUTH_STORE_VERSION, "providers": {}}
+
+
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     auth_file = auth_file or _auth_file_path()
     if not auth_file.exists():
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8"))
-    except Exception as exc:
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        try:
-            import shutil
-            shutil.copy2(auth_file, corrupt_path)
-        except Exception:
-            pass
-        logger.warning(
-            "auth: failed to parse %s (%s) — starting with empty store. "
-            "Corrupt file preserved at %s",
-            auth_file, exc, corrupt_path,
+        raw = _validate_auth_store_structure(
+            json.loads(auth_file.read_text(encoding="utf-8"))
         )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+    except Exception as exc:
+        return _quarantine_auth_store(auth_file, exc)
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)

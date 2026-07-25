@@ -165,3 +165,44 @@ def test_temporary_replace_failure_preserves_complete_previous_store(
         "providers": {"current": {}}
     }
     assert not list(home.glob(".auth-update-*"))
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "auth: {authority: profile}\n",
+        "{auth: {authority: profile}}\n",
+    ],
+)
+def test_inline_yaml_authority_matches_block_yaml(
+    tmp_path: Path, config_text: str
+) -> None:
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    result = _MOD.resolve_auth_authority(str(profile))
+
+    assert result["authority"] == "profile"
+    assert result["auth_path"] == str(profile / "auth.json")
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        "auth: []\n",
+        "auth: {authority: [profile]}\n",
+        "auth: {authority: profile\n",
+    ],
+)
+def test_malformed_authority_yaml_fails_closed(
+    tmp_path: Path, config_text: str
+) -> None:
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "work"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(config_text, encoding="utf-8")
+
+    with pytest.raises(RuntimeError, match="auth authority config"):
+        _MOD.resolve_auth_authority(str(profile))

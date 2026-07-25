@@ -8,6 +8,7 @@
     let
       hermes-agent = self'.packages.default;
       hermesVenv = hermes-agent.hermesVenv;
+      authAuthorityPython = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
 
       configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
 
@@ -94,7 +95,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           echo "ok" > $out/result
         '';
       } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
-        # Exercise the stdlib-only activation helper through the same script
+        # Exercise the activation helper and YAML contract through the same script
         # invoked by the NixOS module: shared/profile routing, private modes,
         # and preserve-on-repeat semantics are all build-time contracts.
         auth-authority-activation = pkgs.runCommand "hermes-auth-authority-activation" { } ''
@@ -104,7 +105,7 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           mkdir -p "$PROFILE"
 
           printf 'auth:\n  authority: shared\n' > "$PROFILE/config.yaml"
-          SHARED_RESULT=$(${pkgs.python3}/bin/python3 ${../scripts/nix_auth_authority.py} \
+          SHARED_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
             "$PROFILE" ${authAuthoritySeed})
           echo "$SHARED_RESULT" | grep -q '"status": "created"'
           test -f "$ROOT/auth.json"
@@ -120,7 +121,7 @@ value["providers"]["nous"]["refresh_token"] = "rotated-token"
 path.write_text(json.dumps(value))
 path.chmod(0o600)
 PY
-          REPEAT_RESULT=$(${pkgs.python3}/bin/python3 ${../scripts/nix_auth_authority.py} \
+          REPEAT_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
             "$PROFILE" ${authAuthoritySeed})
           echo "$REPEAT_RESULT" | grep -q '"status": "preserved"'
           grep -q 'rotated-token' "$ROOT/auth.json"
@@ -128,7 +129,7 @@ PY
           LOCAL="$ROOT/profiles/local"
           mkdir -p "$LOCAL"
           printf 'auth:\n  authority: profile\n' > "$LOCAL/config.yaml"
-          ${pkgs.python3}/bin/python3 ${../scripts/nix_auth_authority.py} \
+          PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
             "$LOCAL" ${authAuthoritySeed} >/dev/null
           test -f "$LOCAL/auth.json"
           test "$(stat -c %a "$LOCAL/auth.json")" = 600

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from contextlib import contextmanager
 import json
 import os
 from pathlib import Path
@@ -32,6 +33,23 @@ def _backup_args(root: Path, **overrides):
     }
     values.update(overrides)
     return SimpleNamespace(**values)
+
+
+def _assert_transition_gate_held(auth_mod) -> None:
+    competing_result: list[str] = []
+
+    def compete() -> None:
+        try:
+            with auth_mod._auth_transition_lock(timeout_seconds=0.1):
+                competing_result.append("acquired")
+        except TimeoutError:
+            competing_result.append("blocked")
+
+    thread = threading.Thread(target=compete)
+    thread.start()
+    thread.join(timeout=2)
+    assert not thread.is_alive()
+    assert competing_result == ["blocked"]
 
 
 def test_full_backup_excludes_auth_by_default(backup_home):
@@ -434,6 +452,120 @@ def test_full_restore_refuses_running_shared_gateway_before_any_write(
             )
         )
 
+    assert (backup_home / "MEMORY.md").read_text() == "destination value"
+
+
+def test_auth_restore_rechecks_quiescence_under_transition_gate_before_mutation(
+    backup_home, monkeypatch
+):
+    import hermes_cli.auth as auth_mod
+    import hermes_cli.backup as backup_mod
+
+    passphrase = backup_home.parent / "passphrase-racing-gateway"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    backup_mod.run_backup(
+        _backup_args(
+            backup_home,
+            auth_mode="include-encrypted",
+            auth_passphrase_file=str(passphrase),
+        )
+    )
+    archive = backup_home / "backups.zip"
+    old_auth = b'{"providers":{"destination":{}}}'
+    old_config = b"auth:\n  authority: shared\nmarker: destination\n"
+    (backup_home / "auth.json").write_bytes(old_auth)
+    (backup_home / "config.yaml").write_bytes(old_config)
+    checks = 0
+    store_lock_held = False
+    real_store_locks = auth_mod._auth_store_locks
+
+    @contextmanager
+    def tracked_store_locks(*args, **kwargs):
+        nonlocal store_lock_held
+        with real_store_locks(*args, **kwargs) as locked:
+            store_lock_held = True
+            try:
+                yield locked
+            finally:
+                store_lock_held = False
+
+    monkeypatch.setattr(auth_mod, "_auth_store_locks", tracked_store_locks)
+
+    def gateway_starts_after_preflight(_home, _auth_action):
+        nonlocal checks
+        checks += 1
+        if checks == 2:
+            assert store_lock_held
+            _assert_transition_gate_held(auth_mod)
+            raise RuntimeError("gateway started after preflight")
+
+    monkeypatch.setattr(
+        backup_mod,
+        "_assert_auth_restore_quiescent",
+        gateway_starts_after_preflight,
+    )
+
+    with pytest.raises(SystemExit):
+        backup_mod.run_import(
+            SimpleNamespace(
+                zipfile=str(archive),
+                force=True,
+                clean=False,
+                auth_action="restore-shared",
+                auth_passphrase_file=str(passphrase),
+            )
+        )
+
+    assert checks == 2
+    assert (backup_home / "auth.json").read_bytes() == old_auth
+    assert (backup_home / "config.yaml").read_bytes() == old_config
+
+
+@pytest.mark.parametrize(
+    "malformed_store",
+    [
+        {"providers": [], "credential_pool": {}},
+        {"providers": {}, "credential_pool": []},
+    ],
+)
+def test_encrypted_restore_rejects_malformed_auth_sections_before_writes(
+    backup_home, malformed_store
+):
+    import hermes_cli.backup as backup_mod
+
+    passphrase = backup_home.parent / "passphrase-malformed-sections"
+    passphrase.write_text("correct horse battery staple", encoding="utf-8")
+    (backup_home / "auth.json").write_text(
+        json.dumps(malformed_store), encoding="utf-8"
+    )
+    (backup_home / "MEMORY.md").write_text("archive value", encoding="utf-8")
+    backup_mod.run_backup(
+        _backup_args(
+            backup_home,
+            auth_mode="include-encrypted",
+            auth_passphrase_file=str(passphrase),
+        )
+    )
+    archive = backup_home / "backups.zip"
+    old_auth = b'{"providers":{"destination":{}}}'
+    old_config = b"auth:\n  authority: shared\nmarker: destination\n"
+    (backup_home / "auth.json").write_bytes(old_auth)
+    (backup_home / "config.yaml").write_bytes(old_config)
+    (backup_home / "MEMORY.md").write_text("destination value", encoding="utf-8")
+
+    with pytest.raises(SystemExit):
+        backup_mod.run_import(
+            SimpleNamespace(
+                zipfile=str(archive),
+                force=True,
+                clean=False,
+                auth_action="restore-shared",
+                auth_passphrase_file=str(passphrase),
+            )
+        )
+
+    assert (backup_home / "auth.json").read_bytes() == old_auth
+    assert (backup_home / "config.yaml").read_bytes() == old_config
     assert (backup_home / "MEMORY.md").read_text() == "destination value"
 
 

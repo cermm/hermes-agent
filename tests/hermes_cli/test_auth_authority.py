@@ -258,7 +258,7 @@ def test_auth_status_all_profiles_reports_redacted_topology(profile_layout, caps
     assert secret not in output
 
 
-def test_incomplete_restore_skips_unstatable_journal_candidate(profile_layout):
+def test_incomplete_restore_blocks_on_unstatable_journal_candidate(profile_layout):
     from hermes_cli.auth_authority import incomplete_auth_restore
 
     journals = (
@@ -274,10 +274,31 @@ def test_incomplete_restore_skips_unstatable_journal_candidate(profile_layout):
     )
     (journals / "dangling.json").symlink_to(journals / "missing-target")
 
-    assert incomplete_auth_restore(profile_layout["root"]) == {
-        "operation_id": "valid-operation",
-        "phase": "auth_written",
-    }
+    incomplete = incomplete_auth_restore(profile_layout["root"])
+    assert incomplete is not None
+    assert incomplete["phase"] == "unreadable"
+
+
+@pytest.mark.parametrize("journal_kind", ["auth-migrations", "auth-restores"])
+def test_malformed_pending_journal_blocks_authority_resolution(
+    profile_layout, journal_kind
+):
+    from hermes_cli.auth_authority import (
+        AuthAuthorityConfigError,
+        resolve_auth_authority,
+    )
+
+    journals = (
+        profile_layout["root"]
+        / "state-snapshots"
+        / journal_kind
+        / "journals"
+    )
+    journals.mkdir(parents=True)
+    (journals / "pending.json").write_text("{", encoding="utf-8")
+
+    with pytest.raises(AuthAuthorityConfigError, match="incomplete (migration|restore)"):
+        resolve_auth_authority()
 
 
 @pytest.mark.parametrize("mode", ["shared", "profile"])
