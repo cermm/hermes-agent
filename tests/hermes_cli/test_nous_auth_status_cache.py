@@ -95,6 +95,8 @@ def test_get_nous_auth_status_cache_is_scoped_by_auth_file_path(tmp_path, monkey
     profile_b = tmp_path / "profiles" / "b"
     profile_a.mkdir(parents=True)
     profile_b.mkdir(parents=True)
+    for profile in (profile_a, profile_b):
+        (profile / "config.yaml").write_text("auth:\n  authority: profile\n")
 
     from hermes_cli import auth as auth_mod
 

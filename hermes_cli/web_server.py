@@ -944,6 +944,10 @@ _CATEGORY_MERGE: Dict[str, str] = {
     "network": "agent",
     "checkpoints": "agent",
     "approvals": "security",
+    # `auth.authority` is the only schema-surfaced auth setting. Keep the
+    # shared/profile authority selector with the other security controls
+    # instead of creating a one-field tab.
+    "auth": "security",
     "human_delay": "display",
     "dashboard": "display",
     "code_execution": "agent",

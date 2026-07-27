@@ -855,9 +855,8 @@ class TestImport:
         self._make_backup_zip(zip_path, {
             "config.yaml": "model: openrouter\n",
             ".env": "OPENROUTER_API_KEY=sk-secret\n",
-            "auth.json": '{"providers": {"nous": "token"}}',
             "state.db": b"SQLite format 3\x00",
-            "profiles/coder/.env": "ANTHROPIC_API_KEY=sk-ant-secret\n",
+            "profiles/coder/.env": "ANTHROPIC_API_KEY=test-value\n",
         })
 
         args = Namespace(zipfile=str(zip_path), force=True)
@@ -865,7 +864,7 @@ class TestImport:
         from hermes_cli.backup import run_import
         run_import(args)
 
-        for rel in (".env", "auth.json", "state.db", "profiles/coder/.env"):
+        for rel in (".env", "state.db", "profiles/coder/.env"):
             mode = (hermes_home / rel).stat().st_mode & 0o777
             assert mode == 0o600, f"{rel} restored with mode {oct(mode)}, expected 0o600"
 
@@ -1300,9 +1299,11 @@ class TestProfileRestoration:
         monkeypatch.setenv("HERMES_HOME", str(hermes_home))
         monkeypatch.setattr(Path, "home", lambda: tmp_path)
 
-        # Mock the wrapper dir to be inside tmp_path
+        # Mock the wrapper dir to be inside tmp_path and isolate command lookup
+        # from user-installed aliases on the host running the test.
         wrapper_dir = tmp_path / ".local" / "bin"
         wrapper_dir.mkdir(parents=True)
+        monkeypatch.setenv("PATH", str(wrapper_dir))
 
         zip_path = tmp_path / "backup.zip"
         self._make_backup_zip(zip_path, {

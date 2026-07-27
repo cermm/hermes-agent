@@ -15,7 +15,8 @@
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
     "typecheck": "tsc -p . --noEmit",
-    "lint:diagrams": "ascii-guard lint --exclude-code-blocks docs"
+    "lint:diagrams": "ascii-guard lint --exclude-code-blocks docs",
+    "lint:auth-authority-docs": "node scripts/check-auth-authority-docs.mjs"
   },
   "dependencies": {
     "@docusaurus/core": "3.9.2",
