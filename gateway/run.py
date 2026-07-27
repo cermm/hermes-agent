@@ -3257,6 +3257,18 @@ def _reconnect_backoff(attempt: int) -> int:
     return min(30 * (2 ** (attempt - 1)), _RECONNECT_BACKOFF_CAP)
 
 
+def _auth_migration_startup_ready() -> bool:
+    """Fail closed before gateway runtime state is acquired during migration."""
+    try:
+        from hermes_cli.auth_authority import resolve_auth_authority
+
+        resolve_auth_authority()
+    except Exception as exc:
+        logger.error("Gateway authentication precondition failed: %s", exc)
+        return False
+    return True
+
+
 class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, GatewaySlashCommandsMixin):
     """
     Main gateway controller.
@@ -23723,6 +23735,9 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
     # in-memory module.
     from gateway.code_skew import record_boot_fingerprint
     record_boot_fingerprint()
+
+    if not _auth_migration_startup_ready():
+        return False
 
     # ── Duplicate-instance guard ──────────────────────────────────────
     # Prevent two gateways from running under the same HERMES_HOME.

@@ -35,4 +35,14 @@ def build_backup_parser(subparsers, *, cmd_backup: Callable) -> None:
     backup_parser.add_argument(
         "-l", "--label", help="Label for the snapshot (only used with --quick)"
     )
+    backup_parser.add_argument(
+        "--auth-mode",
+        choices=["exclude", "include-encrypted"],
+        default="exclude",
+        help="Exclude auth by default or include one encrypted authority store",
+    )
+    backup_parser.add_argument(
+        "--auth-passphrase-file",
+        help="File containing the passphrase for --auth-mode include-encrypted",
+    )
     backup_parser.set_defaults(func=cmd_backup)

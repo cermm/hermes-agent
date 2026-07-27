@@ -110,6 +110,8 @@ Common options:
 | `-s`, `--skills <name>` | Preload one or more skills for the session (can be repeated or comma-separated). |
 | `-v`, `--verbose` | Verbose output. |
 | `-Q`, `--quiet` | Programmatic mode: suppress banner/spinner/tool previews. |
+| `--result-meta-file <absolute-path>` | Atomically create a closed-world JSON status sidecar for a single `--query`; classic CLI only. The destination must not exist. |
+| `--result-meta-fd <fd>` | Write the same status as one bounded frame to a pre-opened POSIX/WSL anonymous-pipe write descriptor; mutually exclusive with `--result-meta-file`. |
 | `--image <path>` | Attach a local image to a single query. |
 | `--resume <session>` / `--continue [name]` | Resume a session directly from `chat`. |
 | `--worktree` | Create an isolated git worktree for this run. |
@@ -134,6 +136,80 @@ hermes chat --worktree -q "Review this repo and open a PR"
 hermes chat --ignore-user-config --ignore-rules -q "Repro without my personal setup"
 hermes chat --safe-mode -q "Is this bug mine or Hermes'?"
 ```
+
+### Structured query-result metadata
+
+Automation that needs a machine-readable turn outcome without inspecting the
+model response can opt in to a separate metadata file:
+
+```bash
+hermes chat -Q -q "Check the deployment" \
+  --result-meta-file /run/user/1000/hermes-result.json
+```
+
+This option is valid only for a non-interactive `--query`/`-q` in the classic
+CLI. It is rejected for interactive chat and the TUI. It does not change the
+normal response on stdout, diagnostics on stderr, model/provider selection,
+toolsets, source tag, or max-turn behavior. The file contains status metadata,
+not the model response.
+
+The v1 file is compact, sorted UTF-8 JSON followed by one newline, with exactly
+these keys:
+
+```json
+{"api_calls":1,"completed":true,"failed":false,"failure_class":"none","interrupted":false,"partial":false,"schema_version":"hermes-agent-result-meta-v1"}
+```
+
+`completed`, `failed`, `partial`, and `interrupted` are strict booleans copied
+from the trusted turn result. `api_calls` is a non-boolean integer in the range
+`0..max_iterations + 1`; the extra call is the conversation loop's bounded
+grace call. `failure_class` is one of:
+
+- `none`
+- `content_policy_blocked`
+- `provider_api_terminal`
+- `max_turns_or_incomplete`
+- `interrupted`
+- `unknown_failure`
+
+Classification uses structured internal result fields only. It never parses or
+stores response/error display text, messages, prompts, tool output, provider or
+model names, session IDs, paths, hashes, or exceptions. Unknown, contradictory,
+or malformed internal results fail closed as `unknown_failure`.
+
+The path must be absolute, contain no lexical `..`, have an existing
+unsymlinked parent chain, and name an absent destination. Hermes never creates
+parent directories or overwrites any existing regular file, symlink, directory,
+FIFO, or device. It writes a random same-directory mode-`0600` temporary file,
+fully writes and fsyncs it, atomically publishes without clobbering, and fsyncs
+the parent directory where supported. Output is bounded to 1024 bytes.
+
+Secure publication currently requires POSIX directory-file-descriptor,
+`O_NOFOLLOW`, hard-link, and `/proc/self/fd` semantics. Platforms or filesystems
+that cannot provide the no-clobber/open-inode guarantee fail closed instead of
+falling back to an overwrite-prone rename. A pre-result startup failure can
+leave the sidecar absent. A validation/publication failure emits only the fixed
+diagnostic `Error: failed to publish result metadata.` and exits nonzero.
+
+For a producer-bound transport, a parent process can instead create an
+anonymous pipe, retain its read endpoint, pass only the blocking write endpoint
+to Hermes, and select it with `--result-meta-fd <fd>`. This option is mutually
+exclusive with `--result-meta-file`, query-only, classic-CLI-only, and available
+only on POSIX systems (including WSL). Hermes accepts only a canonical integer
+descriptor numbered 3 or higher that is an open FIFO write endpoint, is in
+blocking mode, and reports an actual `PC_PIPE_BUF` of at least 1024 bytes.
+Unsupported platforms and invalid descriptors fail before config, model, or
+agent construction; Hermes does not fall back to file mode.
+
+Hermes marks an accepted descriptor non-inheritable before starting any
+descendants, writes the byte-identical v1 serialization as exactly one bounded
+`os.write` frame, requires a full write, and closes its single owned endpoint on
+success, startup failure, publication failure, or interruption. `EPIPE`,
+`EAGAIN`, a short write, or a close fault produces only the same fixed public
+diagnostic and a nonzero exit. No metadata is retried or emitted on stdout or
+stderr.
+
+The security claim is exactly: **producer-bound against ordinary filesystem substitution, not root/arbitrary same-principal ptrace/proc-fd compromise.**
 
 ### `hermes -z <prompt>` — scripted one-shot
 
@@ -520,8 +596,13 @@ hermes auth add openrouter --api-key sk-or-v1-xxx        # Add API key
 hermes auth add anthropic --type oauth                   # Add OAuth credential
 hermes auth remove openrouter 2                          # Remove by index
 hermes auth reset openrouter                             # Clear cooldowns
-hermes auth status anthropic                             # Show auth status for a provider
-hermes auth logout anthropic                             # Log out and clear stored auth state
+hermes auth status                              # Show canonical auth authority and migration state
+hermes auth status anthropic                   # Show auth status for a provider
+hermes auth logout anthropic                   # Log out and clear stored auth state
+hermes auth migrate-shared --profile coder --dry-run
+hermes auth migrate-shared --profile coder --apply --plan-id <id> --plan-digest <digest> --conflict-policy abort
+hermes auth migrate-shared --rollback --plan-id <id>
+hermes auth migrate-recover --plan-id <id>
 hermes auth spotify                                      # Authenticate Hermes with Spotify via PKCE
 ```
 

@@ -430,17 +430,28 @@ if [ -f "$HERMES_HOME/config.yaml" ]; then
         || echo "[stage2] Warning: docker_config_migrate.py failed; continuing"
 fi
 
-# auth.json: bootstrap from env on first boot only. Same semantics as the
-# pre-s6 entrypoint — the [ ! -f ] guard is critical to avoid clobbering
-# rotated refresh tokens on container restart.
-if [ ! -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_BOOTSTRAP:-}" ]; then
-    if refuse_symlinked_path "seed" "$HERMES_HOME/auth.json"; then
-        :
-    else
-        printf '%s' "$HERMES_AUTH_JSON_BOOTSTRAP" > "$HERMES_HOME/auth.json"
-        chown hermes:hermes "$HERMES_HOME/auth.json" 2>/dev/null || true
-        chmod 600 "$HERMES_HOME/auth.json"
-    fi
+# Resolve auth topology after config migration and fail closed on invalid
+# authority config. The helper stays isolated from application imports and uses
+# the PyYAML dependency already installed in the application venv.
+AUTHORITY_AUTH_PATH="$("$INSTALL_DIR/.venv/bin/python" \
+    "$INSTALL_DIR/scripts/docker_auth_authority.py" "$HERMES_HOME" auth_path)" || {
+    echo "[stage2] ERROR: invalid auth authority; refusing auth bootstrap" >&2
+    exit 1
+}
+AUTHORITY_AUTH_DIR="$(dirname "$AUTHORITY_AUTH_PATH")"
+as_hermes mkdir -p "$AUTHORITY_AUTH_DIR"
+
+# auth.json: bootstrap from env on first boot only. The helper takes the
+# canonical auth lock, re-checks existence under that lock, rejects symlinks,
+# and atomically creates a private file. This avoids a check/write race with a
+# concurrently starting Hermes process and never clobbers rotated credentials.
+if [ -n "${HERMES_AUTH_JSON_BOOTSTRAP:-}" ]; then
+    s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" \
+        "$INSTALL_DIR/scripts/docker_auth_authority.py" "$HERMES_HOME" seed \
+        >/dev/null || {
+        echo "[stage2] ERROR: auth bootstrap failed" >&2
+        exit 1
+    }
 fi
 
 # auth.json: re-seed a TERMINALLY-DEAD Nous bootstrap session (self-heal).
@@ -458,13 +469,13 @@ fi
 # local session. Older/incomparable seeds remain no-ops, so leaving the env set
 # cannot roll a healthy rotated token backward. Runs as its own stdlib-only
 # subprocess (no app imports) and always exits 0.
-if [ -f "$HERMES_HOME/auth.json" ] && [ -n "${HERMES_AUTH_JSON_REBOOTSTRAP:-}" ]; then
-    if refuse_symlinked_path "reseed" "$HERMES_HOME/auth.json"; then
+if [ -f "$AUTHORITY_AUTH_PATH" ] && [ -n "${HERMES_AUTH_JSON_REBOOTSTRAP:-}" ]; then
+    if refuse_symlinked_path "reseed" "$AUTHORITY_AUTH_PATH"; then
         :
     else
         s6-setuidgid hermes "$INSTALL_DIR/.venv/bin/python" \
             "$INSTALL_DIR/scripts/docker_rebootstrap_nous_session.py" \
-            "$HERMES_HOME/auth.json" \
+            "$AUTHORITY_AUTH_PATH" \
             || echo "[stage2] Warning: docker_rebootstrap_nous_session.py failed; continuing"
     fi
 fi

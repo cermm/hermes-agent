@@ -722,6 +722,67 @@ def run_doctor(args):
     print(color("│                 🩺 Hermes Doctor                        │", Colors.CYAN))
     print(color("└─────────────────────────────────────────────────────────┘", Colors.CYAN))
 
+    _section("Authentication Authority")
+    try:
+        from hermes_cli.auth_authority import auth_authority_status
+
+        authorities = [("active", auth_authority_status())]
+        if getattr(args, "all_profiles", False):
+            from hermes_cli.profiles import _get_default_hermes_home
+
+            root = _get_default_hermes_home()
+            profiles_root = root / "profiles"
+            homes = [("default", root)]
+            if profiles_root.is_dir():
+                homes.extend(
+                    (path.name, path)
+                    for path in sorted(profiles_root.iterdir(), key=lambda item: item.name)
+                    if path.is_dir()
+                )
+            authorities = [
+                (
+                    name,
+                    auth_authority_status(profile_home=home, shared_root=root),
+                )
+                for name, home in homes
+            ]
+        for label, authority in authorities:
+            suffix = f" [{label}]" if getattr(args, "all_profiles", False) else ""
+            check_ok(
+                f"Auth authority{suffix}: {authority['effective_mode']}",
+                f"({authority['provenance']})",
+            )
+            if authority["legacy_compatibility"]:
+                check_warn(
+                    f"Legacy profile-local auth store is active{suffix}",
+                    "set auth.authority explicitly or run hermes auth migrate",
+                )
+            if authority["conflicting_store"]:
+                check_warn(
+                    f"A non-authoritative auth store also exists{suffix}",
+                    "remove it or migrate it explicitly",
+                )
+            if authority["exists"] and authority["permissions"] not in {
+                "-rw-------",
+                None,
+            }:
+                check_warn(
+                    f"Auth store permissions are broader than 0600{suffix}",
+                    authority["permissions"],
+                )
+            if authority.get("migration"):
+                migration = authority["migration"]
+                check_fail(
+                    f"Auth migration {migration['plan_id']} is incomplete{suffix}",
+                    "run hermes auth migrate-shared --recover --plan-id "
+                    f"{migration['plan_id']}",
+                )
+    except Exception as exc:
+        check_fail("Authentication authority cannot be resolved", str(exc))
+        manual_issues.append(
+            "Fix auth.authority in config.yaml before using authentication commands"
+        )
+
     _section("Security Advisories")
     try:
         from hermes_cli.security_advisories import (
