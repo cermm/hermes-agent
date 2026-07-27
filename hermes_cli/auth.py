@@ -1389,26 +1389,17 @@ def _provider_state_transaction(provider_id: str):
     target lock is acquired prevents both stale refreshes and whole-file lost
     updates without inverting the documented auth -> shared lock order.
     """
-    with _auth_store_locks(include_legacy_fallback=True) as (active_path, fallback_path):
+    with _auth_store_locks(include_legacy_fallback=True) as (active_path, _fallback_path):
         auth_store = _load_auth_store(active_path)
-        providers = auth_store.get("providers")
-        if isinstance(providers, dict):
-            raw_state = providers.get(provider_id)
-            if isinstance(raw_state, dict):
-                yield auth_store, dict(raw_state), active_path
-                return
-
-        if fallback_path is None:
-            yield auth_store, None, None
-            return
-        source_store = _load_auth_store(fallback_path)
-        source_providers = source_store.get("providers")
-        source_state = None
-        if isinstance(source_providers, dict):
-            raw_state = source_providers.get(provider_id)
-            if isinstance(raw_state, dict):
-                source_state = dict(raw_state)
-        yield auth_store, source_state, fallback_path if source_state is not None else None
+        source_state, source_path = _load_provider_state_with_source(
+            auth_store, provider_id
+        )
+        # Test doubles and compatibility callers may provide state without a
+        # source path; while this transaction owns the active lock, that state
+        # is necessarily active-store state for persistence purposes.
+        if source_state is not None and source_path is None:
+            source_path = active_path
+        yield auth_store, source_state, source_path
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
