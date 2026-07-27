@@ -51,27 +51,26 @@ async function waitFor(fn, { timeoutMs, label }) {
 // spawned instance reaches an empty chat view instead of the onboarding wizard.
 // A separate HERMES_HOME dir means a separate gateway lock — no collision with
 // the user's running app, which keeps its own sessions DB and state.
-function seedConfigFrom(sourceHome, targetHome) {
-  if (!existsSync(sourceHome)) {
-    return
-  }
+export function seedConfigFrom(sourceHome, targetHome) {
+  if (!existsSync(sourceHome)) return
 
-  for (const name of ['config.yaml', '.env', 'auth.json']) {
-    const from = join(sourceHome, name)
-
-    if (existsSync(from)) {
-      try {
-        copyFileSync(from, join(targetHome, name))
-      } catch {
-        // best-effort — a missing file just means onboarding may appear.
-      }
+  const from = join(sourceHome, 'config.yaml')
+  if (existsSync(from)) {
+    try {
+      copyFileSync(from, join(targetHome, 'config.yaml'))
+    } catch {
+      // best-effort — a missing file just means onboarding may appear.
     }
   }
 }
 
+export function defaultHermesSourceHome() {
+  return join(homedir(), '.hermes')
+}
+
 // Resolve the vite CLI entry via its package.json `bin` (Vite 8's `exports`
 // blocks importing `vite/bin/vite.js` directly).
-function resolveViteBin() {
+export function resolveViteBin() {
   const pkgPath = require.resolve('vite/package.json')
   const pkg = JSON.parse(readFileSync(pkgPath, 'utf8'))
   const rel = typeof pkg.bin === 'string' ? pkg.bin : pkg.bin?.vite
@@ -188,7 +187,7 @@ export async function startIsolatedInstance({
   const devUrl = prod ? null : `http://127.0.0.1:${devPort}`
 
   if (seedConfig && !hermesHome) {
-    seedConfigFrom(join(homedir(), '.hermes'), home)
+    seedConfigFrom(defaultHermesSourceHome(), home)
   }
 
   const teardown = () => {
@@ -341,7 +340,7 @@ export async function coldStartSamples({ runs = 3, port = 9222, devPort = 5174, 
     // runs 1..N are the representative warm samples.
     const home = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-home-'))
     const userDataDir = mkdtempSync(join(tmpdir(), 'hermes-perf-cold-ud-'))
-    seedConfigFrom(join(homedir(), '.hermes'), home)
+    seedConfigFrom(defaultHermesSourceHome(), home)
 
     try {
       for (let i = 0; i <= runs; i++) {

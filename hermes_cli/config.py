@@ -933,6 +933,11 @@ def _ensure_hermes_home_managed(home: Path):
 DEFAULT_CONFIG = {
     "model": "",
     "providers": {},
+    # Authentication authority. ``shared`` keeps one store under the default
+    # Hermes root across profiles; ``profile`` isolates it. The resolver
+    # preserves pre-existing profile-local stores only while this key is absent
+    # from the user's raw config.
+    "auth": {"authority": "shared"},
     "fallback_providers": [],
     "credential_pool_strategies": {},
     "toolsets": ["hermes-cli"],

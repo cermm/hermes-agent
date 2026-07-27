@@ -86,37 +86,40 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # auth.json helpers — share the file with the rest of hermes-agent.
 
 def _auth_json_path() -> Path:
-    """Resolve ``~/.hermes/auth.json`` honouring the active Hermes profile."""
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "auth.json"
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes")) / "auth.json"
+    """Resolve the configured canonical auth authority."""
+    from hermes_cli.auth_authority import get_auth_store_path
+
+    return get_auth_store_path()
 
 
 def _load_auth() -> Dict[str, Any]:
-    path = _auth_json_path()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("photon: could not read %s: %s", path, e)
-        return {}
+    from hermes_cli.auth import _load_auth_store
+
+    return _load_auth_store(_auth_json_path())
 
 
 def _save_auth(data: Dict[str, Any]) -> None:
+    """Merge only Photon-owned state under the canonical store lock.
+
+    Callers commonly pass a whole-store snapshot loaded before doing network
+    work.  Re-merging unrelated entries from that snapshot would overwrite
+    credentials rotated by another process while Photon was in flight.
+    """
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
     path = _auth_json_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+    with _auth_store_lock(target_path=path):
+        current = _load_auth_store(path)
+        providers = data.get("providers")
+        if isinstance(providers, dict) and "photon" in providers:
+            current.setdefault("providers", {})["photon"] = providers["photon"]
+        pool = data.get("credential_pool")
+        if isinstance(pool, dict):
+            current_pool = current.setdefault("credential_pool", {})
+            for key in ("photon", "photon_project", "photon_user"):
+                if key in pool:
+                    current_pool[key] = pool[key]
+        _save_auth_store(current, target_path=path)
 
 
 def load_photon_token() -> Optional[str]:

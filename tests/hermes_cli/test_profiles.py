@@ -192,7 +192,7 @@ class TestCreateProfile:
         default_home = tmp_path / ".hermes"
         (default_home / ".env").write_text("KEY=val")
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
-        assert (profile_dir / ".env").read_text() == "KEY=val"
+        assert (profile_dir / ".env").read_text().strip() == "KEY=val"
 
     def test_duplicate_raises_file_exists(self, profile_env):
         create_profile("coder", no_alias=True)
@@ -261,6 +261,7 @@ class TestCreateProfile:
         (default_home / "memories").mkdir(exist_ok=True)
         (default_home / "memories" / "note.md").write_text("remember this")
         (default_home / "config.yaml").write_text("model: gpt-4")
+        (default_home / "auth.json").write_text('{"providers": {"nous": {"access_token": "secret"}}}')
         # Runtime files that should be stripped
         (default_home / "gateway.pid").write_text("12345")
         (default_home / "gateway_state.json").write_text("{}")
@@ -270,7 +271,10 @@ class TestCreateProfile:
 
         # Content should be copied
         assert (profile_dir / "memories" / "note.md").read_text() == "remember this"
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cloned_config["model"] == "gpt-4"
+        assert cloned_config["auth"]["authority"] == "shared"
+        assert not (profile_dir / "auth.json").exists()
         # Runtime files should be stripped
         assert not (profile_dir / "gateway.pid").exists()
         assert not (profile_dir / "gateway_state.json").exists()
@@ -343,7 +347,9 @@ class TestCreateProfile:
         assert not (profile_dir / "skills" / "my-skill" / "module.pyo").exists()
         # All profile data must be present
         assert (profile_dir / "skills" / "my-skill" / "SKILL.md").read_text() == "skill"
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cloned_config["model"] == "gpt-4"
+        assert cloned_config["auth"]["authority"] == "shared"
         assert (profile_dir / ".env").read_text() == "KEY=val"
         assert (profile_dir / "logs" / "gateway.log").read_text() == "log"
 
@@ -375,15 +381,19 @@ class TestCreateProfile:
             "sessions", "backups", "state-snapshots", "checkpoints",
         ):
             assert not (profile_dir / history).exists(), history
-        assert (profile_dir / "config.yaml").read_text() == "model: gpt-4"
+        cloned_config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert cloned_config["model"] == "gpt-4"
+        assert cloned_config["auth"]["authority"] == "shared"
         # Root-only: nested same-name dirs survive
         assert (profile_dir / "workspace" / "backups" / "user-data.txt").read_text() == "mine"
 
     def test_clone_config_missing_files_skipped(self, profile_env):
         """Clone config gracefully skips files that don't exist in source."""
         profile_dir = create_profile("coder", clone_config=True, no_alias=True)
-        # No error; optional files just not copied
-        assert not (profile_dir / "config.yaml").exists()
+        # Missing source config is replaced only by the explicit default auth
+        # authority required for every newly created named profile.
+        config = yaml.safe_load((profile_dir / "config.yaml").read_text())
+        assert config["auth"]["authority"] == "shared"
         # .env is always seeded (placeholder) so the profile has its own
         # credentials file even when the clone source lacked one.
         assert (profile_dir / ".env").exists()

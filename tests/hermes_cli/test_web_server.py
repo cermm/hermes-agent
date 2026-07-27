@@ -5893,7 +5893,13 @@ class TestNewEndpoints:
 
         assert resp.status_code == 200
         target_dir = get_hermes_home() / "profiles" / "full-copy"
-        assert (target_dir / "config.yaml").read_text(encoding="utf-8") == "model:\n  provider: source-only\n"
+        assert (target_dir / "config.yaml").read_text(encoding="utf-8") == (
+            "model:\n"
+            "  provider: source-only\n"
+            "auth:\n"
+            "  authority: shared\n"
+        )
+        assert not (target_dir / "auth.json").exists()
         assert (target_dir / "workspace" / "artifact.txt").read_text(encoding="utf-8") == "copied"
 
     def test_profiles_create_without_clone_seeds_bundled_skills(self, monkeypatch):
