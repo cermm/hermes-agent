@@ -45,7 +45,7 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中�
 | `/title` | 为当前会话设置标题（用法：/title My Session Name） |
 | `/compress [focus topic]` | 手动压缩对话上下文（刷新记忆 + 摘要）。可选的焦点主题可缩小摘要保留的范围。 |
 | `/rollback` | 列出或恢复文件系统检查点（用法：/rollback [number]） |
-| `/snapshot [create\|restore <id>\|prune]`（别名：`/snap`） | 创建或恢复 Hermes 配置/状态的快照。`create [label]` 保存快照，`restore <id>` 回滚到该快照，`prune [N]` 删除旧快照，不带参数则列出所有快照。 |
+| `/snapshot [create\|restore <id>\|prune]`（别名：`/snap`） | 创建或恢复状态快照。普通 `restore <id>` 始终跳过认证数据。恢复加密认证信封必须使用 `/snapshot restore <id> --include-auth --auth-action restore-shared\|restore-profile --auth-passphrase-file PATH`；Hermes 会在认证/配置事务提交前验证拓扑、gateway 静止状态和规范锁。 |
 | `/stop` | 终止所有正在运行的后台进程 |
 | `/queue <prompt>`（别名：`/q`） | 将 prompt（提示词）加入队列等待下一轮处理（不会中断当前 agent 响应）。 |
 | `/steer <prompt>` | 在**下一次工具调用之后**向 agent 注入一条中途说明——不中断、不产生新的用户轮次。当前工具完成后，该文本会追加到最后一条工具结果的内容中，在不打断当前工具调用循环的情况下为 agent 提供新上下文。可用于在任务进行中调整方向（例如在 agent 运行测试时说"专注于 auth 模块"）。 |
@@ -114,7 +114,7 @@ Hermes 有两个斜杠命令入口，均由 `hermes_cli/commands.py` 中的中�
 | `/copy [number]` | 将最后一条助手回复复制到剪贴板（或用数字指定倒数第 N 条）。仅限 CLI。 |
 | `/image <path>` | 为下一条 prompt 附加本地图片文件。 |
 | `/debug` | 上传调试报告（系统信息 + 日志）并获取可分享链接。消息平台中也可用。 |
-| `/profile` | 显示活动 profile 名称和主目录 |
+| `/profile` | 显示活动 profile 名称和主目录。profile 身份并不表示 OAuth 存储位于本地；使用 `hermes auth status` 检查规范认证权威存储。 |
 
 ### 退出
 

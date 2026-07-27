@@ -1978,23 +1978,50 @@ class SessionDB:
                     raise sqlite3.DatabaseError(msg)
 
             def _connect_and_init():
-                self._conn = _connect_tracked_db(
-                    str(self.db_path),
-                    check_same_thread=False,
-                    # Short timeout — application-level retry with random
-                    # jitter handles contention instead of sitting in
-                    # SQLite's internal busy handler for up to 30s.
-                    timeout=1.0,
-                    # auto-starts transactions on DML, which conflicts with
-                    # our explicit BEGIN IMMEDIATE.  None = we manage
-                    # transactions ourselves.
-                    isolation_level=None,
-                )
-                self._conn.row_factory = sqlite3.Row
-                apply_wal_with_fallback(self._conn, db_label="state.db")
-                self._conn.execute("PRAGMA foreign_keys=ON")
-                self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
-                self._init_schema()
+                # Fresh-database recovery can put two startups here together:
+                # one process quarantines the damaged file while another sees
+                # the newly-created DB and begins schema setup.  Schema DDL is
+                # idempotent, but on DELETE-journal fallback the second opener
+                # can still receive SQLITE_BUSY while the first is creating
+                # tables.  Apply the same short-timeout + jitter policy used by
+                # normal writes rather than leaking a transient startup error.
+                for attempt in range(self._WRITE_MAX_RETRIES):
+                    try:
+                        self._conn = _connect_tracked_db(
+                            str(self.db_path),
+                            check_same_thread=False,
+                            # Short timeout — application-level retry with random
+                            # jitter handles contention instead of sitting in
+                            # SQLite's internal busy handler for up to 30s.
+                            timeout=1.0,
+                            # auto-starts transactions on DML, which conflicts with
+                            # our explicit BEGIN IMMEDIATE.  None = we manage
+                            # transactions ourselves.
+                            isolation_level=None,
+                        )
+                        self._conn.row_factory = sqlite3.Row
+                        apply_wal_with_fallback(self._conn, db_label="state.db")
+                        self._conn.execute("PRAGMA foreign_keys=ON")
+                        self._fts_cjk_loaded = load_fts5_cjk_extension(self._conn)
+                        self._init_schema()
+                        return
+                    except sqlite3.OperationalError as exc:
+                        err_msg = str(exc).lower()
+                        if "locked" not in err_msg and "busy" not in err_msg:
+                            raise
+                        try:
+                            if self._conn is not None:
+                                self._conn.close()
+                        finally:
+                            self._conn = None
+                        if attempt >= self._WRITE_MAX_RETRIES - 1:
+                            raise
+                        time.sleep(
+                            random.uniform(
+                                self._WRITE_RETRY_MIN_S,
+                                self._WRITE_RETRY_MAX_S,
+                            )
+                        )
 
             try:
                 _connect_and_init()
