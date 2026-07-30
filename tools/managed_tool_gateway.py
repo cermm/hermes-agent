@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-import json
+
 import logging
 import os
 from datetime import datetime, timezone
@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 logger = logging.getLogger(__name__)
 
-from hermes_constants import get_hermes_home
+
 from tools.tool_backend_helpers import managed_nous_tools_enabled
 
 _DEFAULT_TOOL_GATEWAY_DOMAIN = "nousresearch.com"
@@ -29,22 +29,17 @@ class ManagedToolGatewayConfig:
 
 
 def auth_json_path():
-    """Return the Hermes auth store path, respecting HERMES_HOME overrides."""
-    return get_hermes_home() / "auth.json"
+    """Return the current canonical Hermes auth authority path."""
+    from hermes_cli.auth_authority import get_auth_store_path
+
+    return get_auth_store_path()
 
 
 def _read_nous_provider_state() -> Optional[dict]:
     try:
-        path = auth_json_path()
-        if not path.is_file():
-            return None
-        data = json.loads(path.read_text(encoding="utf-8"))
-        providers = data.get("providers", {})
-        if not isinstance(providers, dict):
-            return None
-        nous_provider = providers.get("nous", {})
-        if isinstance(nous_provider, dict):
-            return nous_provider
+        from hermes_cli.auth import get_provider_auth_state
+
+        return get_provider_auth_state("nous")
     except Exception:
         pass
     return None
