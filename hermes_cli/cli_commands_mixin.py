@@ -282,7 +282,8 @@ class CLICommandsMixin:
         Syntax:
             /snapshot                  — list recent snapshots
             /snapshot create [label]   — create a snapshot
-            /snapshot restore <id>     — restore state from snapshot
+            /snapshot restore <id>     — restore state from snapshot (auth skipped)
+            /snapshot restore <id> --include-auth --auth-action <destination>
             /snapshot prune [N]        — prune to N snapshots (default 20)
         """
         from hermes_cli.backup import (
@@ -324,7 +325,11 @@ class CLICommandsMixin:
 
         elif subcmd in {"restore", "rewind"}:
             if len(parts) < 3:
-                print("  Usage: /snapshot restore <snapshot-id>")
+                print(
+                    "  Usage: /snapshot restore <snapshot-id> "
+                    "[--include-auth --auth-action restore-shared|restore-profile "
+                    "--auth-passphrase-file PATH]"
+                )
                 # Show hint with most recent snapshot
                 snaps = list_quick_snapshots(limit=1)
                 if snaps:
@@ -342,8 +347,57 @@ class CLICommandsMixin:
                     return
             except ValueError:
                 pass
-            if restore_quick_snapshot(snap_id):
+
+            options = parts[3:]
+            include_auth = "--include-auth" in options
+            auth_action = "skip"
+            passphrase_file = None
+            try:
+                if "--auth-action" in options:
+                    index = options.index("--auth-action")
+                    auth_action = options[index + 1]
+                if "--auth-passphrase-file" in options:
+                    index = options.index("--auth-passphrase-file")
+                    passphrase_file = options[index + 1]
+            except IndexError:
+                print("  Missing value for auth restore option.")
+                return
+            known_options = {
+                "--include-auth",
+                "--auth-action",
+                "restore-shared",
+                "restore-profile",
+                "--auth-passphrase-file",
+                passphrase_file,
+            }
+            unknown = [option for option in options if option not in known_options]
+            if unknown:
+                print(f"  Unknown restore option: {unknown[0]}")
+                return
+            if include_auth and (
+                auth_action not in {"restore-shared", "restore-profile"}
+                or not passphrase_file
+            ):
+                print(
+                    "  --include-auth requires --auth-action restore-shared|restore-profile "
+                    "and --auth-passphrase-file PATH."
+                )
+                return
+            if not include_auth and (
+                auth_action != "skip" or passphrase_file is not None
+            ):
+                print("  Auth restore options require --include-auth.")
+                return
+
+            if restore_quick_snapshot(
+                snap_id,
+                include_auth=include_auth,
+                auth_action=auth_action,
+                auth_passphrase_file=passphrase_file,
+            ):
                 print(f"  Restored state from: {snap_id}")
+                if not include_auth:
+                    print("  Authentication was skipped.")
                 print("  Restart recommended for state.db changes to take effect.")
             else:
                 print(f"  Snapshot not found: {snap_id}")
@@ -361,7 +415,11 @@ class CLICommandsMixin:
 
         else:
             print(f"  Unknown subcommand: {subcmd}")
-            print("  Usage: /snapshot [list|create [label]|restore <id>|prune [N]]")
+            print(
+                "  Usage: /snapshot [list|create [label]|restore <id> "
+                "[--include-auth --auth-action restore-shared|restore-profile "
+                "--auth-passphrase-file PATH]|prune [N]]"
+            )
 
     def _handle_stop_command(self):
         """Handle /stop — kill all running background processes and

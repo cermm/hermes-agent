@@ -287,14 +287,19 @@ class XAIWebSearchProvider(WebSearchProvider):
                             refresh_exc,
                         )
                 body = ""
-                try:
-                    body = exc.response.text[:300] if exc.response is not None else ""
-                except Exception:
-                    body = ""
+                if status not in {401, 403}:
+                    try:
+                        body = exc.response.text[:300] if exc.response is not None else ""
+                    except Exception:
+                        body = ""
                 logger.warning("xAI web search HTTP %d: %s", status, body)
                 return {
                     "success": False,
-                    "error": f"xAI web search returned HTTP {status}: {body}".rstrip(),
+                    "error": (
+                        f"xAI web search returned HTTP {status}"
+                        if status in {401, 403}
+                        else f"xAI web search returned HTTP {status}: {body}".rstrip()
+                    ),
                 }
             except httpx.RequestError as exc:
                 logger.warning("xAI web search request error: %s", exc)
