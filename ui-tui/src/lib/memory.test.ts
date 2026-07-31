@@ -4,7 +4,7 @@ import { join } from 'node:path'
 
 import { afterEach, beforeEach, describe, expect, it } from 'vitest'
 
-import { performHeapDump } from './memory.js'
+import { isAutoHeapdumpEnabled, performHeapDump } from './memory.js'
 
 const ENV_KEYS = ['HERMES_AUTO_HEAPDUMP', 'HERMES_HEAPDUMP_DIR', 'HERMES_HEAPDUMP_MAX_BYTES'] as const
 
@@ -74,24 +74,15 @@ describe('performHeapDump auto opt-in gate (#21767)', () => {
     expect(files.some(f => f.endsWith('.heapsnapshot'))).toBe(true)
   })
 
-  it('accepts truthy spellings (true|yes|on, case-insensitive) as opt-in', async () => {
-    for (const value of ['true', 'YES', 'On']) {
-      process.env.HERMES_AUTO_HEAPDUMP = value
-      const result = await performHeapDump('auto-high')
-
-      expect(result.success).toBe(true)
-      expect(result.heapPath).toBeDefined()
+  it('accepts truthy spellings (1|true|yes|on, case-insensitive) as opt-in', () => {
+    for (const value of ['1', 'true', 'YES', 'On']) {
+      expect(isAutoHeapdumpEnabled(value)).toBe(true)
     }
   })
 
-  it('treats other values (0, off, garbage) as opt-out for auto triggers', async () => {
+  it('treats other values (0, off, garbage) as opt-out for auto triggers', () => {
     for (const value of ['0', 'off', 'nope']) {
-      process.env.HERMES_AUTO_HEAPDUMP = value
-      const result = await performHeapDump('auto-high')
-
-      expect(result.success).toBe(true)
-      expect(result.suppressed).toBe(true)
-      expect(result.heapPath).toBeUndefined()
+      expect(isAutoHeapdumpEnabled(value)).toBe(false)
     }
   })
 
