@@ -847,11 +847,274 @@ def read_profile_meta(profile_dir: Path) -> dict:
     }
 
 
+def _write_profile_meta_descriptor_relative(
+    directory_fd: int,
+    *,
+    expected_leaf_identity: tuple[int, int] | None,
+    description: Optional[str],
+    description_auto: Optional[bool],
+) -> None:
+    """Stage and publish creation-time metadata without following the leaf."""
+    import yaml
+
+    metadata_fd = staged_fd = -1
+    staged_name: str | None = None
+    leaf_mode = 0o644
+    try:
+        try:
+            leaf = os.stat("profile.yaml", dir_fd=directory_fd, follow_symlinks=False)
+        except FileNotFoundError:
+            leaf = None
+
+        if expected_leaf_identity is None:
+            if leaf is not None:
+                raise ValueError("cloned profile.yaml changed before secure metadata write")
+        elif leaf is None:
+            raise ValueError("cloned profile.yaml changed before secure metadata write")
+        elif not stat.S_ISREG(leaf.st_mode):
+            raise ValueError(
+                "cloned profile.yaml must be a regular file inside the new profile"
+            )
+        elif (leaf.st_dev, leaf.st_ino) != expected_leaf_identity:
+            raise ValueError("cloned profile.yaml changed before secure metadata write")
+
+        existing: dict = {}
+        if leaf is not None:
+            read_flags = os.O_RDONLY | os.O_NOFOLLOW | getattr(os, "O_CLOEXEC", 0)
+            metadata_fd = os.open("profile.yaml", read_flags, dir_fd=directory_fd)
+            opened = os.fstat(metadata_fd)
+            if (
+                not stat.S_ISREG(opened.st_mode)
+                or (opened.st_dev, opened.st_ino) != expected_leaf_identity
+            ):
+                raise ValueError("cloned profile.yaml changed during secure open")
+            leaf_mode = stat.S_IMODE(opened.st_mode) & 0o777
+            with os.fdopen(metadata_fd, "r", encoding="utf-8") as stream:
+                metadata_fd = -1
+                try:
+                    loaded = yaml.safe_load(stream.read()) or {}
+                except Exception:
+                    loaded = {}
+            if isinstance(loaded, dict):
+                existing = loaded
+
+        if description is not None:
+            existing["description"] = description.strip()
+        if description_auto is not None:
+            existing["description_auto"] = bool(description_auto)
+        payload = yaml.safe_dump(
+            existing, sort_keys=False, default_flow_style=False
+        ).encode("utf-8")
+
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+        create_flags |= getattr(os, "O_CLOEXEC", 0)
+        for attempt in range(16):
+            candidate = (
+                f".profile.yaml.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
+            )
+            try:
+                staged_fd = os.open(
+                    candidate, create_flags, leaf_mode, dir_fd=directory_fd
+                )
+                staged_name = candidate
+                break
+            except FileExistsError:
+                continue
+        if staged_fd < 0 or staged_name is None:
+            raise OSError("could not reserve a safe staged profile.yaml file")
+
+        if hasattr(os, "fchmod"):
+            os.fchmod(staged_fd, leaf_mode)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(staged_fd, view[written:])
+            if count <= 0:
+                raise OSError("short profile.yaml write made no progress")
+            written += count
+        os.fsync(staged_fd)
+        staged = os.fstat(staged_fd)
+
+        try:
+            current = os.stat(
+                "profile.yaml", dir_fd=directory_fd, follow_symlinks=False
+            )
+        except FileNotFoundError:
+            current = None
+        if expected_leaf_identity is None:
+            if current is not None:
+                raise ValueError("cloned profile.yaml changed before secure publication")
+        elif current is None or (
+            current.st_dev,
+            current.st_ino,
+        ) != expected_leaf_identity:
+            raise ValueError("cloned profile.yaml changed before secure publication")
+
+        os.replace(
+            staged_name,
+            "profile.yaml",
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+        )
+        staged_name = None
+        published = os.stat(
+            "profile.yaml", dir_fd=directory_fd, follow_symlinks=False
+        )
+        if not stat.S_ISREG(published.st_mode) or (
+            published.st_dev,
+            published.st_ino,
+        ) != (staged.st_dev, staged.st_ino):
+            raise ValueError("published profile.yaml identity changed")
+        os.fsync(directory_fd)
+    finally:
+        if staged_name is not None:
+            try:
+                os.unlink(staged_name, dir_fd=directory_fd)
+            except OSError:
+                pass
+        for fd in (metadata_fd, staged_fd):
+            if fd >= 0:
+                try:
+                    os.close(fd)
+                except OSError:
+                    pass
+
+
+def _write_profile_meta_portable_creation(
+    profile_dir: Path,
+    *,
+    expected_leaf_identity: tuple[int, int] | None,
+    description: Optional[str],
+    description_auto: Optional[bool],
+) -> None:
+    """Safely materialize creation-time metadata on guarded Windows paths."""
+    import yaml
+
+    if not _IS_WINDOWS:
+        raise RuntimeError(
+            "secure profile metadata creation requires descriptor-relative "
+            "operations or a Windows no-delete directory handle"
+        )
+
+    metadata_path = profile_dir / "profile.yaml"
+    staged_path: Path | None = None
+    staged_fd = -1
+    leaf_mode = 0o644
+    try:
+        try:
+            leaf = metadata_path.lstat()
+        except FileNotFoundError:
+            leaf = None
+
+        if expected_leaf_identity is None:
+            if leaf is not None:
+                raise ValueError("cloned profile.yaml changed before secure metadata write")
+        elif leaf is None:
+            raise ValueError("cloned profile.yaml changed before secure metadata write")
+        elif (
+            getattr(leaf, "st_file_attributes", 0) & 0x00000400
+            or not stat.S_ISREG(leaf.st_mode)
+        ):
+            raise ValueError(
+                "cloned profile.yaml must be a regular file inside the new profile"
+            )
+        elif (leaf.st_dev, leaf.st_ino) != expected_leaf_identity:
+            raise ValueError("cloned profile.yaml changed before secure metadata write")
+
+        existing: dict = {}
+        if leaf is not None:
+            leaf_mode = stat.S_IMODE(leaf.st_mode) & 0o777
+            try:
+                loaded = yaml.safe_load(
+                    _read_windows_regular_file_no_follow(
+                        metadata_path, expected_leaf_identity
+                    ).decode("utf-8")
+                ) or {}
+            except (UnicodeDecodeError, yaml.YAMLError):
+                loaded = {}
+            if isinstance(loaded, dict):
+                existing = loaded
+
+        if description is not None:
+            existing["description"] = description.strip()
+        if description_auto is not None:
+            existing["description_auto"] = bool(description_auto)
+        payload = yaml.safe_dump(
+            existing, sort_keys=False, default_flow_style=False
+        ).encode("utf-8")
+
+        create_flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        create_flags |= getattr(os, "O_BINARY", 0)
+        for attempt in range(16):
+            candidate = profile_dir / (
+                f".profile.yaml.{os.getpid()}.{time.time_ns()}.{attempt}.tmp"
+            )
+            try:
+                staged_fd = os.open(str(candidate), create_flags, leaf_mode)
+                staged_path = candidate
+                break
+            except FileExistsError:
+                continue
+        if staged_fd < 0 or staged_path is None:
+            raise OSError("could not reserve a safe staged profile.yaml file")
+
+        if hasattr(os, "fchmod"):
+            os.fchmod(staged_fd, leaf_mode)
+        view = memoryview(payload)
+        written = 0
+        while written < len(view):
+            count = os.write(staged_fd, view[written:])
+            if count <= 0:
+                raise OSError("short profile.yaml write made no progress")
+            written += count
+        os.fsync(staged_fd)
+        staged = os.fstat(staged_fd)
+        os.close(staged_fd)
+        staged_fd = -1
+
+        try:
+            current = metadata_path.lstat()
+        except FileNotFoundError:
+            current = None
+        if expected_leaf_identity is None:
+            if current is not None:
+                raise ValueError("cloned profile.yaml changed before secure publication")
+        elif current is None or (
+            current.st_dev,
+            current.st_ino,
+        ) != expected_leaf_identity:
+            raise ValueError("cloned profile.yaml changed before secure publication")
+
+        # Replacing the directory entry never follows its current target.  A
+        # last-moment same-user symlink swap is therefore materialized safely
+        # as this staged regular file without touching the external target.
+        os.replace(staged_path, metadata_path)
+        staged_path = None
+        published = metadata_path.lstat()
+        if (
+            getattr(published, "st_file_attributes", 0) & 0x00000400
+            or not stat.S_ISREG(published.st_mode)
+            or (published.st_dev, published.st_ino) != (staged.st_dev, staged.st_ino)
+        ):
+            raise ValueError("published profile.yaml identity changed")
+    finally:
+        if staged_fd >= 0:
+            os.close(staged_fd)
+        if staged_path is not None:
+            try:
+                staged_path.unlink()
+            except OSError:
+                pass
+
+
 def write_profile_meta(
     profile_dir: Path,
     *,
     description: Optional[str] = None,
     description_auto: Optional[bool] = None,
+    creation_directory_fd: int | None = None,
+    expected_leaf_identity: tuple[int, int] | None = None,
+    creation_safe: bool = False,
 ) -> None:
     """Update ``<profile_dir>/profile.yaml`` in place.
 
@@ -859,6 +1122,22 @@ def write_profile_meta(
     fields preserve existing values. Creates the file if missing.
     Profile directory itself must exist.
     """
+    if creation_directory_fd is not None:
+        _write_profile_meta_descriptor_relative(
+            creation_directory_fd,
+            expected_leaf_identity=expected_leaf_identity,
+            description=description,
+            description_auto=description_auto,
+        )
+        return
+    if creation_safe:
+        _write_profile_meta_portable_creation(
+            profile_dir,
+            expected_leaf_identity=expected_leaf_identity,
+            description=description,
+            description_auto=description_auto,
+        )
+        return
     if not profile_dir.is_dir():
         raise FileNotFoundError(f"profile directory does not exist: {profile_dir}")
     import yaml
@@ -1509,12 +1788,51 @@ def _rename_directory_noreplace(
         raise RuntimeError("atomic no-replace profile publication is unavailable")
 
 
+def _profile_leaf_identity(
+    profile_dir: Path,
+    name: str,
+    *,
+    directory_fd: int | None = None,
+) -> tuple[int, int] | None:
+    """Return a no-follow regular-leaf identity within a pinned profile."""
+    try:
+        if directory_fd is not None:
+            leaf = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        else:
+            leaf = (profile_dir / name).lstat()
+    except FileNotFoundError:
+        return None
+    if (
+        getattr(leaf, "st_file_attributes", 0) & 0x00000400
+        or not stat.S_ISREG(leaf.st_mode)
+    ):
+        raise ValueError(f"cloned {name} must be a regular file inside the new profile")
+    return leaf.st_dev, leaf.st_ino
+
+
+def _verify_profile_leaf_identity(
+    profile_dir: Path,
+    name: str,
+    expected_identity: tuple[int, int] | None,
+    *,
+    directory_fd: int | None = None,
+) -> None:
+    """Fail when a tracked mutable leaf was added, removed, or replaced."""
+    current_identity = _profile_leaf_identity(
+        profile_dir, name, directory_fd=directory_fd
+    )
+    if current_identity != expected_identity:
+        raise ValueError(f"cloned {name} changed during secure profile creation")
+
+
 def _publish_new_profile(
     staged_dir: Path,
     profile_dir: Path,
     identity: tuple[int, int],
     *,
     staging_parent_identity: tuple[int, int],
+    profile_metadata_identity: tuple[int, int] | None = None,
+    verify_profile_metadata: bool = False,
 ) -> None:
     """Publish the staged object and undo publication if its identity changed."""
     staged = staged_dir.lstat()
@@ -1529,6 +1847,7 @@ def _publish_new_profile(
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
         source_parent_fd = os.open(staged_dir.parent, directory_flags)
         destination_parent_fd = os.open(profile_dir.parent, directory_flags)
+        staged_directory_fd = -1
         published = False
         try:
             opened_parent = os.fstat(source_parent_fd)
@@ -1537,6 +1856,24 @@ def _publish_new_profile(
                 opened_parent.st_ino,
             ) != staging_parent_identity:
                 raise ValueError("staged profile parent identity changed before publication")
+            staged_directory_fd = os.open(
+                staged_dir.name,
+                directory_flags,
+                dir_fd=source_parent_fd,
+            )
+            opened_staged = os.fstat(staged_directory_fd)
+            if not stat.S_ISDIR(opened_staged.st_mode) or (
+                opened_staged.st_dev,
+                opened_staged.st_ino,
+            ) != identity:
+                raise ValueError("staged profile directory identity changed before publication")
+            if verify_profile_metadata:
+                _verify_profile_leaf_identity(
+                    staged_dir,
+                    "profile.yaml",
+                    profile_metadata_identity,
+                    directory_fd=staged_directory_fd,
+                )
             _rename_directory_noreplace(
                 Path(staged_dir.name),
                 Path(profile_dir.name),
@@ -1544,6 +1881,13 @@ def _publish_new_profile(
                 destination_parent_fd=destination_parent_fd,
             )
             published = True
+            if verify_profile_metadata:
+                _verify_profile_leaf_identity(
+                    profile_dir,
+                    "profile.yaml",
+                    profile_metadata_identity,
+                    directory_fd=staged_directory_fd,
+                )
             published_fd = os.open(
                 profile_dir.name,
                 directory_flags,
@@ -1556,6 +1900,13 @@ def _publish_new_profile(
                     published_stat.st_ino,
                 ) != identity:
                     raise ValueError("published profile directory identity changed")
+                if verify_profile_metadata:
+                    _verify_profile_leaf_identity(
+                        profile_dir,
+                        "profile.yaml",
+                        profile_metadata_identity,
+                        directory_fd=published_fd,
+                    )
             finally:
                 os.close(published_fd)
         except BaseException:
@@ -1573,10 +1924,16 @@ def _publish_new_profile(
                     ) from restore_error
             raise
         finally:
+            if staged_directory_fd >= 0:
+                os.close(staged_directory_fd)
             os.close(destination_parent_fd)
             os.close(source_parent_fd)
         return
 
+    if verify_profile_metadata:
+        _verify_profile_leaf_identity(
+            staged_dir, "profile.yaml", profile_metadata_identity
+        )
     _rename_directory_noreplace(staged_dir, profile_dir)
     try:
         published = profile_dir.lstat()
@@ -1586,6 +1943,10 @@ def _publish_new_profile(
             or (published.st_dev, published.st_ino) != identity
         ):
             raise ValueError("published profile directory identity changed")
+        if verify_profile_metadata:
+            _verify_profile_leaf_identity(
+                profile_dir, "profile.yaml", profile_metadata_identity
+            )
     except BaseException:
         try:
             _rename_directory_noreplace(profile_dir, staged_dir)
@@ -1849,6 +2210,7 @@ def create_profile(
     if not stat.S_ISDIR(created_stat.st_mode):
         raise ValueError("new profile path is not a directory")
     created_identity = (created_stat.st_dev, created_stat.st_ino)
+    profile_metadata_identity: tuple[int, int] | None = None
     try:
         with _profile_creation_authority(
             profile_dir, created_identity
@@ -1858,6 +2220,11 @@ def create_profile(
                 source_dir,
                 clone_all,
                 destination_dir=write_dir,
+            )
+            profile_metadata_identity = _profile_leaf_identity(
+                write_dir,
+                "profile.yaml",
+                directory_fd=creation_directory_fd,
             )
 
             # auth.json OAuth and credential-pool content never moves during
@@ -1906,32 +2273,31 @@ def create_profile(
                 _migrate_profile_config_if_outdated(write_dir)
 
             if description and description.strip():
-                metadata_path = _profile_yaml_path(write_dir)
-                try:
-                    metadata_leaf = metadata_path.lstat()
-                except FileNotFoundError:
-                    metadata_leaf = None
-                if metadata_leaf is not None and (
-                    getattr(metadata_leaf, "st_file_attributes", 0) & 0x00000400
-                    or not stat.S_ISREG(metadata_leaf.st_mode)
-                ):
-                    raise ValueError(
-                        "cloned profile.yaml must be a regular file inside the new profile"
-                    )
-                try:
-                    write_profile_meta(
-                        write_dir,
-                        description=description.strip(),
-                        description_auto=False,
-                    )
-                except OSError:
-                    pass  # non-fatal — user can describe later
+                write_profile_meta(
+                    write_dir,
+                    description=description.strip(),
+                    description_auto=False,
+                    creation_directory_fd=creation_directory_fd,
+                    expected_leaf_identity=profile_metadata_identity,
+                    creation_safe=True,
+                )
+                profile_metadata_identity = _profile_leaf_identity(
+                    write_dir,
+                    "profile.yaml",
+                    directory_fd=creation_directory_fd,
+                )
 
             _write_profile_auth_authority(
                 profile_dir,
                 auth_mode,
                 created_identity,
                 creation_directory_fd=creation_directory_fd,
+            )
+            _verify_profile_leaf_identity(
+                write_dir,
+                "profile.yaml",
+                profile_metadata_identity,
+                directory_fd=creation_directory_fd,
             )
             current = profile_dir.lstat()
             if not stat.S_ISDIR(current.st_mode) or (
@@ -1945,6 +2311,8 @@ def create_profile(
             final_profile_dir,
             created_identity,
             staging_parent_identity=staging_parent_identity,
+            profile_metadata_identity=profile_metadata_identity,
+            verify_profile_metadata=True,
         )
     except BaseException as creation_error:
         _quarantine_failed_profile(profile_dir, created_identity, creation_error)

@@ -490,12 +490,18 @@ def test_supported_portable_profile_creation_writes_authority(
         "portable-supported",
         clone_config=True,
         auth_mode="shared",
+        description="portable metadata",
         no_alias=True,
     )
 
     raw = yaml.safe_load((created / "config.yaml").read_text(encoding="utf-8"))
     assert raw["display"]["skin"] == "mono"
     assert raw["auth"]["authority"] == "shared"
+    metadata = yaml.safe_load((created / "profile.yaml").read_text(encoding="utf-8"))
+    assert metadata == {
+        "description": "portable metadata",
+        "description_auto": False,
+    }
 
 
 def test_windows_portable_handles_deny_delete_sharing_and_open_reparse_points(
@@ -805,6 +811,102 @@ def test_clone_all_description_rejects_symlinked_profile_metadata(
 
     assert external.read_bytes() == sentinel
     assert not os.path.lexists(profile_root / "profiles" / "meta-symlink")
+
+
+@pytest.mark.parametrize("auth_mode", ["shared", "profile"])
+def test_clone_all_description_rejects_profile_metadata_swap_without_external_mutation(
+    profile_root, tmp_path, monkeypatch, auth_mode
+):
+    import hermes_cli.profiles as profiles
+
+    source_metadata = profile_root / "profile.yaml"
+    source_content = b"description: source profile\ndescription_auto: true\n"
+    source_metadata.write_bytes(source_content)
+
+    outside = tmp_path / "outside-metadata"
+    outside.mkdir()
+    external = outside / "external-profile.yaml"
+    sentinel = b"description: external sentinel\n"
+    external.write_bytes(sentinel)
+    external.chmod(0o640)
+    outside_entries = {entry.name for entry in outside.iterdir()}
+
+    real_write_profile_meta = profiles.write_profile_meta
+    swapped = False
+
+    def swap_before_metadata_write(profile_dir, *args, **kwargs):
+        nonlocal swapped
+        metadata = Path(profile_dir) / "profile.yaml"
+        metadata.unlink()
+        metadata.symlink_to(external)
+        swapped = True
+        return real_write_profile_meta(profile_dir, *args, **kwargs)
+
+    monkeypatch.setattr(profiles, "write_profile_meta", swap_before_metadata_write)
+    target = profile_root / "profiles" / f"metadata-race-{auth_mode}"
+
+    with pytest.raises(ValueError, match="profile.yaml.*regular file|changed"):
+        profiles.create_profile(
+            f"metadata-race-{auth_mode}",
+            clone_from="default",
+            clone_all=True,
+            auth_mode=auth_mode,
+            description="transaction local",
+            no_alias=True,
+        )
+
+    assert swapped
+    assert external.read_bytes() == sentinel
+    assert stat.S_IMODE(external.stat().st_mode) == 0o640
+    assert {entry.name for entry in outside.iterdir()} == outside_entries
+    assert source_metadata.read_bytes() == source_content
+    assert not source_metadata.is_symlink()
+    assert not os.path.lexists(target)
+
+
+@pytest.mark.parametrize("auth_mode", ["shared", "profile"])
+def test_profile_metadata_swap_after_secure_write_is_not_published(
+    profile_root, tmp_path, monkeypatch, auth_mode
+):
+    import hermes_cli.profiles as profiles
+
+    outside = tmp_path / "outside-post-metadata"
+    outside.mkdir()
+    external = outside / "external-profile.yaml"
+    sentinel = b"description: external sentinel\n"
+    external.write_bytes(sentinel)
+    external.chmod(0o640)
+    outside_entries = {entry.name for entry in outside.iterdir()}
+
+    real_write_authority = profiles._write_profile_auth_authority
+    swapped = False
+
+    def swap_after_authority(profile_dir, *args, **kwargs):
+        nonlocal swapped
+        real_write_authority(profile_dir, *args, **kwargs)
+        metadata = Path(profile_dir) / "profile.yaml"
+        metadata.unlink()
+        metadata.symlink_to(external)
+        swapped = True
+
+    monkeypatch.setattr(
+        profiles, "_write_profile_auth_authority", swap_after_authority
+    )
+    target = profile_root / "profiles" / f"post-metadata-race-{auth_mode}"
+
+    with pytest.raises(ValueError, match="profile.yaml.*regular file|changed"):
+        profiles.create_profile(
+            f"post-metadata-race-{auth_mode}",
+            auth_mode=auth_mode,
+            description="transaction local",
+            no_alias=True,
+        )
+
+    assert swapped
+    assert external.read_bytes() == sentinel
+    assert stat.S_IMODE(external.stat().st_mode) == 0o640
+    assert {entry.name for entry in outside.iterdir()} == outside_entries
+    assert not os.path.lexists(target)
 
 
 def test_clone_profile_during_source_rotation_never_copies_oauth_chain(
