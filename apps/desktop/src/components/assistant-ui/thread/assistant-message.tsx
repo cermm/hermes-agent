@@ -54,7 +54,7 @@ export const AssistantMessage: FC<{
   onDismissError?: (messageId: string) => void
 }> = ({ onBranchInNewChat, onDismissError }) => {
   const messageId = useAuiState(s => s.message.id)
-  const messageRuntime = useAui().message
+  const messageRuntime = useAui().message()
   const { t } = useI18n()
 
   // PERF: this component must NOT subscribe to the streaming text. Every

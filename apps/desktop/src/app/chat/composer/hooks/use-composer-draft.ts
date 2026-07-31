@@ -78,7 +78,7 @@ export function useComposerDraft({
   const setComposerText = useCallback(
     (value: string) => {
       try {
-        aui.composer.setText(value)
+        aui.composer().setText(value)
       } catch {
         // Composer core not bound yet — DOM/draftRef carry the text.
       }
@@ -271,7 +271,7 @@ export function useComposerDraft({
   // eslint-disable-next-line no-restricted-syntax -- legitimate non-atom ref write (see eslint rule comment)
   useEffect(() => {
     const sync = () => {
-      const text = aui.composer.getState().text
+      const text = aui.composer().getState().text
       draftRef.current = text
 
       const editor = editorRef.current

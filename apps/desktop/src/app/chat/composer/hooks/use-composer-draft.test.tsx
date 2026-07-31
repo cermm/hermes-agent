@@ -10,10 +10,21 @@ import { type ComposerScope, ComposerScopeProvider, MAIN_COMPOSER_SCOPE } from '
 
 import { useComposerDraft } from './use-composer-draft'
 
-const mockComposerApi = { setText: vi.fn(), getState: () => ({ text: '' }) }
+const mockComposerApi = { setText: vi.fn(), getState: vi.fn(() => ({ text: '' })) }
+const mockComposerAccessor = vi.fn(() => mockComposerApi)
+let mockAuiSubscriber: (() => void) | null = null
 
 vi.mock('@assistant-ui/react', () => ({
-  useAui: () => ({ composer: () => mockComposerApi, subscribe: () => () => undefined }),
+  useAui: () => ({
+    composer: mockComposerAccessor,
+    subscribe: (subscriber: () => void) => {
+      mockAuiSubscriber = subscriber
+
+      return () => {
+        mockAuiSubscriber = null
+      }
+    }
+  }),
   useAuiState: (selector: (state: { composer: { text: string } }) => unknown) => selector({ composer: { text: '' } })
 }))
 
@@ -43,6 +54,34 @@ function ProbeHarness({ activeQueueSessionKey, onLayoutSnapshot, sessionId }: Pr
 
   return null
 }
+
+describe('useComposerDraft — assistant-ui client accessor contract', () => {
+  afterEach(() => {
+    cleanup()
+    mainComposerScope.clear()
+    mockComposerAccessor.mockClear()
+    mockComposerApi.getState.mockClear()
+    mockComposerApi.setText.mockClear()
+    mockAuiSubscriber = null
+  })
+
+  it('resolves the composer accessor for both draft writes and subscription reads', () => {
+    render(
+      <ProbeHarness
+        activeQueueSessionKey="session-accessor"
+        onLayoutSnapshot={() => undefined}
+        sessionId="session-accessor"
+      />
+    )
+
+    expect(mockComposerAccessor).toHaveBeenCalled()
+    expect(mockComposerApi.setText).toHaveBeenCalledWith('')
+
+    act(() => mockAuiSubscriber?.())
+
+    expect(mockComposerApi.getState).toHaveBeenCalled()
+  })
+})
 
 describe('useComposerDraft — attachment scope stays coherent with the committed session on switch (#59305)', () => {
   afterEach(() => {

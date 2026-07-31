@@ -106,7 +106,7 @@ export function useTapbackDoubleClick(
   role: ChatMessage['role']
 ): ((event: MouseEvent<HTMLElement>) => void) | undefined {
   const enabled = useStore($reactionsEnabled)
-  const messageRuntime = useAui().message
+  const messageRuntime = useAui().message()
 
   const onDoubleClick = useCallback(
     (event: MouseEvent<HTMLElement>) => {
