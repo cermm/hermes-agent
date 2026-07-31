@@ -4,7 +4,7 @@ sidebar_position: 2
 
 # Profiles: Running Multiple Agents
 
-Run multiple independent Hermes agents on the same machine — each with its own config, API keys, memory, sessions, skills, and gateway state.
+Run multiple isolated Hermes agents on the same machine. Config, memory, sessions, skills, cron, gateway state, and platform credentials remain profile-scoped; Hermes OAuth credentials use the shared default-root authority unless you explicitly opt a profile into a local auth store.
 
 ## What are profiles?
 
@@ -20,7 +20,19 @@ coder setup                       # configure API keys and model
 coder chat                        # start chatting
 ```
 
-That's it. `coder` is now its own Hermes profile with its own config, memory, and state.
+That's it. `coder` is now its own Hermes profile with its own config, memory, and state. Its `config.yaml` explicitly selects `auth.authority: shared`, so provider OAuth sign-in is reused without merging any other profile state.
+
+### Authentication authority
+
+New profiles use the canonical shared store at `~/.hermes/auth.json`. This shares only Hermes provider credentials; it does not merge profile config, memory, sessions, skills, cron jobs, gateway state, messaging-platform tokens, or project files.
+
+Use a profile-local credential store only when you need deliberate isolation:
+
+```bash
+hermes profile create regulated --auth-mode profile
+```
+
+That command writes `auth.authority: profile` and uses `~/.hermes/profiles/regulated/auth.json`. Existing profiles with ambiguous local stores should use the reviewed `hermes auth migrate-shared` workflow rather than copying or deleting `auth.json` manually. See [Authentication Authority](/guides/auth-authority).
 
 ## Creating a profile
 
@@ -50,7 +62,7 @@ You can also set or auto-generate the description later with `hermes profile des
 hermes profile create work --clone
 ```
 
-Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Same API keys, model, and capabilities, but fresh sessions and memory. Edit `~/.hermes/profiles/work/.env` for different API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
+Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into the new profile. Static API keys in `.env`, model settings, and capabilities are copied, but OAuth `auth.json` is not copied in the default shared mode. Sessions and memory start fresh. Edit `~/.hermes/profiles/work/.env` for different static API keys, or `~/.hermes/profiles/work/SOUL.md` for a different personality.
 
 ### Clone everything (`--clone-all`)
 
@@ -58,7 +70,7 @@ Copies your current profile's `config.yaml`, `.env`, `SOUL.md`, and skills into 
 hermes profile create backup --clone-all
 ```
 
-Copies **everything** — config, API keys, personality, all memories, skills, cron jobs, plugins. A complete working snapshot. Per-profile history is excluded (session history, `state.db`, `backups/`, `state-snapshots/`, `checkpoints/`) — these belong to the source profile and can reach tens of GB. For a full backup including history, use `hermes profile export` or `hermes backup` instead.
+Copies config, `.env` API keys, personality, memories, skills, cron jobs, and plugins. The canonical OAuth `auth.json` is still not copied in the default shared mode. Per-profile history is excluded (session history, `state.db`, `backups/`, `state-snapshots/`, `checkpoints/`) — these belong to the source profile and can reach tens of GB. For an authority-aware backup including encrypted auth, use `hermes backup --auth-mode include-encrypted` instead.
 
 ### Clone from a specific profile
 

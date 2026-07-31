@@ -32,13 +32,18 @@ import traceback
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
-# Force-isolate the test environment BEFORE any hermes imports.
-ORIGINAL_HOME = os.environ.get("HERMES_HOME")
-ORIGINAL_AUTH = Path.home() / ".hermes" / "auth.json"
-
 _THIS_DIR = Path(__file__).resolve().parent
 _WORKTREE_ROOT = _THIS_DIR.parent
 sys.path.insert(0, str(_WORKTREE_ROOT))
+
+# Resolve the real credential authority before replacing HERMES_HOME with the
+# harness sandbox. Repository imports are available because the worktree root
+# is inserted first; silently falling back to a guessed path would violate the
+# single-authority contract.
+ORIGINAL_HOME = os.environ.get("HERMES_HOME")
+from hermes_cli.auth_authority import resolve_auth_authority
+
+ORIGINAL_AUTH = resolve_auth_authority().auth_path
 
 # ---------------------------------------------------------------------------
 # Fake MCP tools — realistic shape, varied difficulty for retrieval
@@ -251,23 +256,27 @@ SCENARIOS: List[Dict[str, Any]] = [
 def setup_isolated_home(enabled: bool, listing: str = "off",
                         listing_max_tokens: int = 4000,
                         model: str = "anthropic/claude-haiku-4.5") -> Path:
-    """Create a fresh ~/.hermes/ for one test, copying minimal credentials.
+    """Create a fresh profile-local Hermes home for one live test.
 
-    Also reads OPENROUTER_API_KEY from the user's real ``~/.hermes/.env`` so
-    the agent can authenticate against OpenRouter inside the isolated home.
+    Credential copying is privileged and disabled unless the operator sets
+    ``HERMES_TOOL_SEARCH_LIVETEST_ALLOW_CREDENTIAL_COPY=1`` explicitly.
     """
     home_dir = Path(tempfile.mkdtemp(prefix="hermes_ts_live_"))
     hermes_home = home_dir / ".hermes"
     hermes_home.mkdir(parents=True)
 
-    if ORIGINAL_AUTH.exists():
-        shutil.copy(ORIGINAL_AUTH, hermes_home / "auth.json")
-
-    # Copy .env so OPENROUTER_API_KEY (or others) are visible to the agent
-    # running inside the isolated home.
+    allow_credentials = (
+        os.environ.get("HERMES_TOOL_SEARCH_LIVETEST_ALLOW_CREDENTIAL_COPY") == "1"
+    )
     real_env_file = Path.home() / ".hermes" / ".env"
-    if real_env_file.exists():
-        shutil.copy(real_env_file, hermes_home / ".env")
+    if allow_credentials and ORIGINAL_AUTH.is_file():
+        destination = hermes_home / "auth.json"
+        shutil.copyfile(ORIGINAL_AUTH, destination)
+        destination.chmod(0o600)
+    if allow_credentials and real_env_file.is_file():
+        destination = hermes_home / ".env"
+        shutil.copyfile(real_env_file, destination)
+        destination.chmod(0o600)
         # Also load the real user env into this process so the provider
         # resolver can authenticate. We go through the canonical loader
         # (python-dotenv under the hood) rather than parsing the file by
@@ -278,6 +287,7 @@ def setup_isolated_home(enabled: bool, listing: str = "off",
         load_hermes_dotenv(hermes_home=str(Path.home() / ".hermes"))
 
     cfg = {
+        "auth": {"authority": "profile"},
         "model": {
             "provider": "openrouter",
             "model": model,

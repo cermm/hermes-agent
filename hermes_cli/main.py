@@ -1024,20 +1024,18 @@ def _has_any_provider_configured() -> bool:
     except Exception:
         pass
 
-    # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
-    if auth_file.exists():
-        try:
-            import json
+    # Check for configured auth credentials through the canonical authority.
+    try:
+        from hermes_cli.auth import get_auth_status, _load_auth_store
+        from hermes_cli.auth_authority import get_auth_store_path
 
-            auth = json.loads(auth_file.read_text(encoding="utf-8"))
-            active = auth.get("active_provider")
-            if active:
-                status = get_auth_status(active)
-                if status.get("logged_in"):
-                    return True
-        except Exception:
-            pass
+        auth_file = get_auth_store_path()
+        auth = _load_auth_store(auth_file)
+        active = auth.get("active_provider")
+        if active and get_auth_status(active).get("logged_in"):
+            return True
+    except Exception:
+        pass
 
     # Check config.yaml — if model is a dict with an explicit provider set,
     # the user has gone through setup (fresh installs have model as a plain
@@ -2493,8 +2491,64 @@ def _resolve_use_tui(args) -> bool:
 
 
 def cmd_chat(args):
-    """Run interactive chat CLI."""
+    """Claim result-metadata descriptors before config or agent startup."""
+
+    from hermes_cli import result_metadata
+
+    owner = None
+    raw_fd = getattr(args, "result_meta_fd", None)
+    if raw_fd is not None:
+        try:
+            owner = result_metadata.claim_result_metadata_fd(raw_fd)
+        except result_metadata.ResultMetadataError:
+            print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(2) from None
+        args.result_meta_fd = owner
+    try:
+        return _cmd_chat(args)
+    finally:
+        if owner is not None:
+            try:
+                owner.close()
+            except result_metadata.ResultMetadataError:
+                print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+                raise SystemExit(1) from None
+
+
+def _cmd_chat(args):
+    """Run interactive chat CLI after descriptor ownership is established."""
     use_tui = _resolve_use_tui(args)
+
+    result_meta_file = getattr(args, "result_meta_file", None)
+    result_meta_fd = getattr(args, "result_meta_fd", None)
+    if result_meta_file is not None and result_meta_fd is not None:
+        print("Error: choose only one result metadata transport.", file=sys.stderr)
+        raise SystemExit(2)
+    if result_meta_file:
+        if not getattr(args, "query", None):
+            print("Error: --result-meta-file requires --query.", file=sys.stderr)
+            raise SystemExit(2)
+        if use_tui:
+            print("Error: --result-meta-file is available only in the classic CLI.", file=sys.stderr)
+            raise SystemExit(2)
+        from hermes_cli.result_metadata import (
+            PUBLIC_ERROR_MESSAGE,
+            ResultMetadataError,
+            validate_result_metadata_destination,
+        )
+
+        try:
+            validate_result_metadata_destination(result_meta_file)
+        except ResultMetadataError:
+            print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(2) from None
+    if result_meta_fd is not None:
+        if not getattr(args, "query", None):
+            print("Error: --result-meta-fd requires --query.", file=sys.stderr)
+            raise SystemExit(2)
+        if use_tui:
+            print("Error: --result-meta-fd is available only in the classic CLI.", file=sys.stderr)
+            raise SystemExit(2)
 
     _apply_safe_mode(args)
 
@@ -2684,6 +2738,8 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "result_meta_file": result_meta_file,
+        "result_meta_fd": result_meta_fd,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
@@ -9232,6 +9288,7 @@ def cmd_profile(args):
                 clone_config=clone_config,
                 no_alias=no_alias,
                 no_skills=no_skills,
+                auth_mode=getattr(args, "auth_mode", "shared"),
                 description=getattr(args, "description", None),
             )
             print(f"\nProfile '{name}' created at {profile_dir}")
@@ -9329,8 +9386,9 @@ def cmd_profile(args):
     elif action == "delete":
         name = args.profile_name
         yes = getattr(args, "yes", False)
+        auth_action = getattr(args, "auth_action", None)
         try:
-            delete_profile(name, yes=yes)
+            delete_profile(name, yes=yes, auth_action=auth_action)
         except (ValueError, FileNotFoundError) as e:
             print(f"Error: {e}")
             sys.exit(1)

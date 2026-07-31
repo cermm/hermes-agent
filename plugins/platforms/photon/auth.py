@@ -40,9 +40,7 @@ import json
 import logging
 import os
 import re
-import stat
 import time
-import uuid
 from base64 import b64encode
 from dataclasses import dataclass
 from pathlib import Path
@@ -88,69 +86,48 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # auth.json helpers — share the file with the rest of hermes-agent.
 
 def _auth_json_path() -> Path:
-    """Resolve ``~/.hermes/auth.json`` honouring the active Hermes profile."""
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "auth.json"
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes")) / "auth.json"
+    """Resolve the configured canonical auth authority."""
+    from hermes_cli.auth_authority import get_auth_store_path
+
+    return get_auth_store_path()
 
 
 def _load_auth() -> Dict[str, Any]:
-    path = _auth_json_path()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("photon: could not read %s: %s", path, e)
-        return {}
+    from hermes_cli.auth import _load_auth_store
+
+    return _load_auth_store(_auth_json_path())
 
 
-def _save_auth(data: Dict[str, Any]) -> None:
+def _save_auth(
+    data: Dict[str, Any],
+    *,
+    pool_keys: tuple[str, ...] = ("photon", "photon_project", "photon_user"),
+    provider_keys: tuple[str, ...] = ("photon",),
+) -> None:
+    """Merge only Photon-owned state under the canonical store lock.
+
+    Callers commonly pass a whole-store snapshot loaded before doing network
+    work. Re-merging unrelated entries from that snapshot would overwrite
+    credentials rotated by another process while Photon was in flight.
+    """
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
     path = _auth_json_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    # Per-process random temp suffix avoids collisions between concurrent
-    # writers and stale leftovers from a crashed prior write.
-    tmp = path.with_name(f"{path.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
-    # Create with 0o600 atomically via os.open(O_EXCL) + fdopen: the old
-    # open() → write → chmod() sequence left a window where the bearer
-    # token sat world-readable at process umask (typically 0o644), and the
-    # predictable temp name could be pre-planted (symlink attack). Mirrors
-    # hermes_cli/auth.py:_save_auth_store (#19673, #21148).
-    fd = os.open(
-        str(tmp),
-        os.O_WRONLY | os.O_CREAT | os.O_EXCL,
-        stat.S_IRUSR | stat.S_IWUSR,
-    )
-    try:
-        fh = os.fdopen(fd, "w", encoding="utf-8")
-    except BaseException:
-        # os.fdopen() failed before taking ownership of the raw descriptor,
-        # so nothing else will ever close it — do it here, then drop the
-        # just-created temp file.
-        try:
-            os.close(fd)
-        except OSError:
-            pass
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
-    try:
-        with fh:
-            json.dump(data, fh, indent=2, sort_keys=True)
-            fh.flush()
-            os.fsync(fh.fileno())
-        tmp.replace(path)
-    except BaseException:
-        try:
-            tmp.unlink()
-        except OSError:
-            pass
-        raise
+    with _auth_store_lock(target_path=path):
+        current = _load_auth_store(path)
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            current_providers = current.setdefault("providers", {})
+            for key in provider_keys:
+                if key in providers:
+                    current_providers[key] = providers[key]
+        pool = data.get("credential_pool")
+        if isinstance(pool, dict):
+            current_pool = current.setdefault("credential_pool", {})
+            for key in pool_keys:
+                if key in pool:
+                    current_pool[key] = pool[key]
+        _save_auth_store(current, target_path=path)
 
 
 def load_photon_token() -> Optional[str]:
@@ -170,14 +147,11 @@ def load_photon_token() -> Optional[str]:
 
 def store_photon_token(token: str) -> None:
     """Persist a dashboard bearer token under ``credential_pool.photon``."""
-    from hermes_cli.auth import _auth_store_lock
-
-    with _auth_store_lock():
-        auth = _load_auth()
-        auth.setdefault("credential_pool", {})["photon"] = [
-            {"access_token": token, "issued_at": int(time.time())}
-        ]
-        _save_auth(auth)
+    auth = _load_auth()
+    auth.setdefault("credential_pool", {})["photon"] = [
+        {"access_token": token, "issued_at": int(time.time())}
+    ]
+    _save_auth(auth, pool_keys=("photon",), provider_keys=())
 
 
 def clear_photon_token() -> None:
@@ -188,14 +162,20 @@ def clear_photon_token() -> None:
     auth = _load_auth()
     pool = auth.get("credential_pool", {})
     photon = pool.get("photon", [])
-    if isinstance(photon, list) and photon:
+    pool_changed = isinstance(photon, list) and bool(photon)
+    if pool_changed:
         pool["photon"] = []
-        _save_auth(auth)
     # Also clear the legacy shape if present.
     providers = auth.get("providers", {})
-    if "photon" in providers:
+    provider_changed = "photon" in providers
+    if provider_changed:
         providers["photon"] = {}
-        _save_auth(auth)
+    if pool_changed or provider_changed:
+        _save_auth(
+            auth,
+            pool_keys=("photon",) if pool_changed else (),
+            provider_keys=("photon",) if provider_changed else (),
+        )
 
 
 def check_photon_token_valid(token: str) -> bool:
@@ -284,21 +264,18 @@ def store_project_credentials(
     ``auth.json`` so management commands work even when ``.env`` hasn't been
     loaded into the current process.
     """
-    from hermes_cli.auth import _auth_store_lock
-
-    with _auth_store_lock():
-        auth = _load_auth()
-        record: Dict[str, Any] = {
-            "spectrum_project_id": spectrum_project_id,
-            "project_secret": project_secret,
-            "issued_at": int(time.time()),
-        }
-        if dashboard_project_id:
-            record["dashboard_project_id"] = dashboard_project_id
-        if name:
-            record["name"] = name
-        auth.setdefault("credential_pool", {})["photon_project"] = [record]
-        _save_auth(auth)
+    auth = _load_auth()
+    record: Dict[str, Any] = {
+        "spectrum_project_id": spectrum_project_id,
+        "project_secret": project_secret,
+        "issued_at": int(time.time()),
+    }
+    if dashboard_project_id:
+        record["dashboard_project_id"] = dashboard_project_id
+    if name:
+        record["name"] = name
+    auth.setdefault("credential_pool", {})["photon_project"] = [record]
+    _save_auth(auth, pool_keys=("photon_project",), provider_keys=())
     _persist_runtime_env(spectrum_project_id, project_secret)
 
 
@@ -312,21 +289,18 @@ def store_user_numbers(
     """Persist non-secret Photon user numbers for offline ``status`` output."""
     if not phone_number and not assigned_phone_number:
         return
-    from hermes_cli.auth import _auth_store_lock
-
-    with _auth_store_lock():
-        auth = _load_auth()
-        record: Dict[str, Any] = {"issued_at": int(time.time())}
-        if phone_number:
-            record["phone_number"] = phone_number
-        if assigned_phone_number:
-            record["assigned_phone_number"] = assigned_phone_number
-        if user_id:
-            record["user_id"] = user_id
-        if dashboard_project_id:
-            record["dashboard_project_id"] = dashboard_project_id
-        auth.setdefault("credential_pool", {})["photon_user"] = [record]
-        _save_auth(auth)
+    auth = _load_auth()
+    record: Dict[str, Any] = {"issued_at": int(time.time())}
+    if phone_number:
+        record["phone_number"] = phone_number
+    if assigned_phone_number:
+        record["assigned_phone_number"] = assigned_phone_number
+    if user_id:
+        record["user_id"] = user_id
+    if dashboard_project_id:
+        record["dashboard_project_id"] = dashboard_project_id
+    auth.setdefault("credential_pool", {})["photon_user"] = [record]
+    _save_auth(auth, pool_keys=("photon_user",), provider_keys=())
 
 
 def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
