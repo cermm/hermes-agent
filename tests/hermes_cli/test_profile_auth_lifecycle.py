@@ -130,17 +130,20 @@ def test_auth_injection_rejects_replaced_profile_directory(
 
     real_open = profiles.os.open
     swapped = False
+    raced_path = None
 
     def swap_before_directory_open(path, flags, *args, dir_fd=None, **kwargs):
-        nonlocal swapped
+        nonlocal raced_path, swapped
+        path_name = Path(path).name
         opens_target = (
-            (dir_fd is None and Path(path) == target)
-            or (dir_fd is not None and path == target.name)
+            path_name.startswith(".raced.create-")
+            and flags & getattr(profiles.os, "O_DIRECTORY", 0)
         )
-        if not swapped and opens_target and flags & getattr(profiles.os, "O_DIRECTORY", 0):
+        if not swapped and opens_target:
             swapped = True
-            profiles.os.rename(target, saved_created)
-            profiles.os.rename(replacement, target)
+            raced_path = profile_root / "profiles" / path_name
+            profiles.os.rename(raced_path, saved_created)
+            profiles.os.rename(replacement, raced_path)
         return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
 
     supported_dir_fd = set(profiles.os.supports_dir_fd)
@@ -153,10 +156,59 @@ def test_auth_injection_rejects_replaced_profile_directory(
         profiles.create_profile("raced", auth_mode="shared", no_alias=True)
 
     assert swapped
-    assert (target / "config.yaml").read_bytes() == sentinel_content
-    assert stat.S_IMODE((target / "config.yaml").stat().st_mode) == 0o640
-    assert not (target / ".env").exists()
+    assert raced_path is not None
+    assert (raced_path / "config.yaml").read_bytes() == sentinel_content
+    assert stat.S_IMODE((raced_path / "config.yaml").stat().st_mode) == 0o640
+    assert not (raced_path / ".env").exists()
+    assert not os.path.lexists(target)
     assert saved_created.is_dir()
+
+
+def test_profile_identity_remains_bound_after_authority_injection(
+    profile_root, tmp_path, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "post-authority-race"
+    saved_created = profile_root / "profiles" / ".post-authority-created"
+    replacement = tmp_path / "post-authority-replacement"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel.txt"
+    sentinel.write_text("external sentinel", encoding="utf-8")
+
+    real_write_authority = profiles._write_profile_auth_authority
+    swapped = False
+
+    def swap_after_authority(*args, **kwargs):
+        nonlocal swapped
+        result = real_write_authority(*args, **kwargs)
+        if target.exists():
+            profiles.os.rename(target, saved_created)
+        profiles.os.rename(replacement, target)
+        swapped = True
+        return result
+
+    monkeypatch.setattr(
+        profiles, "_write_profile_auth_authority", swap_after_authority
+    )
+
+    with pytest.raises(
+        (FileExistsError, ValueError, RuntimeError),
+        match="exists|identity|changed|refusing",
+    ):
+        profiles.create_profile(
+            "post-authority-race",
+            auth_mode="profile",
+            description="must stay transaction-local",
+            no_alias=True,
+        )
+
+    assert swapped
+    assert (target / "sentinel.txt").read_text(encoding="utf-8") == "external sentinel"
+    assert not (target / ".env").exists()
+    assert not (target / "SOUL.md").exists()
+    assert not (target / "auth.json").exists()
+    assert not (target / "profile.json").exists()
 
 
 def test_portable_authority_injection_fails_closed_on_directory_swap(
@@ -204,6 +256,53 @@ def test_portable_authority_injection_fails_closed_on_directory_swap(
     assert not os.path.lexists(target)
 
 
+def test_supported_portable_profile_creation_publishes_authority(
+    profile_root, monkeypatch
+):
+    import contextlib
+    import hermes_cli.profiles as profiles
+
+    @contextlib.contextmanager
+    def stable_portable_directory(_profile_dir, _created_identity):
+        try:
+            yield
+        finally:
+            # Exercise the Windows authority branch on Linux, then let the
+            # real Linux no-replace publisher complete the public operation.
+            monkeypatch.setattr(profiles, "_IS_WINDOWS", False)
+
+    def portable_regular_file(path, _identity):
+        return Path(path).read_bytes()
+
+    monkeypatch.setattr(profiles.os, "supports_dir_fd", set())
+    monkeypatch.setattr(profiles, "_IS_WINDOWS", True, raising=False)
+    monkeypatch.setattr(
+        profiles,
+        "_windows_profile_directory_guard",
+        stable_portable_directory,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        profiles,
+        "_read_windows_regular_file_no_follow",
+        portable_regular_file,
+    )
+    (profile_root / "config.yaml").write_text(
+        "display:\n  skin: mono\n", encoding="utf-8"
+    )
+
+    created = profiles.create_profile(
+        "portable-supported",
+        clone_config=True,
+        auth_mode="shared",
+        no_alias=True,
+    )
+
+    raw = yaml.safe_load((created / "config.yaml").read_text(encoding="utf-8"))
+    assert raw["display"]["skin"] == "mono"
+    assert raw["auth"]["authority"] == "shared"
+
+
 def test_rollback_never_recursively_deletes_replacement_directory(
     profile_root, tmp_path, monkeypatch
 ):
@@ -223,24 +322,25 @@ def test_rollback_never_recursively_deletes_replacement_directory(
     real_rmtree = profiles.shutil.rmtree
     swapped = False
 
-    def swap_once() -> None:
-        nonlocal swapped
+    swapped_path = None
+
+    def swap_once(path: Path) -> None:
+        nonlocal swapped, swapped_path
         if swapped:
             return
         swapped = True
-        real_rename(target, saved_created)
-        real_rename(replacement, target)
+        swapped_path = path
+        real_rename(path, saved_created)
+        real_rename(replacement, path)
 
     def swap_before_quarantine(source, destination, *args, **kwargs):
-        if Path(source).name == target.name and Path(destination).name.startswith(
-            f".{target.name}.rollback-"
-        ):
-            swap_once()
+        if ".rollback-" in Path(destination).name:
+            swap_once(Path(source))
         return real_rename(source, destination, *args, **kwargs)
 
     def swap_before_legacy_rmtree(path, *args, **kwargs):
-        if Path(path) == target:
-            swap_once()
+        if Path(path).name.startswith(".rollback-race.create-"):
+            swap_once(Path(path))
         return real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(profiles, "_write_profile_auth_authority", fail_authority_write)
@@ -255,8 +355,139 @@ def test_rollback_never_recursively_deletes_replacement_directory(
         profiles.create_profile("rollback-race", auth_mode="shared", no_alias=True)
 
     assert swapped
-    assert (target / sentinel.name).read_text(encoding="utf-8") == "external sentinel"
-    assert not os.path.lexists(saved_created)
+    assert swapped_path is not None
+    assert (swapped_path / sentinel.name).read_text(encoding="utf-8") == "external sentinel"
+    assert not os.path.lexists(target)
+    assert saved_created.is_dir(), "unsafe cleanup must retain the transaction inode"
+
+
+def test_downstream_failure_rolls_staged_profile_out_of_creation_namespace(
+    profile_root, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    gateway_registrations = []
+
+    def fail_migration(_profile_dir):
+        raise ValueError("forced downstream migration failure")
+
+    monkeypatch.setattr(
+        profiles, "_migrate_profile_config_if_outdated", fail_migration
+    )
+    monkeypatch.setattr(
+        profiles,
+        "_maybe_register_gateway_service",
+        lambda name: gateway_registrations.append(name),
+    )
+
+    with pytest.raises(ValueError, match="forced downstream migration failure"):
+        profiles.create_profile("full-transaction", auth_mode="profile", no_alias=True)
+
+    profiles_root = profile_root / "profiles"
+    assert not os.path.lexists(profiles_root / "full-transaction")
+    assert not list(profiles_root.glob(".full-transaction.create-*"))
+    assert list(profiles_root.glob("..full-transaction.create-*.rollback-*"))
+    assert gateway_registrations == []
+
+
+def test_posix_rollback_never_rmdirs_a_last_moment_replacement(
+    profile_root, tmp_path, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "posix-rmdir-race"
+    saved_created = profile_root / "profiles" / ".posix-rmdir-created"
+    replacement = tmp_path / "empty-external-directory"
+    replacement.mkdir()
+    real_rmdir = profiles.os.rmdir
+    real_rename = profiles.os.rename
+    swapped = False
+
+    def fail_authority_write(*_args, **_kwargs):
+        raise ValueError("forced authority failure")
+
+    def swap_inside_final_rmdir(path, *args, **kwargs):
+        nonlocal swapped
+        candidate = Path(path)
+        if not swapped and ".rollback-" in candidate.name:
+            swapped = True
+            real_rename(candidate, saved_created)
+            real_rename(replacement, candidate)
+        return real_rmdir(path, *args, **kwargs)
+
+    monkeypatch.setattr(profiles, "_write_profile_auth_authority", fail_authority_write)
+    supported_dir_fd = set(profiles.os.supports_dir_fd)
+    supported_dir_fd.discard(real_rmdir)
+    supported_dir_fd.add(swap_inside_final_rmdir)
+    monkeypatch.setattr(profiles.os, "rmdir", swap_inside_final_rmdir)
+    monkeypatch.setattr(profiles.os, "supports_dir_fd", supported_dir_fd)
+
+    with pytest.raises(ValueError, match="forced authority failure"):
+        profiles.create_profile("posix-rmdir-race", auth_mode="shared", no_alias=True)
+
+    assert not swapped, "rollback must not issue a path-bound final rmdir"
+    assert replacement.is_dir()
+
+
+def test_portable_rollback_never_rmtrees_a_replaced_profile(
+    profile_root, tmp_path, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "portable-rmtree-race"
+    saved_created = profile_root / "profiles" / ".portable-rmtree-created"
+    replacement = tmp_path / "portable-external-directory"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel.txt"
+    sentinel.write_text("external sentinel", encoding="utf-8")
+    real_rmtree = profiles.shutil.rmtree
+    real_rename = profiles.os.rename
+    swapped = False
+
+    def fail_authority_write(*_args, **_kwargs):
+        raise ValueError("forced authority failure")
+
+    def swap_inside_rmtree(path, *args, **kwargs):
+        nonlocal swapped
+        candidate = Path(path)
+        if not swapped and ".rollback-" in candidate.name:
+            swapped = True
+            real_rename(candidate, saved_created)
+            real_rename(replacement, candidate)
+        return real_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(profiles, "_write_profile_auth_authority", fail_authority_write)
+    monkeypatch.setattr(profiles.os, "supports_dir_fd", set())
+    monkeypatch.setattr(profiles.shutil, "rmtree", swap_inside_rmtree)
+
+    with pytest.raises((ValueError, RuntimeError), match="forced|secure directory"):
+        profiles.create_profile("portable-rmtree-race", auth_mode="shared", no_alias=True)
+
+    assert not swapped, "rollback must not recursively delete by pathname"
+    assert sentinel.read_text(encoding="utf-8") == "external sentinel"
+
+
+def test_clone_all_description_rejects_symlinked_profile_metadata(
+    profile_root, tmp_path
+):
+    import hermes_cli.profiles as profiles
+
+    external = tmp_path / "external-profile.yaml"
+    sentinel = b"description: external sentinel\n"
+    external.write_bytes(sentinel)
+    (profile_root / "profile.yaml").symlink_to(external)
+
+    with pytest.raises(ValueError, match="profile.yaml.*regular file"):
+        profiles.create_profile(
+            "meta-symlink",
+            clone_all=True,
+            auth_mode="shared",
+            description="must not escape staging",
+            no_alias=True,
+        )
+
+    assert external.read_bytes() == sentinel
+    assert not os.path.lexists(profile_root / "profiles" / "meta-symlink")
 
 
 def test_clone_profile_during_source_rotation_never_copies_oauth_chain(
