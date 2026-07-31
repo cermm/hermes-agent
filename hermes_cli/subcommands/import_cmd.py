@@ -28,4 +28,14 @@ def build_import_cmd_parser(subparsers, *, cmd_import: Callable) -> None:
         action="store_true",
         help="Overwrite existing files without confirmation",
     )
+    import_parser.add_argument(
+        "--auth-action",
+        choices=["skip", "restore-shared", "restore-profile"],
+        default="skip",
+        help="Explicit destination for encrypted auth in the archive",
+    )
+    import_parser.add_argument(
+        "--auth-passphrase-file",
+        help="File containing the passphrase for encrypted auth restore",
+    )
     import_parser.set_defaults(func=cmd_import)

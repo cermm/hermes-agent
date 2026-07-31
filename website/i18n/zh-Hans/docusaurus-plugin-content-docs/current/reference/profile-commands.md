@@ -82,6 +82,7 @@ hermes profile create <name> [options]
 | `--clone` | 从当前 profile 复制 `config.yaml`、`.env`、`SOUL.md` 和 skills。 |
 | `--clone-all` | 从当前 profile 复制所有内容（config、memories、skills、cron、plugins）。会排除每个 profile 自己的历史数据：sessions、`state.db`、backups、state-snapshots、checkpoints。 |
 | `--clone-from <profile>` | 从指定 profile 克隆 config/skills/SOUL，而非当前 profile。除非与 `--clone-all` 配合使用，否则会隐含 `--clone`。 |
+| `--auth-mode <shared\|profile>` | 选择新 profile 的凭据权威存储。`shared` 是安全默认值，不复制 OAuth `auth.json`；`profile` 创建空的隔离本地权威存储。克隆选项绝不会向其中导入 `auth.json` 的 OAuth 或凭据池状态；请通过独立登录或显式加密的 profile 恢复来填充该存储。其他被克隆选项选中的文件（如 `.env`）仍保持其文档所述行为。 |
 | `--no-alias` | 跳过 wrapper 脚本创建。 |
 | `--description "<text>"` | 一到两句话描述该 profile 的用途。供 kanban 编排器根据角色而非仅凭 profile 名称来路由任务。可跳过，稍后通过 `hermes profile describe` 添加。持久化保存在 `<profile_dir>/profile.yaml` 中。 |
 | `--no-skills` | 创建一个**空** profile，不启用任何内置 skill。会在 profile 目录中写入 `.no-bundled-skills` 标记，使后续 `hermes update` 不再重新植入内置 skill 集，且拒绝与 `--clone`、`--clone-from` 或 `--clone-all` 组合使用（因为这些选项会复制 skill）。适用于不应继承完整 skill 目录的窄化编排器 profile 或沙箱 profile。 |
@@ -105,7 +106,12 @@ hermes profile create work2 --clone-from work
 
 # 从指定 profile 克隆所有内容
 hermes profile create work2-backup --clone-from work --clone-all
+
+# 创建刻意隔离的 profile 本地凭据权威存储
+hermes profile create regulated --auth-mode profile
 ```
+
+创建 profile 不会把其他 profile 状态与共享认证合并。使用 `hermes auth status` 检查所选规范存储；对于已有本地存储，应使用 `hermes auth migrate-shared`，不要手工移动 `auth.json`。
 
 ## `hermes profile describe`
 

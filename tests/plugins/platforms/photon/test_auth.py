@@ -75,6 +75,68 @@ def test_store_and_load_photon_token(tmp_hermes_home: Path) -> None:
     assert auth_json["credential_pool"]["photon"][0]["access_token"] == "abc123def456"
 
 
+def test_clear_photon_token_preserves_other_rotated_credentials(tmp_hermes_home: Path) -> None:
+    auth_path = tmp_hermes_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "photon": {"access_token": "legacy-photon"},
+                    "openai-codex": {"refresh_token": "rotated-refresh"},
+                },
+                "credential_pool": {
+                    "photon": [{"access_token": "stale-photon"}],
+                    "nous": [{"access_token": "rotated-nous"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    photon_auth.clear_photon_token()
+
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert saved["providers"]["photon"] == {}
+    assert saved["credential_pool"]["photon"] == []
+    assert saved["providers"]["openai-codex"]["refresh_token"] == "rotated-refresh"
+    assert saved["credential_pool"]["nous"][0]["access_token"] == "rotated-nous"
+
+
+def test_store_photon_token_preserves_concurrent_project_rotation(
+    tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_hermes_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "photon": [{"access_token": "old-photon"}],
+                    "photon_project": [{"project_secret": "old-project"}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def rotate_project_before_save() -> int:
+        current = json.loads(auth_path.read_text(encoding="utf-8"))
+        current["credential_pool"]["photon_project"] = [
+            {"project_secret": "rotated-project"}
+        ]
+        auth_path.write_text(json.dumps(current), encoding="utf-8")
+        return 123
+
+    monkeypatch.setattr(photon_auth.time, "time", rotate_project_before_save)
+
+    photon_auth.store_photon_token("new-photon")
+
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert saved["credential_pool"]["photon"][0]["access_token"] == "new-photon"
+    assert saved["credential_pool"]["photon_project"] == [
+        {"project_secret": "rotated-project"}
+    ]
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
 def test_save_auth_never_world_readable(tmp_hermes_home: Path) -> None:
     """auth.json must be created 0o600 — no window at process umask."""
@@ -259,6 +321,43 @@ def test_create_project_omits_spectrum_flag(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["body"]["name"] == "Hermes Agent"
     assert captured["headers"]["Authorization"] == "Bearer tok"
     assert captured["url"].endswith("/api/projects")
+
+
+def test_create_project_unwraps_current_dashboard_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        photon_auth.httpx,
+        "post",
+        lambda *_args, **_kwargs: _FakeResponse(
+            json_body={"succeed": True, "data": {"id": "nested-project"}}
+        ),
+    )
+
+    assert photon_auth.create_project("tok")["id"] == "nested-project"
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ([{"id": "not-a-mapping"}], "unexpected response"),
+        ({"succeed": False, "message": "denied"}, "denied"),
+        ({"succeed": True, "data": {}}, "did not return a project id"),
+    ],
+)
+def test_create_project_rejects_invalid_dashboard_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Any,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        photon_auth.httpx,
+        "post",
+        lambda *_args, **_kwargs: _FakeResponse(json_body=response),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
+        photon_auth.create_project("tok")
 
 
 def test_regenerate_project_secret(monkeypatch: pytest.MonkeyPatch) -> None:
