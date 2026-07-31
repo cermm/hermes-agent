@@ -1001,6 +1001,8 @@ def _write_profile_auth_authority(
     profile_dir: Path,
     auth_mode: str,
     created_identity: tuple[int, int],
+    *,
+    creation_directory_fd: int | None = None,
 ) -> None:
     """Safely inject auth authority into a new profile's config.
 
@@ -1012,7 +1014,11 @@ def _write_profile_auth_authority(
     import yaml
 
     profiles_root = _get_profiles_root()
-    if os.path.abspath(profile_dir.parent) != os.path.abspath(profiles_root):
+    if (
+        creation_directory_fd is None
+        and not _IS_WINDOWS
+        and os.path.abspath(profile_dir.parent) != os.path.abspath(profiles_root)
+    ):
         raise ValueError("new profile must remain contained under the profiles directory")
 
     secure_dir_fd = (
@@ -1034,10 +1040,13 @@ def _write_profile_auth_authority(
     try:
         directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
         directory_flags |= getattr(os, "O_CLOEXEC", 0)
-        root_fd = os.open(profiles_root, directory_flags)
-        directory_fd = os.open(
-            profile_dir.name, directory_flags, dir_fd=root_fd
-        )
+        if creation_directory_fd is None:
+            root_fd = os.open(profiles_root, directory_flags)
+            directory_fd = os.open(
+                profile_dir.name, directory_flags, dir_fd=root_fd
+            )
+        else:
+            directory_fd = os.dup(creation_directory_fd)
         directory_stat = os.fstat(directory_fd)
         if not stat.S_ISDIR(directory_stat.st_mode) or (
             directory_stat.st_dev,
@@ -1371,13 +1380,15 @@ def _rollback_new_profile(profile_dir: Path, identity: tuple[int, int]) -> Path:
         candidate = profile_dir.with_name(
             f".{profile_dir.name}.rollback-{os.getpid()}-{time.time_ns()}-{attempt}"
         )
-        if not os.path.lexists(candidate):
+        try:
+            _rename_directory_noreplace(profile_dir, candidate)
+        except FileExistsError:
+            continue
+        else:
             quarantine = candidate
             break
     if quarantine is None:
         raise OSError("could not reserve a profile rollback quarantine name")
-
-    os.rename(profile_dir, quarantine)
     moved = quarantine.lstat()
     if not stat.S_ISDIR(moved.st_mode) or (
         moved.st_dev,
@@ -1387,7 +1398,7 @@ def _rollback_new_profile(profile_dir: Path, identity: tuple[int, int]) -> Path:
         # unrelated object when possible and leave the transaction inode where
         # the concurrent actor placed it; never search-and-delete by pathname.
         if not os.path.lexists(profile_dir):
-            os.rename(quarantine, profile_dir)
+            _rename_directory_noreplace(quarantine, profile_dir)
         raise RuntimeError("refusing to remove a quarantined profile whose identity changed")
     return quarantine
 
@@ -1407,19 +1418,14 @@ def _quarantine_failed_profile(
         creation_error.add_note(f"profile rollback refused: {rollback_error}")
 
 
-def _publish_new_profile(
+def _rename_directory_noreplace(
     staged_dir: Path,
     profile_dir: Path,
-    identity: tuple[int, int],
+    *,
+    source_parent_fd: int | None = None,
+    destination_parent_fd: int | None = None,
 ) -> None:
-    """Atomically publish ``staged_dir`` only if ``profile_dir`` is absent."""
-    staged = staged_dir.lstat()
-    if not stat.S_ISDIR(staged.st_mode) or (
-        staged.st_dev,
-        staged.st_ino,
-    ) != identity:
-        raise ValueError("staged profile directory identity changed before publication")
-
+    """Atomically rename one directory only when the destination is absent."""
     if _IS_WINDOWS:
         import ctypes
         from ctypes import wintypes
@@ -1450,9 +1456,9 @@ def _publish_new_profile(
         ]
         renameat2.restype = ctypes.c_int
         result = renameat2(
-            -100,
+            source_parent_fd if source_parent_fd is not None else -100,
             os.fsencode(staged_dir),
-            -100,
+            destination_parent_fd if destination_parent_fd is not None else -100,
             os.fsencode(profile_dir),
             1,  # RENAME_NOREPLACE
         )
@@ -1466,12 +1472,35 @@ def _publish_new_profile(
         import errno
 
         libc = ctypes.CDLL(None, use_errno=True)
-        renamex_np = getattr(libc, "renamex_np", None)
-        if renamex_np is None:
-            raise RuntimeError("atomic no-replace profile publication is unavailable")
-        renamex_np.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
-        renamex_np.restype = ctypes.c_int
-        if renamex_np(os.fsencode(staged_dir), os.fsencode(profile_dir), 0x00000004):
+        if source_parent_fd is not None or destination_parent_fd is not None:
+            rename_fn = getattr(libc, "renameatx_np", None)
+            if rename_fn is None:
+                raise RuntimeError("atomic no-replace profile publication is unavailable")
+            rename_fn.argtypes = [
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_int,
+                ctypes.c_char_p,
+                ctypes.c_uint,
+            ]
+            rename_fn.restype = ctypes.c_int
+            result = rename_fn(
+                source_parent_fd if source_parent_fd is not None else -2,
+                os.fsencode(staged_dir),
+                destination_parent_fd if destination_parent_fd is not None else -2,
+                os.fsencode(profile_dir),
+                0x00000004,
+            )
+        else:
+            rename_fn = getattr(libc, "renamex_np", None)
+            if rename_fn is None:
+                raise RuntimeError("atomic no-replace profile publication is unavailable")
+            rename_fn.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_uint]
+            rename_fn.restype = ctypes.c_int
+            result = rename_fn(
+                os.fsencode(staged_dir), os.fsencode(profile_dir), 0x00000004
+            )
+        if result:
             error = ctypes.get_errno()
             if error == errno.EEXIST:
                 raise FileExistsError(f"Profile path already exists: {profile_dir}")
@@ -1479,33 +1508,213 @@ def _publish_new_profile(
     else:
         raise RuntimeError("atomic no-replace profile publication is unavailable")
 
-    published = profile_dir.lstat()
-    if not stat.S_ISDIR(published.st_mode) or (
-        published.st_dev,
-        published.st_ino,
+
+def _publish_new_profile(
+    staged_dir: Path,
+    profile_dir: Path,
+    identity: tuple[int, int],
+    *,
+    staging_parent_identity: tuple[int, int],
+) -> None:
+    """Publish the staged object and undo publication if its identity changed."""
+    staged = staged_dir.lstat()
+    if not stat.S_ISDIR(staged.st_mode) or (
+        staged.st_dev,
+        staged.st_ino,
     ) != identity:
-        raise ValueError("published profile directory identity changed")
+        raise ValueError("staged profile directory identity changed before publication")
+
+    if os.name == "posix" and not _IS_WINDOWS:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        source_parent_fd = os.open(staged_dir.parent, directory_flags)
+        destination_parent_fd = os.open(profile_dir.parent, directory_flags)
+        published = False
+        try:
+            opened_parent = os.fstat(source_parent_fd)
+            if (
+                opened_parent.st_dev,
+                opened_parent.st_ino,
+            ) != staging_parent_identity:
+                raise ValueError("staged profile parent identity changed before publication")
+            _rename_directory_noreplace(
+                Path(staged_dir.name),
+                Path(profile_dir.name),
+                source_parent_fd=source_parent_fd,
+                destination_parent_fd=destination_parent_fd,
+            )
+            published = True
+            published_fd = os.open(
+                profile_dir.name,
+                directory_flags,
+                dir_fd=destination_parent_fd,
+            )
+            try:
+                published_stat = os.fstat(published_fd)
+                if not stat.S_ISDIR(published_stat.st_mode) or (
+                    published_stat.st_dev,
+                    published_stat.st_ino,
+                ) != identity:
+                    raise ValueError("published profile directory identity changed")
+            finally:
+                os.close(published_fd)
+        except BaseException:
+            if published:
+                try:
+                    _rename_directory_noreplace(
+                        Path(profile_dir.name),
+                        Path(staged_dir.name),
+                        source_parent_fd=destination_parent_fd,
+                        destination_parent_fd=source_parent_fd,
+                    )
+                except BaseException as restore_error:
+                    raise RuntimeError(
+                        "profile publication failed and could not be restored safely"
+                    ) from restore_error
+            raise
+        finally:
+            os.close(destination_parent_fd)
+            os.close(source_parent_fd)
+        return
+
+    _rename_directory_noreplace(staged_dir, profile_dir)
+    try:
+        published = profile_dir.lstat()
+        if (
+            getattr(published, "st_file_attributes", 0) & 0x00000400
+            or not stat.S_ISDIR(published.st_mode)
+            or (published.st_dev, published.st_ino) != identity
+        ):
+            raise ValueError("published profile directory identity changed")
+    except BaseException:
+        try:
+            _rename_directory_noreplace(profile_dir, staged_dir)
+        except BaseException as restore_error:
+            raise RuntimeError(
+                "profile publication failed and could not be restored safely"
+            ) from restore_error
+        raise
+
+
+@contextlib.contextmanager
+def _profile_creation_authority(
+    profile_dir: Path,
+    created_identity: tuple[int, int],
+):
+    """Keep all profile writes bound to the created directory object."""
+    secure_dir_fd = (
+        os.name == "posix"
+        and hasattr(os, "O_DIRECTORY")
+        and hasattr(os, "O_NOFOLLOW")
+        and os.open in os.supports_dir_fd
+        and os.stat in os.supports_dir_fd
+        and os.rename in os.supports_dir_fd
+    )
+    if secure_dir_fd:
+        directory_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+        directory_flags |= getattr(os, "O_CLOEXEC", 0)
+        directory_fd = os.open(profile_dir, directory_flags)
+        try:
+            opened = os.fstat(directory_fd)
+            if not stat.S_ISDIR(opened.st_mode) or (
+                opened.st_dev,
+                opened.st_ino,
+            ) != created_identity:
+                raise ValueError(
+                    "new profile directory identity changed before profile creation"
+                )
+            fd_root = Path("/proc/self/fd" if _IS_LINUX else "/dev/fd")
+            if not fd_root.is_dir():
+                raise RuntimeError(
+                    "secure profile creation requires an addressable directory descriptor"
+                )
+            yield fd_root / str(directory_fd), directory_fd
+        finally:
+            os.close(directory_fd)
+        return
+
+    if _IS_WINDOWS:
+        with _windows_profile_directory_guard(profile_dir, created_identity):
+            yield profile_dir, None
+        return
+
+    raise RuntimeError(
+        "secure profile creation requires descriptor-bound paths or a Windows "
+        "no-delete directory handle"
+    )
+
+
+def _regular_profile_leaf_exists(profile_dir: Path, name: str) -> bool:
+    """Return whether a mutable profile leaf exists and reject path escapes."""
+    path = profile_dir / name
+    try:
+        leaf = path.lstat()
+    except FileNotFoundError:
+        return False
+    if (
+        getattr(leaf, "st_file_attributes", 0) & 0x00000400
+        or not stat.S_ISREG(leaf.st_mode)
+    ):
+        raise ValueError(f"cloned {name} must be a regular file inside the new profile")
+    return True
+
+
+def _write_new_profile_leaf(
+    profile_dir: Path,
+    name: str,
+    payload: str,
+    *,
+    mode: int = 0o600,
+) -> bool:
+    """Create one regular leaf without following an occupied symlink."""
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_CLOEXEC", 0)
+    flags |= getattr(os, "O_BINARY", 0)
+    path = profile_dir / name
+    try:
+        fd = os.open(path, flags, mode)
+    except FileExistsError:
+        _regular_profile_leaf_exists(profile_dir, name)
+        return False
+    try:
+        encoded = payload.encode("utf-8")
+        view = memoryview(encoded)
+        written = 0
+        while written < len(view):
+            count = os.write(fd, view[written:])
+            if count <= 0:
+                raise OSError(f"short {name} write made no progress")
+            written += count
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, mode)
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    return True
 
 
 def _populate_staged_profile(
     profile_dir: Path,
     source_dir: Path | None,
     clone_all: bool,
+    *,
+    destination_dir: Path | None = None,
 ) -> None:
+    write_dir = destination_dir or profile_dir
     if clone_all and source_dir:
         shutil.copytree(
             source_dir,
-            profile_dir,
+            write_dir,
             symlinks=True,
             dirs_exist_ok=True,
             ignore=_clone_all_copytree_ignore(source_dir),
         )
         for stale in _CLONE_ALL_STRIP:
-            (profile_dir / stale).unlink(missing_ok=True)
+            (write_dir / stale).unlink(missing_ok=True)
         return
 
     for subdir in _PROFILE_DIRS:
-        (profile_dir / subdir).mkdir(parents=True, exist_ok=True)
+        (write_dir / subdir).mkdir(parents=True, exist_ok=True)
     if source_dir is None:
         return
 
@@ -1513,7 +1722,7 @@ def _populate_staged_profile(
         src = source_dir / filename
         if not src.exists():
             continue
-        dst = profile_dir / filename
+        dst = write_dir / filename
         shutil.copy2(src, dst)
         if filename == ".env":
             try:
@@ -1525,7 +1734,7 @@ def _populate_staged_profile(
     if source_skills.is_dir():
         shutil.copytree(
             source_skills,
-            profile_dir / "skills",
+            write_dir / "skills",
             symlinks=True,
             dirs_exist_ok=True,
         )
@@ -1533,7 +1742,7 @@ def _populate_staged_profile(
     for relpath in _CLONE_SUBDIR_FILES:
         src = source_dir / relpath
         if src.exists():
-            dst = profile_dir / relpath
+            dst = write_dir / relpath
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
 
@@ -1613,6 +1822,7 @@ def create_profile(
             )
 
     final_profile_dir.parent.mkdir(parents=True, exist_ok=True)
+    staging_parent: Path | None = None
     profile_dir: Path | None = None
     for attempt in range(16):
         candidate = final_profile_dir.with_name(
@@ -1620,145 +1830,137 @@ def create_profile(
         )
         try:
             candidate.mkdir(mode=0o700)
-            profile_dir = candidate
+            staged_child = candidate / "profile"
+            staged_child.mkdir(mode=0o700)
+            staging_parent = candidate
+            profile_dir = staged_child
             break
         except FileExistsError:
             continue
-    if profile_dir is None:
-        raise OSError("could not reserve a staged profile directory")
+    if profile_dir is None or staging_parent is None:
+        raise OSError("could not reserve a private profile staging directory")
 
+    staging_parent_stat = staging_parent.lstat()
+    staging_parent_identity = (
+        staging_parent_stat.st_dev,
+        staging_parent_stat.st_ino,
+    )
     created_stat = profile_dir.lstat()
     if not stat.S_ISDIR(created_stat.st_mode):
         raise ValueError("new profile path is not a directory")
     created_identity = (created_stat.st_dev, created_stat.st_ino)
     try:
-        _populate_staged_profile(profile_dir, source_dir, clone_all)
-    except BaseException as creation_error:
-        _quarantine_failed_profile(profile_dir, created_identity, creation_error)
-        raise
-
-    # auth.json OAuth and credential-pool content never moves during profile
-    # creation. ``profile`` creates a new empty local authority; ``shared``
-    # keeps the singleton store in place. Populating a local authority requires
-    # an independent login or an explicit encrypted restore so rotating OAuth
-    # chains are never forked. Clone options may still copy explicitly selected
-    # profile files such as .env; auth authority is intentionally separate.
-    if auth_mode == "profile":
-        from hermes_cli.auth import _auth_store_lock, _save_auth_store
-
-        local_auth = profile_dir / "auth.json"
-        try:
-            with _auth_store_lock(target_path=local_auth):
-                _save_auth_store({"providers": {}}, target_path=local_auth)
-        except BaseException as creation_error:
-            _quarantine_failed_profile(
-                profile_dir, created_identity, creation_error
+        with _profile_creation_authority(
+            profile_dir, created_identity
+        ) as (write_dir, creation_directory_fd):
+            _populate_staged_profile(
+                profile_dir,
+                source_dir,
+                clone_all,
+                destination_dir=write_dir,
             )
-            raise
 
-    # Seed an empty .env so the profile has its own credentials file from
-    # day one. Without it, profile-scoped env writes (dashboard Channels /
-    # Keys pages, `hermes -p <name> auth add`) had no file until first
-    # write, and the profile silently inherited API keys from the shell
-    # environment — users reasonably read that as "the new profile reads
-    # the root .env". Skipped when --clone/--clone-all already copied one.
-    env_path = profile_dir / ".env"
-    if not env_path.exists():
-        try:
-            env_path.write_text(
+            # auth.json OAuth and credential-pool content never moves during
+            # profile creation. ``profile`` creates a new empty local authority;
+            # ``shared`` keeps the singleton store in place.
+            if auth_mode == "profile":
+                from hermes_cli.auth import _auth_store_lock, _save_auth_store
+
+                _regular_profile_leaf_exists(write_dir, "auth.json")
+                _regular_profile_leaf_exists(write_dir, "auth.lock")
+                local_auth = write_dir / "auth.json"
+                with _auth_store_lock(target_path=local_auth):
+                    _save_auth_store({"providers": {}}, target_path=local_auth)
+
+            # Seed profile-local defaults with exclusive, no-follow creation.
+            _write_new_profile_leaf(
+                write_dir,
+                ".env",
                 "# Per-profile secrets for this Hermes profile.\n"
                 "# API keys and tokens set here override the shell environment.\n"
                 "# Behavioral settings belong in config.yaml, not here.\n",
-                encoding="utf-8",
             )
-            os.chmod(str(env_path), 0o600)
-        except OSError:
-            pass  # best-effort — save_env_value creates the file on demand
+            try:
+                from hermes_cli.default_soul import DEFAULT_SOUL_MD
 
-    # Seed a default SOUL.md so the user has a file to customize immediately.
-    # Skipped when the profile already has one (from --clone / --clone-all).
-    soul_path = profile_dir / "SOUL.md"
-    if not soul_path.exists():
-        try:
-            from hermes_cli.default_soul import DEFAULT_SOUL_MD
-            soul_path.write_text(DEFAULT_SOUL_MD, encoding="utf-8")
-        except Exception:
-            pass  # best-effort — don't fail profile creation over this
+                _write_new_profile_leaf(
+                    write_dir, "SOUL.md", DEFAULT_SOUL_MD, mode=0o644
+                )
+            except OSError:
+                pass  # best-effort — don't fail profile creation over this
 
-    # Write the opt-out marker so seed_profile_skills() and `hermes update`'s
-    # all-profile sync loop both skip this profile for bundled-skill seeding.
-    if no_skills:
-        try:
-            (profile_dir / NO_BUNDLED_SKILLS_MARKER).write_text(
-                "This profile opted out of bundled-skill seeding "
-                "(`hermes profile create --no-skills`).\n"
-                "Delete this file to re-enable sync on the next `hermes update`.\n",
-                encoding="utf-8",
-            )
-        except OSError:
-            pass  # best-effort — the feature still works via the empty skills/ dir
+            if no_skills:
+                try:
+                    _write_new_profile_leaf(
+                        write_dir,
+                        NO_BUNDLED_SKILLS_MARKER,
+                        "This profile opted out of bundled-skill seeding "
+                        "(`hermes profile create --no-skills`).\n"
+                        "Delete this file to re-enable sync on the next `hermes update`.\n",
+                        mode=0o644,
+                    )
+                except OSError:
+                    pass
 
-    # Cloned configs can be older than the running Hermes (or predate schema
-    # tracking entirely). Migrate config-only clones immediately so
-    # desktop/status surfaces don't warn that a just-created profile is
-    # v0/outdated. Leave --clone-all snapshots byte-for-byte apart from the
-    # explicit runtime/history stripping above.
-    if not clone_all:
-        try:
-            _migrate_profile_config_if_outdated(profile_dir)
-        except BaseException as creation_error:
-            _quarantine_failed_profile(
-                profile_dir, created_identity, creation_error
-            )
-            raise
+            if not clone_all:
+                _migrate_profile_config_if_outdated(write_dir)
 
-    # Persist description if the caller provided one. Done last so a
-    # partial-create failure doesn't strand a description file in an
-    # otherwise unusable profile.
-    if description and description.strip():
-        metadata_path = _profile_yaml_path(profile_dir)
-        try:
-            metadata_leaf = metadata_path.lstat()
-        except FileNotFoundError:
-            metadata_leaf = None
-        if metadata_leaf is not None and not stat.S_ISREG(metadata_leaf.st_mode):
-            creation_error = ValueError(
-                "cloned profile.yaml must be a regular file inside the new profile"
-            )
-            _quarantine_failed_profile(
-                profile_dir, created_identity, creation_error
-            )
-            raise creation_error
-        try:
-            write_profile_meta(
+            if description and description.strip():
+                metadata_path = _profile_yaml_path(write_dir)
+                try:
+                    metadata_leaf = metadata_path.lstat()
+                except FileNotFoundError:
+                    metadata_leaf = None
+                if metadata_leaf is not None and (
+                    getattr(metadata_leaf, "st_file_attributes", 0) & 0x00000400
+                    or not stat.S_ISREG(metadata_leaf.st_mode)
+                ):
+                    raise ValueError(
+                        "cloned profile.yaml must be a regular file inside the new profile"
+                    )
+                try:
+                    write_profile_meta(
+                        write_dir,
+                        description=description.strip(),
+                        description_auto=False,
+                    )
+                except OSError:
+                    pass  # non-fatal — user can describe later
+
+            _write_profile_auth_authority(
                 profile_dir,
-                description=description.strip(),
-                description_auto=False,
+                auth_mode,
+                created_identity,
+                creation_directory_fd=creation_directory_fd,
             )
-        except Exception:
-            pass  # non-fatal — user can describe later with `hermes profile describe`
+            current = profile_dir.lstat()
+            if not stat.S_ISDIR(current.st_mode) or (
+                current.st_dev,
+                current.st_ino,
+            ) != created_identity:
+                raise ValueError("new profile directory identity changed during creation")
 
-    # Authority publication is the final staged-profile mutation.  The staged
-    # directory is then atomically installed at the requested name only if that
-    # name is still absent.
-    try:
-        _write_profile_auth_authority(profile_dir, auth_mode, created_identity)
-        current = profile_dir.lstat()
-        if not stat.S_ISDIR(current.st_mode) or (
-            current.st_dev,
-            current.st_ino,
-        ) != created_identity:
-            raise ValueError("new profile directory identity changed during creation")
         _publish_new_profile(
-            profile_dir, final_profile_dir, created_identity
+            profile_dir,
+            final_profile_dir,
+            created_identity,
+            staging_parent_identity=staging_parent_identity,
         )
     except BaseException as creation_error:
         _quarantine_failed_profile(profile_dir, created_identity, creation_error)
         raise
 
-    # Register the gateway only after atomic publication. On host platforms
+    try:
+        staging_parent.rmdir()
+    except OSError:
+        pass  # private empty transaction parent; safe to retain if cleanup races
+
+    # Register the gateway only after the transaction has committed. On host platforms
     # this is a no-op; under s6 it makes the now-complete profile supervisable.
-    _maybe_register_gateway_service(canon)
+    try:
+        _maybe_register_gateway_service(canon)
+    except Exception:
+        pass  # publication committed; optional registration cannot undo success
     return final_profile_dir
 
 

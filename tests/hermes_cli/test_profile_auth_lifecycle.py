@@ -136,12 +136,13 @@ def test_auth_injection_rejects_replaced_profile_directory(
         nonlocal raced_path, swapped
         path_name = Path(path).name
         opens_target = (
-            path_name.startswith(".raced.create-")
+            path_name == "profile"
+            and Path(path).parent.name.startswith(".raced.create-")
             and flags & getattr(profiles.os, "O_DIRECTORY", 0)
         )
         if not swapped and opens_target:
             swapped = True
-            raced_path = profile_root / "profiles" / path_name
+            raced_path = Path(path)
             profiles.os.rename(raced_path, saved_created)
             profiles.os.rename(replacement, raced_path)
         return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
@@ -175,6 +176,7 @@ def test_profile_identity_remains_bound_after_authority_injection(
     replacement.mkdir()
     sentinel = replacement / "sentinel.txt"
     sentinel.write_text("external sentinel", encoding="utf-8")
+    sentinel.chmod(0o640)
 
     real_write_authority = profiles._write_profile_auth_authority
     swapped = False
@@ -182,9 +184,9 @@ def test_profile_identity_remains_bound_after_authority_injection(
     def swap_after_authority(*args, **kwargs):
         nonlocal swapped
         result = real_write_authority(*args, **kwargs)
-        if target.exists():
-            profiles.os.rename(target, saved_created)
-        profiles.os.rename(replacement, target)
+        profile_path = Path(args[0])
+        profiles.os.rename(profile_path, saved_created)
+        profiles.os.rename(replacement, profile_path)
         swapped = True
         return result
 
@@ -204,11 +206,193 @@ def test_profile_identity_remains_bound_after_authority_injection(
         )
 
     assert swapped
+    raced_path = next(
+        (profile_root / "profiles").glob(".post-authority-race.create-*/profile")
+    )
+    assert (raced_path / "sentinel.txt").read_text(encoding="utf-8") == "external sentinel"
+    assert stat.S_IMODE((raced_path / "sentinel.txt").stat().st_mode) == 0o640
+    assert {entry.name for entry in raced_path.iterdir()} == {"sentinel.txt"}
+    assert not os.path.lexists(target)
+    assert saved_created.is_dir()
+
+
+def test_pre_authority_profile_swap_cannot_redirect_generated_writes(
+    profile_root, tmp_path, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "pre-authority-race"
+    saved_created = profile_root / "profiles" / ".pre-authority-created"
+    replacement = tmp_path / "pre-authority-replacement"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel.txt"
+    sentinel.write_text("external sentinel", encoding="utf-8")
+    sentinel.chmod(0o640)
+    before = {entry.name for entry in replacement.iterdir()}
+
+    real_populate = profiles._populate_staged_profile
+    swapped_path = None
+
+    def swap_after_population(profile_dir, *args, **kwargs):
+        nonlocal swapped_path
+        result = real_populate(profile_dir, *args, **kwargs)
+        swapped_path = Path(profile_dir)
+        profiles.os.rename(swapped_path, saved_created)
+        profiles.os.rename(replacement, swapped_path)
+        return result
+
+    monkeypatch.setattr(profiles, "_populate_staged_profile", swap_after_population)
+
+    with pytest.raises((ValueError, RuntimeError), match="identity|changed|refusing"):
+        profiles.create_profile(
+            "pre-authority-race",
+            auth_mode="profile",
+            description="must stay transaction-local",
+            no_alias=True,
+        )
+
+    assert swapped_path is not None
+    assert {entry.name for entry in swapped_path.iterdir()} == before
+    moved_sentinel = swapped_path / sentinel.name
+    assert moved_sentinel.read_text(encoding="utf-8") == "external sentinel"
+    assert stat.S_IMODE(moved_sentinel.stat().st_mode) == 0o640
+    assert saved_created.is_dir()
+
+
+def test_clone_all_rejects_dangling_env_symlink_without_external_creation(
+    profile_root, tmp_path
+):
+    import hermes_cli.profiles as profiles
+
+    outside = tmp_path / "outside-env"
+    outside.mkdir()
+    external_env = outside / "created-through-symlink.env"
+    (profile_root / ".env").symlink_to(external_env)
+
+    with pytest.raises(ValueError, match=r"\.env.*regular file"):
+        profiles.create_profile(
+            "dangling-env",
+            clone_from="default",
+            clone_all=True,
+            auth_mode="shared",
+            no_alias=True,
+        )
+
+    assert not external_env.exists()
+    assert not os.path.lexists(profile_root / "profiles" / "dangling-env")
+
+
+def test_profile_creation_never_replaces_a_racing_final_directory(
+    profile_root, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "publication-race"
+    real_noreplace = profiles._rename_directory_noreplace
+    injected = False
+
+    def collide_with_publication(source, destination, **kwargs):
+        nonlocal injected
+        destination = Path(destination)
+        if not injected and destination.name == target.name:
+            target.mkdir()
+            (target / "sentinel.txt").write_text(
+                "external sentinel", encoding="utf-8"
+            )
+            injected = True
+        return real_noreplace(Path(source), destination, **kwargs)
+
+    monkeypatch.setattr(
+        profiles, "_rename_directory_noreplace", collide_with_publication
+    )
+
+    with pytest.raises(FileExistsError, match="already exists"):
+        profiles.create_profile("publication-race", auth_mode="profile", no_alias=True)
+
+    assert injected
     assert (target / "sentinel.txt").read_text(encoding="utf-8") == "external sentinel"
     assert not (target / ".env").exists()
     assert not (target / "SOUL.md").exists()
     assert not (target / "auth.json").exists()
     assert not (target / "profile.json").exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses POSIX descriptor paths")
+def test_publication_source_substitution_is_restored_not_committed(
+    profile_root, tmp_path, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "source-race"
+    replacement = tmp_path / "source-replacement"
+    replacement.mkdir()
+    sentinel = replacement / "sentinel.txt"
+    sentinel.write_text("external sentinel", encoding="utf-8")
+    real_noreplace = profiles._rename_directory_noreplace
+    raced_source = None
+    saved_created = None
+
+    def substitute_source(source, destination, **kwargs):
+        nonlocal raced_source, saved_created
+        source = Path(source)
+        destination = Path(destination)
+        source_parent_fd = kwargs.get("source_parent_fd")
+        if (
+            raced_source is None
+            and destination.name == target.name
+            and source_parent_fd is not None
+        ):
+            parent = Path(os.readlink(f"/proc/self/fd/{source_parent_fd}"))
+            raced_source = parent / source.name
+            saved_created = parent / "saved-created"
+            profiles.os.rename(raced_source, saved_created)
+            profiles.os.rename(replacement, raced_source)
+        return real_noreplace(source, destination, **kwargs)
+
+    monkeypatch.setattr(
+        profiles, "_rename_directory_noreplace", substitute_source
+    )
+
+    with pytest.raises(ValueError, match="published profile directory identity changed"):
+        profiles.create_profile("source-race", auth_mode="shared", no_alias=True)
+
+    assert raced_source is not None
+    assert saved_created is not None and saved_created.is_dir()
+    assert not os.path.lexists(target)
+    assert (raced_source / sentinel.name).read_text(encoding="utf-8") == "external sentinel"
+
+
+@pytest.mark.skipif(os.name != "posix", reason="uses POSIX dir_fd publication")
+def test_post_publication_verification_failure_restores_before_error(
+    profile_root, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    target = profile_root / "profiles" / "verify-failure"
+    real_open = profiles.os.open
+    injected = False
+
+    def fail_published_open(path, flags, *args, dir_fd=None, **kwargs):
+        nonlocal injected
+        if not injected and dir_fd is not None and Path(path).name == target.name:
+            injected = True
+            raise OSError("forced post-publication verification failure")
+        return real_open(path, flags, *args, dir_fd=dir_fd, **kwargs)
+
+    supported_dir_fd = set(profiles.os.supports_dir_fd)
+    supported_dir_fd.discard(real_open)
+    supported_dir_fd.add(fail_published_open)
+    monkeypatch.setattr(profiles.os, "open", fail_published_open)
+    monkeypatch.setattr(profiles.os, "supports_dir_fd", supported_dir_fd)
+
+    with pytest.raises(OSError, match="forced post-publication verification failure"):
+        profiles.create_profile("verify-failure", auth_mode="shared", no_alias=True)
+
+    assert injected
+    assert not os.path.lexists(target)
+    containers = list((profile_root / "profiles").glob(".verify-failure.create-*"))
+    assert len(containers) == 1
+    assert list(containers[0].glob(".profile.rollback-*"))
 
 
 def test_portable_authority_injection_fails_closed_on_directory_swap(
@@ -256,7 +440,7 @@ def test_portable_authority_injection_fails_closed_on_directory_swap(
     assert not os.path.lexists(target)
 
 
-def test_supported_portable_profile_creation_publishes_authority(
+def test_supported_portable_profile_creation_writes_authority(
     profile_root, monkeypatch
 ):
     import contextlib
@@ -275,7 +459,7 @@ def test_supported_portable_profile_creation_publishes_authority(
         restype = None
 
         def __call__(self, source, destination, flags):
-            assert flags == 0, "Windows publication must not replace an existing target"
+            assert flags == 0
             os.rename(source, destination)
             return 1
 
@@ -393,6 +577,7 @@ def test_rollback_never_recursively_deletes_replacement_directory(
 
     real_rename = profiles.os.rename
     real_rmtree = profiles.shutil.rmtree
+    real_noreplace = getattr(profiles, "_rename_directory_noreplace")
     swapped = False
 
     swapped_path = None
@@ -406,10 +591,10 @@ def test_rollback_never_recursively_deletes_replacement_directory(
         real_rename(path, saved_created)
         real_rename(replacement, path)
 
-    def swap_before_quarantine(source, destination, *args, **kwargs):
+    def swap_before_quarantine(source, destination):
         if ".rollback-" in Path(destination).name:
             swap_once(Path(source))
-        return real_rename(source, destination, *args, **kwargs)
+        return real_noreplace(Path(source), Path(destination))
 
     def swap_before_legacy_rmtree(path, *args, **kwargs):
         if Path(path).name.startswith(".rollback-race.create-"):
@@ -417,11 +602,9 @@ def test_rollback_never_recursively_deletes_replacement_directory(
         return real_rmtree(path, *args, **kwargs)
 
     monkeypatch.setattr(profiles, "_write_profile_auth_authority", fail_authority_write)
-    supported_dir_fd = set(profiles.os.supports_dir_fd)
-    supported_dir_fd.discard(real_rename)
-    supported_dir_fd.add(swap_before_quarantine)
-    monkeypatch.setattr(profiles.os, "rename", swap_before_quarantine)
-    monkeypatch.setattr(profiles.os, "supports_dir_fd", supported_dir_fd)
+    monkeypatch.setattr(
+        profiles, "_rename_directory_noreplace", swap_before_quarantine
+    )
     monkeypatch.setattr(profiles.shutil, "rmtree", swap_before_legacy_rmtree)
 
     with pytest.raises(ValueError, match="forced authority failure"):
@@ -434,7 +617,43 @@ def test_rollback_never_recursively_deletes_replacement_directory(
     assert saved_created.is_dir(), "unsafe cleanup must retain the transaction inode"
 
 
-def test_downstream_failure_rolls_staged_profile_out_of_creation_namespace(
+def test_rollback_quarantine_publication_never_replaces_a_racing_directory(
+    profile_root, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    real_noreplace = getattr(profiles, "_rename_directory_noreplace")
+    injected = None
+
+    def fail_authority_write(*_args, **_kwargs):
+        raise ValueError("forced authority failure")
+
+    def collide_with_quarantine(source, destination):
+        nonlocal injected
+        destination = Path(destination)
+        if injected is None and ".rollback-" in destination.name:
+            destination.mkdir()
+            injected = destination
+        return real_noreplace(Path(source), destination)
+
+    monkeypatch.setattr(profiles, "_write_profile_auth_authority", fail_authority_write)
+    monkeypatch.setattr(
+        profiles, "_rename_directory_noreplace", collide_with_quarantine
+    )
+
+    with pytest.raises(ValueError, match="forced authority failure"):
+        profiles.create_profile(
+            "rollback-destination-race", auth_mode="shared", no_alias=True
+        )
+
+    assert injected is not None
+    assert injected.is_dir(), "no-replace quarantine must preserve a racing directory"
+    assert not os.path.lexists(
+        profile_root / "profiles" / "rollback-destination-race"
+    )
+
+
+def test_downstream_failure_quarantines_profile_out_of_creation_namespace(
     profile_root, monkeypatch
 ):
     import hermes_cli.profiles as profiles
@@ -458,9 +677,32 @@ def test_downstream_failure_rolls_staged_profile_out_of_creation_namespace(
 
     profiles_root = profile_root / "profiles"
     assert not os.path.lexists(profiles_root / "full-transaction")
-    assert not list(profiles_root.glob(".full-transaction.create-*"))
-    assert list(profiles_root.glob("..full-transaction.create-*.rollback-*"))
+    containers = list(profiles_root.glob(".full-transaction.create-*"))
+    assert len(containers) == 1
+    assert not (containers[0] / "profile").exists()
+    assert list(containers[0].glob(".profile.rollback-*"))
     assert gateway_registrations == []
+
+
+def test_postcommit_gateway_probe_failure_does_not_report_creation_failure(
+    profile_root, monkeypatch
+):
+    import hermes_cli.profiles as profiles
+
+    def fail_gateway_probe(_name):
+        raise OSError("forced post-commit gateway probe failure")
+
+    monkeypatch.setattr(profiles, "_maybe_register_gateway_service", fail_gateway_probe)
+
+    created = profiles.create_profile(
+        "postcommit-gateway", auth_mode="shared", no_alias=True
+    )
+
+    assert created == profile_root / "profiles" / "postcommit-gateway"
+    assert created.is_dir()
+    assert yaml.safe_load((created / "config.yaml").read_text())["auth"][
+        "authority"
+    ] == "shared"
 
 
 def test_posix_rollback_never_rmdirs_a_last_moment_replacement(
@@ -533,7 +775,9 @@ def test_portable_rollback_never_rmtrees_a_replaced_profile(
     monkeypatch.setattr(profiles.os, "supports_dir_fd", set())
     monkeypatch.setattr(profiles.shutil, "rmtree", swap_inside_rmtree)
 
-    with pytest.raises((ValueError, RuntimeError), match="forced|secure directory"):
+    with pytest.raises(
+        (ValueError, RuntimeError), match="forced|secure directory|descriptor-bound"
+    ):
         profiles.create_profile("portable-rmtree-race", auth_mode="shared", no_alias=True)
 
     assert not swapped, "rollback must not recursively delete by pathname"
