@@ -33,7 +33,7 @@ import threading
 import time
 import uuid
 import webbrowser
-from contextlib import contextmanager
+from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, HTTPServer
@@ -49,7 +49,8 @@ from hermes_cli.config import (
     read_raw_config,
     require_readable_config_before_write,
 )
-from hermes_constants import OPENROUTER_BASE_URL, secure_parent_dir
+from hermes_constants import OPENROUTER_BASE_URL, get_default_hermes_root, secure_parent_dir
+from hermes_cli.auth_authority import describe_auth_store, resolve_auth_authority
 from agent.credential_persistence import sanitize_borrowed_credential_payload
 from utils import atomic_replace, atomic_yaml_write, env_float, is_truthy_value
 
@@ -903,14 +904,21 @@ def _oauth_trace(event: str, *, sequence_id: Optional[str] = None, **fields: Any
 # =============================================================================
 
 def _auth_file_path() -> Path:
-    path = get_hermes_home() / "auth.json"
+    pinned_path = getattr(_auth_transaction_target, "path", None)
+    path = pinned_path if pinned_path is not None else resolve_auth_authority().auth_path
     # Seat belt: if pytest is running and HERMES_HOME resolves to the real
     # user's auth store, refuse rather than silently corrupt it. This catches
     # tests that forgot to monkeypatch HERMES_HOME, tests invoked without the
     # hermetic conftest, or sandbox escapes via threads/subprocesses. In
     # production (no PYTEST_CURRENT_TEST) this is a single dict lookup.
     if os.environ.get("PYTEST_CURRENT_TEST"):
-        real_home_auth = (Path.home() / ".hermes" / "auth.json").resolve(strict=False)
+        # Use the unmodified HOME environment, not Path.home(): profile tests
+        # intentionally monkeypatch Path.home() so the synthetic shared root is
+        # still resolvable. The guard must compare against the actual operator
+        # home, matching _load_global_auth_store().
+        real_home_auth = (
+            Path(os.environ.get("HOME", str(Path.home()))) / ".hermes" / "auth.json"
+        ).resolve(strict=False)
         try:
             resolved = path.resolve(strict=False)
         except Exception:
@@ -934,25 +942,17 @@ def _global_auth_file_path() -> Optional[Path]:
 
     See issue #18594 follow-up (credential_pool shadowing).
     """
-    try:
-        from hermes_constants import get_default_hermes_root
-        global_root = get_default_hermes_root()
-    except Exception:
+    authority = resolve_auth_authority()
+    # A configured authority is singular: shared/profile modes never
+    # overlay one store on another. Preserve the old profile-to-root fallback
+    # only while an existing profile-local store is selected by the bounded
+    # legacy compatibility rule (auth.authority is absent).
+    if not authority.legacy_compatibility:
         return None
-    profile_home = get_hermes_home()
-    try:
-        if profile_home.resolve(strict=False) == global_root.resolve(strict=False):
-            return None
-    except Exception:
-        if profile_home == global_root:
-            return None
     # No pytest seat belt here: this is a pure read-only path, and
     # ``_load_global_auth_store()`` wraps the read in a try/except so an
-    # unreadable global file can never break the profile process.  The
-    # write-side seat belt still lives on ``_auth_file_path()`` where it
-    # belongs (that's what protects the real user's auth store from being
-    # corrupted by a mis-configured test).
-    return global_root / "auth.json"
+    # unreadable global file can never break the profile process.
+    return authority.shared_root / "auth.json"
 
 
 def _load_global_auth_store() -> Dict[str, Any]:
@@ -997,6 +997,8 @@ def _auth_lock_path() -> Path:
 
 _auth_target_lock_holders: Dict[str, threading.local] = {}
 _auth_target_lock_holders_guard = threading.Lock()
+_auth_transaction_target = threading.local()
+_auth_transition_lock_holder = threading.local()
 
 
 def _same_path(left: Path, right: Path) -> bool:
@@ -1014,6 +1016,14 @@ def _auth_lock_holder_for(target_path: Path) -> threading.local:
         key = str(target_path)
     with _auth_target_lock_holders_guard:
         return _auth_target_lock_holders.setdefault(key, threading.local())
+
+
+def _validate_locked_store_path(path: Path) -> None:
+    """Fail closed if a locked transaction target was replaced by a link."""
+    if path.is_symlink():
+        raise RuntimeError(f"Refusing symlink auth transaction path: {path}")
+    if path.exists() and not path.is_file():
+        raise RuntimeError(f"Auth transaction path must be a regular file: {path}")
 
 
 @contextmanager
@@ -1089,32 +1099,178 @@ def _file_lock(
 
 
 @contextmanager
+def _auth_transition_lock(timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS):
+    """Gate topology changes ahead of every auth-store acquisition.
+
+    Runtime transactions hold this lock only until their complete, canonically
+    ordered store-lock set has been acquired. Migrations hold it for the whole
+    topology transition. This gives one total order (transition -> stores)
+    without serializing unrelated profile-local transactions for their full
+    duration.
+    """
+    lock_path = get_default_hermes_root().resolve(strict=False) / "auth-transition.lock"
+    with _file_lock(
+        lock_path,
+        _auth_transition_lock_holder,
+        timeout_seconds,
+        "Timed out waiting for auth authority transition lock",
+    ):
+        yield
+
+
+@contextmanager
+def _auth_store_locks(
+    target_paths: Optional[Iterable[Path]] = None,
+    *,
+    transaction_target: Optional[Path] = None,
+    include_legacy_fallback: bool = False,
+    timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
+):
+    """Acquire a transaction's complete store-lock set in canonical order."""
+    pinned_path = getattr(_auth_transaction_target, "path", None)
+    if pinned_path is not None:
+        if target_paths is None:
+            paths = {Path(pinned_path).resolve(strict=False)}
+        else:
+            raw_paths = {Path(path) for path in target_paths}
+            for path in raw_paths:
+                _validate_locked_store_path(path)
+            paths = {path.resolve(strict=False) for path in raw_paths}
+        held_paths = getattr(_auth_transaction_target, "locked_paths", frozenset())
+        if not paths.issubset(held_paths):
+            raise RuntimeError(
+                "Nested auth transaction cannot expand its store-lock set"
+            )
+        active_path = Path(transaction_target or pinned_path).resolve(strict=False)
+        with ExitStack() as nested_stack:
+            for path in sorted(paths, key=lambda item: os.fsencode(str(item))):
+                nested_stack.enter_context(
+                    _file_lock(
+                        path.with_suffix(".lock"),
+                        _auth_lock_holder_for(path),
+                        timeout_seconds,
+                        "Timed out waiting for auth store lock",
+                    )
+                )
+            for path in paths:
+                _validate_locked_store_path(path)
+            yield active_path, getattr(_auth_transaction_target, "fallback_path", None)
+        return
+
+    stack = ExitStack()
+    try:
+        with _auth_transition_lock(timeout_seconds):
+            fallback_path: Optional[Path] = None
+            if target_paths is None:
+                active_path = _auth_file_path()
+                paths = {active_path}
+                if include_legacy_fallback:
+                    fallback_path = _global_auth_file_path()
+                    if fallback_path is not None:
+                        paths.add(fallback_path)
+            else:
+                raw_paths = {Path(path) for path in target_paths}
+                for path in raw_paths:
+                    _validate_locked_store_path(path)
+                paths = {path.resolve(strict=False) for path in raw_paths}
+                if not paths:
+                    raise ValueError("at least one auth-store target is required")
+                active_path = Path(
+                    transaction_target
+                    or min(paths, key=lambda path: os.fsencode(str(path)))
+                ).resolve(strict=False)
+            for path in sorted(paths, key=lambda item: os.fsencode(str(item))):
+                stack.enter_context(
+                    _file_lock(
+                        path.with_suffix(".lock"),
+                        _auth_lock_holder_for(path),
+                        timeout_seconds,
+                        "Timed out waiting for auth store lock",
+                    )
+                )
+            for path in paths:
+                _validate_locked_store_path(path)
+
+        previous = getattr(_auth_transaction_target, "path", None)
+        _auth_transaction_target.path = active_path
+        _auth_transaction_target.locked_paths = frozenset(paths)
+        _auth_transaction_target.fallback_path = fallback_path
+        try:
+            yield active_path, fallback_path
+        finally:
+            if previous is None:
+                try:
+                    del _auth_transaction_target.path
+                except AttributeError:
+                    pass
+                for attribute in ("locked_paths", "fallback_path"):
+                    try:
+                        delattr(_auth_transaction_target, attribute)
+                    except AttributeError:
+                        pass
+            else:
+                _auth_transaction_target.path = previous
+    finally:
+        stack.close()
+
+
+@contextmanager
 def _auth_store_lock(
     timeout_seconds: float = AUTH_LOCK_TIMEOUT_SECONDS,
     *,
     target_path: Optional[Path] = None,
 ):
-    """Cross-process advisory lock for one auth.json read/write transaction.
-
-    ``target_path`` is required for profile-to-global write-throughs. A profile
-    lock does not protect the distinct global auth store; each path therefore
-    uses its own reentrancy tracker and kernel lock.
-
-    Lock ordering invariant: when this lock is held together with
-    ``_nous_shared_store_lock``, acquire ``_auth_store_lock`` FIRST
-    (outer) and the shared Nous lock SECOND (inner). All runtime
-    refresh paths follow this order; violating it risks deadlock
-    against a concurrent import on the shared store.
-    """
-    auth_path = target_path if target_path is not None else _auth_file_path()
-    lock_path = auth_path.with_suffix(".lock") if target_path is not None else _auth_lock_path()
-    with _file_lock(
-        lock_path,
-        _auth_lock_holder_for(auth_path),
-        timeout_seconds,
-        "Timed out waiting for auth store lock",
+    """Lock one auth store after pinning its authority under the transition gate."""
+    paths = None if target_path is None else (target_path,)
+    with _auth_store_locks(
+        paths,
+        transaction_target=target_path,
+        timeout_seconds=timeout_seconds,
     ):
         yield
+
+
+def _validate_auth_store_structure(raw: Any) -> Dict[str, Any]:
+    """Reject section types that alternate auth-store loaders could misread."""
+    if not isinstance(raw, dict):
+        raise ValueError("auth store must be a JSON object")
+    for section in ("providers", "credential_pool"):
+        if section in raw and not isinstance(raw[section], dict):
+            raise ValueError(f"auth store {section} section must be a mapping")
+    return raw
+
+
+def _quarantine_auth_store(auth_file: Path, reason: Exception) -> Dict[str, Any]:
+    corrupt_path = auth_file.with_suffix(".json.corrupt")
+    preserved = False
+    try:
+        import shutil
+
+        shutil.copy2(auth_file, corrupt_path)
+        preserved = True
+    except Exception:
+        logger.debug(
+            "auth: could not preserve a copy of the corrupt store at %s",
+            corrupt_path,
+            exc_info=True,
+        )
+    if preserved:
+        logger.warning(
+            "auth: failed to parse %s (%s), starting with empty store. "
+            "Corrupt file preserved at %s",
+            auth_file,
+            reason,
+            corrupt_path,
+        )
+    else:
+        logger.warning(
+            "auth: failed to parse %s (%s), starting with empty store. "
+            "A copy could NOT be preserved at %s",
+            auth_file,
+            reason,
+            corrupt_path,
+        )
+    return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
 def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
@@ -1123,7 +1279,9 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         return {"version": AUTH_STORE_VERSION, "providers": {}}
 
     try:
-        raw = json.loads(auth_file.read_text(encoding="utf-8"))
+        raw = _validate_auth_store_structure(
+            json.loads(auth_file.read_text(encoding="utf-8"))
+        )
     except OSError:
         # The file exists (checked above) but could not be READ: EMFILE under
         # fd exhaustion, EACCES, EIO, a stalled network mount. None of those
@@ -1138,32 +1296,7 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
         )
         raise
     except Exception as exc:
-        # Genuine corruption: unparseable JSON, or bytes that are not UTF-8.
-        corrupt_path = auth_file.with_suffix(".json.corrupt")
-        preserved = False
-        try:
-            import shutil
-            shutil.copy2(auth_file, corrupt_path)
-            preserved = True
-        except Exception:
-            logger.debug(
-                "auth: could not preserve a copy of the corrupt store at %s",
-                corrupt_path, exc_info=True,
-            )
-        if preserved:
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "Corrupt file preserved at %s",
-                auth_file, exc, corrupt_path,
-            )
-        else:
-            # Do not advertise a backup that was never written.
-            logger.warning(
-                "auth: failed to parse %s (%s), starting with empty store. "
-                "A copy could NOT be preserved at %s",
-                auth_file, exc, corrupt_path,
-            )
-        return {"version": AUTH_STORE_VERSION, "providers": {}}
+        return _quarantine_auth_store(auth_file, exc)
 
     if isinstance(raw, dict) and (
         isinstance(raw.get("providers"), dict)
@@ -1186,7 +1319,12 @@ def _load_auth_store(auth_file: Optional[Path] = None) -> Dict[str, Any]:
     return {"version": AUTH_STORE_VERSION, "providers": {}}
 
 
-def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = None) -> Path:
+def _save_auth_store(
+    auth_store: Dict[str, Any],
+    target_path: Optional[Path] = None,
+    *,
+    updated_at: Optional[str] = None,
+) -> Path:
     # target_path=None preserves the existing contract (write the active
     # store at _auth_file_path()). An explicit path lets callers persist a
     # specific store — e.g. the global-root write-through for rotating xAI
@@ -1199,7 +1337,7 @@ def _save_auth_store(auth_store: Dict[str, Any], target_path: Optional[Path] = N
     # secure_parent_dir refuses to chmod / or top-level dirs (#25821).
     secure_parent_dir(auth_file)
     auth_store["version"] = AUTH_STORE_VERSION
-    auth_store["updated_at"] = datetime.now(timezone.utc).isoformat()
+    auth_store["updated_at"] = updated_at or datetime.now(timezone.utc).isoformat()
     payload = json.dumps(auth_store, indent=2) + "\n"
     tmp_path = auth_file.with_name(f"{auth_file.name}.tmp.{os.getpid()}.{uuid.uuid4().hex}")
     try:
@@ -1279,26 +1417,17 @@ def _provider_state_transaction(provider_id: str):
     target lock is acquired prevents both stale refreshes and whole-file lost
     updates without inverting the documented auth -> shared lock order.
     """
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
-        state, source_path = _load_provider_state_with_source(
-            auth_store,
-            provider_id,
+    with _auth_store_locks(include_legacy_fallback=True) as (active_path, _fallback_path):
+        auth_store = _load_auth_store(active_path)
+        source_state, source_path = _load_provider_state_with_source(
+            auth_store, provider_id
         )
-        active_path = _auth_file_path()
-        if source_path is None or _same_path(source_path, active_path):
-            yield auth_store, state, source_path
-            return
-
-        with _auth_store_lock(target_path=source_path):
-            source_store = _load_auth_store(source_path)
-            source_providers = source_store.get("providers")
-            source_state = None
-            if isinstance(source_providers, dict):
-                raw_state = source_providers.get(provider_id)
-                if isinstance(raw_state, dict):
-                    source_state = dict(raw_state)
-            yield auth_store, source_state, source_path
+        # Test doubles and compatibility callers may provide state without a
+        # source path; while this transaction owns the active lock, that state
+        # is necessarily active-store state for persistence purposes.
+        if source_state is not None and source_path is None:
+            source_path = active_path
+        yield auth_store, source_state, source_path
 
 
 def _load_provider_state(auth_store: Dict[str, Any], provider_id: str) -> Optional[Dict[str, Any]]:
@@ -4492,8 +4621,11 @@ def _save_xai_oauth_tokens(
     """
     if last_refresh is None:
         last_refresh = datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
-    with _auth_store_lock():
-        auth_store = _load_auth_store()
+    with _provider_state_transaction("xai-oauth") as (
+        auth_store,
+        inherited_state,
+        source_path,
+    ):
         # A profile that lacks its own xai-oauth block is reading the root
         # grant through _load_provider_state's fallback. When such a profile
         # refreshes the (rotating) grant, we must write the rotated chain back
@@ -4502,13 +4634,9 @@ def _save_xai_oauth_tokens(
         # decided write-through based on whether the profile had a
         # providers.xai-oauth key BEFORE the save — but _store_provider_state
         # unconditionally creates that key below. Use
-        # _load_provider_state_with_source to learn where the grant was
-        # resolved from and write back only to that source.
-        state, source_path = _load_provider_state_with_source(
-            auth_store, "xai-oauth"
-        )
-        if state is None:
-            state = {}
+        # the source path returned by the authority-bound transaction to learn
+        # where the grant was resolved from and write back only to that source.
+        state = inherited_state or {}
         state["tokens"] = tokens
         state["last_refresh"] = last_refresh
         state["auth_mode"] = auth_mode
@@ -7645,8 +7773,7 @@ def _login_openai_codex(
     config_path = _update_config_for_provider("openai-codex", creds.get("base_url", DEFAULT_CODEX_BASE_URL))
     print()
     print("Login successful!")
-    from hermes_constants import display_hermes_home as _dhh
-    print(f"  Auth state: {_dhh()}/auth.json")
+    print(f"  Auth state: {describe_auth_store()}")
     print(f"  Config updated: {config_path} (model.provider=openai-codex)")
 
 
@@ -7713,8 +7840,7 @@ def _login_xai_oauth(
     config_path = _update_config_for_provider("xai-oauth", creds.get("base_url", DEFAULT_XAI_OAUTH_BASE_URL))
     print()
     print("Login successful!")
-    from hermes_constants import display_hermes_home as _dhh
-    print(f"  Auth state: {_dhh()}/auth.json")
+    print(f"  Auth state: {describe_auth_store()}")
     print(f"  Config updated: {config_path} (model.provider=xai-oauth)")
 
 
