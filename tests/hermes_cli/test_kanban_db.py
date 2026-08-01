@@ -2549,6 +2549,42 @@ def test_configured_worktree_root_has_no_environment_override(monkeypatch):
     assert kb._configured_worktree_root() is None
 
 
+@pytest.mark.parametrize("forbidden_root", ["/tmp/worktrees", "/mnt/c/Users/Michal/worktrees"])
+def test_configured_worktree_root_rejects_forbidden_global_roots(
+    monkeypatch, forbidden_root
+):
+    import hermes_cli.config as config
+
+    monkeypatch.setattr(
+        config,
+        "load_config_readonly",
+        lambda: {"kanban": {"worktree_root": forbidden_root}},
+    )
+    with pytest.raises(ValueError, match="must not be under"):
+        kb._configured_worktree_root()
+
+
+def test_configured_worktree_root_rejects_repo_local_policy_root(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    monkeypatch.setattr(
+        kb, "_configured_worktree_root", lambda: (repo / ".worktrees").resolve()
+    )
+    kb.create_board("repo-local-policy", default_workdir=str(repo))
+
+    with kb.connect(board="repo-local-policy") as conn:
+        with pytest.raises(ValueError, match="outside every git repository"):
+            kb.create_task(
+                conn,
+                title="reject repo-local root",
+                workspace_kind="worktree",
+                board="repo-local-policy",
+            )
+
+
 # ---------------------------------------------------------------------------
 # Scratch cleanup containment (#28818)
 # ---------------------------------------------------------------------------

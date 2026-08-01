@@ -5444,7 +5444,13 @@ def _configured_worktree_root() -> Optional[Path]:
         raise ValueError(
             f"kanban.worktree_root must be an absolute path, got {str(raw)!r}"
         )
-    return root.resolve(strict=False)
+    resolved = root.resolve(strict=False)
+    for forbidden in (Path("/tmp"), Path("/mnt/c")):
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise ValueError(
+                f"kanban.worktree_root must not be under {forbidden}: {resolved}"
+            )
+    return resolved
 
 
 def _git_remote_origin(repo_root: Path) -> Optional[str]:
@@ -5493,7 +5499,20 @@ def _remote_owner_repo_namespace(repo_root: Path) -> str:
 
 
 def _configured_worktree_namespace(repo_root: Path, policy_root: Path) -> Path:
-    return (policy_root / _remote_owner_repo_namespace(repo_root)).resolve(strict=False)
+    resolved_root = policy_root.resolve(strict=False)
+    resolved_repo = repo_root.resolve(strict=False)
+    containing_repo = _repo_root_for_worktree_target(resolved_root)
+    if (
+        resolved_root == resolved_repo
+        or resolved_repo in resolved_root.parents
+        or containing_repo is not None
+    ):
+        raise ValueError(
+            f"kanban.worktree_root must be outside every git repository: {resolved_root}"
+        )
+    return (resolved_root / _remote_owner_repo_namespace(repo_root)).resolve(
+        strict=False
+    )
 
 
 def _validate_configured_worktree_target(

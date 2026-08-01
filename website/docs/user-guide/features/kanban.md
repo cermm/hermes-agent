@@ -696,6 +696,8 @@ kanban:
 
 Set the value with `hermes config set kanban.worktree_root /absolute/path`. Restart the gateway before relying on the policy for unattended dispatch; clearing the key and restarting rolls back to legacy placement. Existing targets outside the configured namespace fail closed rather than being silently moved.
 
+The root is profile-global and has no environment-variable override. It must be an absolute external Linux path: Hermes rejects roots under `/tmp`, `/mnt/c`, or any Git repository. In policy mode Hermes derives `<owner>-<repo>` from the source repository's `remote.origin.url`, persists the canonical target at card creation, and revalidates it before every materialization or reclaim. Explicit targets must be direct children of that namespace; traversal, symlink escapes, prefix lookalikes, repository-local `.worktrees`, and paths outside the configured root are rejected.
+
 ### Scheduled task starts (`scheduled_at`)
 
 Set `scheduled_at` on a task to delay dispatch until a specific time. The dispatcher skips ready tasks whose `scheduled_at` is in the future and picks them up on the first tick after that timestamp.
