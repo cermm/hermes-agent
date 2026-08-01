@@ -1087,11 +1087,15 @@ class CredentialPool:
                 else:
                     return
 
-                global_root = _global_auth_file_path()
+                # Resolve through the authority module at call time. Besides
+                # keeping one authority source of truth, this avoids a stale
+                # function binding when tests or embedders replace the path
+                # resolver after credential_pool was imported.
+                global_root = auth_mod._global_auth_file_path()
                 is_from_root = bool(
                     source_path is not None
                     and global_root is not None
-                    and _same_path(source_path, global_root)
+                    and auth_mod._same_path(source_path, global_root)
                 )
 
                 if self.provider == "nous":
