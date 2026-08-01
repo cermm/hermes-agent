@@ -4,6 +4,8 @@ worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +40,60 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     # Deterministic branch: <slug>/<task-id>-<title-slug>. NOT a random wt/...
     assert task.branch_name == f"{proj.slug}/{tid}-add-login"
     assert not task.branch_name.startswith("wt/")
+
+
+def test_project_linked_task_uses_configured_external_root(
+    kanban_conn, tmp_path, monkeypatch
+):
+    repo = tmp_path / "webapp"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    (repo / "README.md").write_text("webapp\n", encoding="utf-8")
+    for args in (
+        ["config", "user.name", "Test User"],
+        ["config", "user.email", "test@example.invalid"],
+        ["add", "README.md"],
+        ["commit", "-m", "init"],
+    ):
+        subprocess.run(
+            ["git", "-C", str(repo), *args],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "git@github.com:acme/webapp.git",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    policy_root = tmp_path / "external-worktrees"
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    proj = _make_project(name="External Web App", repo=str(repo))
+
+    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
+    task = kb.get_task(kanban_conn, tid)
+    expected = policy_root / "acme-webapp" / tid
+
+    assert task is not None
+    assert task.workspace_path == str(expected)
+    assert task.branch_name == f"{proj.slug}/{tid}-add-login"
+    assert kb.resolve_workspace(task) == expected
+    assert expected.is_dir()
+    assert not (repo / ".worktrees").exists()
 
 
 def test_explicit_branch_overrides_project_default(kanban_conn):
