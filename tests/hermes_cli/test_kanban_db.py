@@ -38,6 +38,15 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _set_remote_origin(repo: Path, remote: str = "git@github.com:acme/widgets.git") -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", remote],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -2344,6 +2353,200 @@ def test_dispatch_worktree_task_rerun_reuses_existing_linked_worktree_and_branch
     assert listed.count(f"worktree {expected}\n") == 1
     assert f"worktree {expected}/.worktrees/{tid}" not in listed
     assert f"branch refs/heads/{actual_branch}" in listed
+
+
+def test_configured_worktree_root_persists_canonical_target_before_dispatch_and_reuses(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt", default_workdir=str(repo))
+
+    with kb.connect(board="external-wt") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            board="external-wt",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        expected = policy_root / "acme-widgets" / tid
+        assert task.workspace_path == str(expected)
+        assert not expected.exists()
+
+        first = kb.resolve_workspace(task, board="external-wt")
+        kb.set_workspace_path(conn, tid, first)
+        refreshed = kb.get_task(conn, tid)
+        assert refreshed is not None
+        second = kb.resolve_workspace(refreshed, board="external-wt")
+
+    assert first == expected
+    assert second == expected
+    assert expected.exists()
+    assert not (repo / ".worktrees").exists()
+    listed = subprocess.run(
+        ["git", "-C", str(repo), "worktree", "list", "--porcelain"],
+        check=True,
+        capture_output=True,
+        text=True,
+    ).stdout
+    assert listed.count(f"worktree {expected}\n") == 1
+
+
+def test_configured_worktree_root_idempotent_retry_converges_legacy_anchor(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    active_root = [None]
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: active_root[0])
+    kb.create_board("external-wt-idempotent", default_workdir=str(repo))
+
+    with kb.connect(board="external-wt-idempotent") as conn:
+        tid = kb.create_task(
+            conn,
+            title="ship",
+            workspace_kind="worktree",
+            idempotency_key="same-card",
+            board="external-wt-idempotent",
+        )
+        legacy = kb.get_task(conn, tid)
+        assert legacy is not None
+        assert legacy.workspace_path == str(repo)
+
+        active_root[0] = policy_root.resolve()
+        repeated = kb.create_task(
+            conn,
+            title="ship retry",
+            workspace_kind="worktree",
+            idempotency_key="same-card",
+            board="external-wt-idempotent",
+        )
+        converged = kb.get_task(conn, tid)
+
+    assert repeated == tid
+    assert converged is not None
+    assert converged.workspace_path == str(policy_root / "acme-widgets" / tid)
+
+
+@pytest.mark.parametrize(
+    "target_factory",
+    [
+        lambda repo, root: repo / ".worktrees" / "repo-local",
+        lambda repo, root: Path("/tmp/kanban-worktree-escape"),
+        lambda repo, root: Path("/mnt/c/Users/Michal/worktrees/windows-side"),
+        lambda repo, root: Path(str(root) + "-lookalike") / "acme-widgets" / "card",
+        lambda repo, root: root / "acme-widgets" / "nested" / "card",
+        lambda repo, root: root / "acme-widgets" / ".." / "escape",
+    ],
+)
+def test_configured_worktree_root_rejects_targets_outside_direct_namespace(
+    kanban_home, tmp_path, monkeypatch, target_factory
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt-reject", default_workdir=str(repo))
+    target = target_factory(repo, policy_root)
+
+    with kb.connect(board="external-wt-reject") as conn:
+        with pytest.raises(ValueError, match="direct child"):
+            kb.create_task(
+                conn,
+                title="escape",
+                workspace_kind="worktree",
+                workspace_path=str(target),
+                board="external-wt-reject",
+            )
+
+
+def test_configured_worktree_root_rejects_symlink_escape_at_create(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    namespace = policy_root / "acme-widgets"
+    outside = tmp_path / "outside"
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    namespace.mkdir(parents=True)
+    outside.mkdir()
+    (namespace / "escape").symlink_to(outside, target_is_directory=True)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt-symlink", default_workdir=str(repo))
+
+    with kb.connect(board="external-wt-symlink") as conn:
+        with pytest.raises(ValueError, match="direct child"):
+            kb.create_task(
+                conn,
+                title="escape",
+                workspace_kind="worktree",
+                workspace_path=str(namespace / "escape"),
+                board="external-wt-symlink",
+            )
+
+
+def test_configured_worktree_root_requires_remote_owner_repo(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    _init_git_repo(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt-no-remote", default_workdir=str(repo))
+
+    with kb.connect(board="external-wt-no-remote") as conn:
+        with pytest.raises(ValueError, match="remote.origin.url"):
+            kb.create_task(
+                conn,
+                title="no remote",
+                workspace_kind="worktree",
+                board="external-wt-no-remote",
+            )
+
+
+def test_configured_worktree_root_revalidates_persisted_path_before_materialization(
+    kanban_home, tmp_path, monkeypatch
+):
+    repo = tmp_path / "repo"
+    policy_root = tmp_path / "external-worktrees"
+    _init_git_repo(repo)
+    _set_remote_origin(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt-revalidate", default_workdir=str(repo))
+
+    with kb.connect(board="external-wt-revalidate") as conn:
+        tid = kb.create_task(
+            conn,
+            title="tamper",
+            workspace_kind="worktree",
+            board="external-wt-revalidate",
+        )
+        escaped = repo / ".worktrees" / tid
+        conn.execute("UPDATE tasks SET workspace_path=? WHERE id=?", (str(escaped), tid))
+        conn.commit()
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        with pytest.raises(ValueError, match="direct child"):
+            kb.resolve_workspace(task, board="external-wt-revalidate")
+
+    assert not escaped.exists()
+
+
+def test_configured_worktree_root_has_no_environment_override(monkeypatch):
+    import hermes_cli.config as config
+
+    monkeypatch.setenv("HERMES_KANBAN_WORKTREE_ROOT", "/tmp/ignored")
+    monkeypatch.setattr(config, "load_config_readonly", lambda: {"kanban": {}})
+    assert kb._configured_worktree_root() is None
 
 
 # ---------------------------------------------------------------------------

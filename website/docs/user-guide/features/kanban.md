@@ -684,13 +684,17 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+| `kanban.worktree_root` | unset | Optional global root for this profile's Kanban git worktrees. When set, Hermes derives `<remote-owner>-<remote-repo>` from `remote.origin.url`, persists only direct-child targets under that namespace, and revalidates containment before dispatch/reclaim. Unset preserves legacy `<repo>/.worktrees/<task-id>` behavior. |
 
 ```yaml
 kanban:
   max_in_progress: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
+  worktree_root: ~/worktrees
 ```
+
+Set the value with `hermes config set kanban.worktree_root /absolute/path`. Restart the gateway before relying on the policy for unattended dispatch; clearing the key and restarting rolls back to legacy placement. Existing targets outside the configured namespace fail closed rather than being silently moved.
 
 ### Scheduled task starts (`scheduled_at`)
 
