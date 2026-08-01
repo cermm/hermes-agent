@@ -2557,9 +2557,15 @@ def create_task(
                 and existing.workspace_kind == "worktree"
                 and _configured_worktree_root() is not None
             ):
-                target, _repo_root, _branch = _plan_worktree_workspace(
-                    existing, board=board
+                target = _configured_create_worktree_target(
+                    workspace_path=existing.workspace_path,
+                    project_repo=None,
+                    project_id=existing.project_id,
+                    board=board,
+                    task_id=existing.id,
                 )
+                if target is None:
+                    raise ValueError("configured worktree policy unexpectedly resolved no target")
                 if existing.workspace_path != str(target):
                     set_workspace_path(conn, existing_id, target)
             return existing_id
@@ -5702,8 +5708,9 @@ def _resolve_worktree_workspace(
                     f"configured Kanban worktree target {target} belongs to a different git repository"
                 )
             actual_branch = _git_current_branch(target)
-            return target, None, actual_branch or branch_name
-        return target, repo_root, branch_name
+            return target, actual_branch or branch_name
+        _ensure_git_worktree(repo_root, target, branch_name)
+        return target, branch_name
 
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
