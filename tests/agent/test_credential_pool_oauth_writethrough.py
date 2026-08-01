@@ -70,10 +70,257 @@ def profile_and_root(tmp_path, monkeypatch):
     return profile_path, root_path
 
 
+@pytest.mark.parametrize(
+    "provider",
+    ["openai-codex", "xai-oauth"],
+)
+def test_pool_refresh_writes_through_to_root_when_profile_reads_root(
+    profile_and_root, provider
+):
+    """A profile reading root's grant must push rotated tokens back to root."""
+    profile_path, root_path = profile_and_root
+    # Profile has NO own provider block (reads root via fallback).
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = CredentialPool(provider, [])
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(provider, id="e1", access_token="new-access", refresh_token="new-refresh")
+    )
+
+    # Root-sourced grants remain root-owned. Writing a shadow block into the
+    # profile would make the first refresh self-seal and disable write-through
+    # for every later rotation (#74339).
+    profile = _read_store(profile_path)
+    assert provider not in profile["providers"]
+
+    # The global root no longer holds the revoked refresh token (#48415).
+    root = _read_store(root_path)
+    assert root["providers"][provider]["tokens"]["access_token"] == "new-access"
+    assert root["providers"][provider]["tokens"]["refresh_token"] == "new-refresh"
 
 
+@pytest.mark.parametrize(
+    ("provider", "refresh_name"),
+    [
+        ("openai-codex", "refresh_codex_oauth_pure"),
+        ("xai-oauth", "refresh_xai_oauth_pure"),
+    ],
+)
+def test_full_pool_refresh_locks_and_updates_authoritative_root(
+    profile_and_root, monkeypatch, provider, refresh_name
+):
+    """The full single-use refresh transaction must own and update root."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "old-access",
+                        "refresh_token": "old-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    root_before = root_path.read_bytes()
+    root_lock_held = {"during_post": False}
+
+    def fake_refresh(*_args, **_kwargs):
+        root_lock_held["during_post"] = (
+            getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+        )
+        return {
+            "access_token": "rotated-access",
+            "refresh_token": "rotated-refresh",
+            "last_refresh": "2020-01-02T00:00:00Z",
+        }
+
+    monkeypatch.setattr(A, refresh_name, fake_refresh)
+    entry = _entry(
+        provider,
+        id=f"{provider}-full-refresh",
+        access_token="old-access",
+        refresh_token="old-refresh",
+    )
+    pool = CredentialPool(provider, [entry])
+
+    refreshed = pool._refresh_entry(entry, force=True)
+
+    assert refreshed is not None
+    assert refreshed.refresh_token == "rotated-refresh"
+    assert root_lock_held["during_post"] is True
+    assert root_path.read_bytes() != root_before
+    root = _read_store(root_path)
+    assert (
+        root["providers"][provider]["tokens"]["refresh_token"]
+        == "rotated-refresh"
+    )
 
 
+@pytest.mark.parametrize(
+    ("provider", "refresh_name", "error_code"),
+    [
+        ("openai-codex", "refresh_codex_oauth_pure", "codex_refresh_failed"),
+        ("xai-oauth", "refresh_xai_oauth_pure", "xai_refresh_failed"),
+    ],
+)
+def test_terminal_pool_refresh_quarantines_authoritative_root(
+    profile_and_root, monkeypatch, provider, refresh_name, error_code
+):
+    """A terminal fallback refresh must revoke root, not only the profile."""
+    profile_path, root_path = profile_and_root
+    _write_store(profile_path, {"version": 1, "providers": {}})
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "revoked-access",
+                        "refresh_token": "revoked-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    root_before = root_path.read_bytes()
+    root_lock_held = {"during_save": False}
+    real_save = A._save_auth_store
+
+    def tracking_save(auth_store, target_path=None, *, updated_at=None):
+        save_path = target_path if target_path is not None else A._auth_file_path()
+        if save_path.resolve(strict=False) == root_path.resolve(strict=False):
+            root_lock_held["during_save"] = (
+                getattr(A._auth_lock_holder_for(root_path), "depth", 0) > 0
+            )
+        return real_save(auth_store, target_path, updated_at=updated_at)
+
+    monkeypatch.setattr(A, "_save_auth_store", tracking_save)
+
+    def terminal_refresh(*_args, **_kwargs):
+        raise A.AuthError(
+            "Refresh token was revoked",
+            provider=provider,
+            code=error_code,
+            relogin_required=True,
+        )
+
+    monkeypatch.setattr(A, refresh_name, terminal_refresh)
+    entry = _entry(
+        provider,
+        id=f"{provider}-terminal",
+        access_token="revoked-access",
+        refresh_token="revoked-refresh",
+    )
+    pool = CredentialPool(provider, [entry])
+
+    assert pool._refresh_entry(entry, force=True) is None
+
+    assert root_lock_held["during_save"] is True
+    assert root_path.read_bytes() != root_before
+    root_state = _read_store(root_path)["providers"][provider]
+    assert "access_token" not in root_state["tokens"]
+    assert "refresh_token" not in root_state["tokens"]
+    assert root_state["last_auth_error"]["code"] == error_code
+
+
+@pytest.mark.parametrize(
+    "provider",
+    ["openai-codex", "xai-oauth"],
+)
+def test_pool_refresh_does_not_touch_root_when_profile_shadows(
+    profile_and_root, provider
+):
+    """A profile that genuinely shadows root must NOT clobber the root grant."""
+    profile_path, root_path = profile_and_root
+    # Profile has its OWN provider block: it shadows root legitimately.
+    _write_store(
+        profile_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "profile-old",
+                        "refresh_token": "profile-old-refresh",
+                    }
+                }
+            },
+        },
+    )
+    _write_store(
+        root_path,
+        {
+            "version": 1,
+            "providers": {
+                provider: {
+                    "tokens": {
+                        "access_token": "root-untouched",
+                        "refresh_token": "root-untouched-refresh",
+                    }
+                }
+            },
+        },
+    )
+
+    pool = CredentialPool(provider, [])
+    pool._sync_device_code_entry_to_auth_store(
+        _entry(
+            provider,
+            id="e2",
+            access_token="profile-new",
+            refresh_token="profile-new-refresh",
+        )
+    )
+
+    profile = _read_store(profile_path)
+    assert (
+        profile["providers"][provider]["tokens"]["refresh_token"]
+        == "profile-new-refresh"
+    )
+
+    # Root keeps its own grant — write-through must not run when the profile
+    # owns the block.
+    root = _read_store(root_path)
+    assert (
+        root["providers"][provider]["tokens"]["refresh_token"]
+        == "root-untouched-refresh"
+    )
+
+
+def test_write_through_helper_is_noop_in_classic_mode(monkeypatch, tmp_path):
+    """When profile == root (classic mode), the helper must be a no-op.
+
+    ``_global_auth_file_path`` returns None in classic mode; the profile save
+    already wrote to root, so a second write would be redundant (and the
+    helper has nothing to target).
+    """
+    monkeypatch.setattr(A, "_global_auth_file_path", lambda: None)
+    # Must not raise and must not attempt any write.
+    CP._write_through_provider_state_to_global_root(
+        "openai-codex", {"tokens": {"access_token": "a", "refresh_token": "r"}}
+    )
 
 
 def test_global_write_through_preserves_concurrent_root_update(
@@ -173,12 +420,13 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     Codex refresh tokens are single-use. If two Hermes processes both read the
     same on-disk token and both POST it, the loser gets ``refresh_token_reused``.
     Serializing the sync -> refresh POST -> write-back sequence through the
-    shared ``_auth_store_lock`` closes that window: a second process blocks on
-    the flock and, once inside, adopts the rotated token instead of re-POSTing.
+    authority-bound auth-store lock set closes that window: a second process
+    blocks on the flock and, once inside, adopts the rotated token instead of
+    re-POSTing.
 
     This asserts the invariant directly — that ``refresh_codex_oauth_pure`` is
-    only ever called while the auth-store lock is held — rather than snapshotting
-    any token value.
+    only ever called while the active auth-store lock is held — rather than
+    snapshotting any token value.
     """
     provider = "openai-codex"
     profile_path = tmp_path / "auth.json"
@@ -187,28 +435,12 @@ def test_codex_pool_refresh_holds_auth_store_lock_across_post(monkeypatch, tmp_p
     monkeypatch.setenv("HOME", str(tmp_path / "not-the-root"))
 
     lock_held: dict = {"during_post": None}
-    real_lock = A._auth_store_lock
-
-    depth = {"n": 0}
-
-    import contextlib
-
-    @contextlib.contextmanager
-    def tracking_lock(*args, **kwargs):
-        depth["n"] += 1
-        try:
-            with real_lock(*args, **kwargs):
-                yield
-        finally:
-            depth["n"] -= 1
-
-    monkeypatch.setattr(A, "_auth_store_lock", tracking_lock)
-    # credential_pool imported _auth_store_lock by name; patch that binding too.
-    monkeypatch.setattr(CP, "_auth_store_lock", tracking_lock)
 
     def fake_refresh(access_token, refresh_token, **kwargs):
         # The POST to the token endpoint must happen with the lock held.
-        lock_held["during_post"] = depth["n"] > 0
+        lock_held["during_post"] = (
+            getattr(A._auth_lock_holder_for(profile_path), "depth", 0) > 0
+        )
         return {
             "access_token": "rotated-access",
             "refresh_token": "rotated-refresh",

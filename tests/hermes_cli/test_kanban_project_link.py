@@ -4,6 +4,8 @@ worktree path + branch instead of the random ``wt/<task-id>`` fallback."""
 from __future__ import annotations
 
 import os
+import subprocess
+from pathlib import Path
 
 import pytest
 
@@ -38,6 +40,44 @@ def test_project_linked_task_gets_deterministic_worktree_and_branch(kanban_conn)
     # Deterministic branch: <slug>/<task-id>-<title-slug>. NOT a random wt/...
     assert task.branch_name == f"{proj.slug}/{tid}-add-login"
     assert not task.branch_name.startswith("wt/")
+
+
+def test_project_linked_task_uses_configured_external_root(
+    kanban_conn, tmp_path, monkeypatch
+):
+    repo = tmp_path / "project-repo"
+    repo.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "main", str(repo)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(repo),
+            "remote",
+            "add",
+            "origin",
+            "https://github.com/acme/webapp.git",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    proj = _make_project(repo=str(repo))
+    assert proj is not None
+    root = tmp_path / "external-worktrees"
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: root)
+
+    tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
+    task = kb.get_task(kanban_conn, tid)
+
+    assert task is not None and task.workspace_path
+    assert Path(task.workspace_path) == root / "acme-webapp" / tid
+    assert task.branch_name == f"{proj.slug}/{tid}-add-login"
 
 
 def test_explicit_branch_overrides_project_default(kanban_conn):

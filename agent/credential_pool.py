@@ -1039,6 +1039,7 @@ class CredentialPool:
         # device-code sources (nous, openai-codex, xAI) use ``device_code``.
         if entry.source != "device_code":
             return
+        write_through_state: Optional[Tuple[str, Dict[str, Any]]] = None
         try:
             with _auth_store_lock():
                 auth_store = _load_auth_store()
@@ -1086,11 +1087,15 @@ class CredentialPool:
                 else:
                     return
 
-                global_root = _global_auth_file_path()
+                # Resolve through the authority module at call time. Besides
+                # keeping one authority source of truth, this avoids a stale
+                # function binding when tests or embedders replace the path
+                # resolver after credential_pool was imported.
+                global_root = auth_mod._global_auth_file_path()
                 is_from_root = bool(
                     source_path is not None
                     and global_root is not None
-                    and _same_path(source_path, global_root)
+                    and auth_mod._same_path(source_path, global_root)
                 )
 
                 if self.provider == "nous":
@@ -1141,9 +1146,10 @@ class CredentialPool:
                     # _load_provider_state has root fallback, so the
                     # profile can always read fresh tokens from root
                     # without needing its own providers block.
-                    _write_through_provider_state_to_global_root(
-                        _wt_provider_id, state
-                    )
+                    # Defer the distinct root write until the profile lock has
+                    # been released. Authority-bound lock tracking correctly
+                    # rejects nested lock acquisition for a different store.
+                    write_through_state = (_wt_provider_id, dict(state))
                 else:
                     # Profile genuinely owns this provider — write to
                     # the profile store as normal.
@@ -1151,6 +1157,8 @@ class CredentialPool:
                         auth_store, self.provider, state, set_active=False
                     )
                     _save_auth_store(auth_store)
+            if write_through_state is not None:
+                _write_through_provider_state_to_global_root(*write_through_state)
         except Exception as exc:
             logger.debug("Failed to sync %s pool entry back to auth store: %s", self.provider, exc)
 
@@ -1164,19 +1172,21 @@ class CredentialPool:
         # sync→POST→write-back sequence below must run atomically across Hermes
         # processes: otherwise two processes can both adopt the same on-disk
         # token, both POST it, and the loser gets ``refresh_token_reused``.
-        # Serialize the whole sequence through the shared cross-process
-        # auth-store flock (the same lock and extended-timeout pattern used by
-        # resolve_codex_runtime_credentials()).  When a waiter finally acquires
-        # the lock, the in-lock re-sync below picks up the rotated token the
-        # winner persisted and skips the POST.
+        # Serialize the whole sequence through the complete authority-bound
+        # auth-store lock set. In legacy profile->root fallback mode that means
+        # both stores: the token endpoint POST and write-back must own the root
+        # lock because root supplied the single-use token. When a waiter finally
+        # acquires the locks, the in-lock re-sync below picks up the rotated
+        # token the winner persisted and skips the POST.
         if self.provider in ("openai-codex", "xai-oauth"):
             sync_entry = (
                 self._sync_codex_entry_from_auth_store
                 if self.provider == "openai-codex"
                 else self._sync_xai_oauth_entry_from_pool_store
             )
-            with _auth_store_lock(
-                timeout_seconds=self._single_use_refresh_lock_timeout()
+            with auth_mod._auth_store_locks(
+                include_legacy_fallback=True,
+                timeout_seconds=self._single_use_refresh_lock_timeout(),
             ):
                 synced = sync_entry(entry)
                 if self.provider == "openai-codex":
@@ -1367,7 +1377,10 @@ class CredentialPool:
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
-                            state = _load_provider_state(auth_store, "xai-oauth") or {}
+                            state, source_path = auth_mod._load_provider_state_with_source(
+                                auth_store, "xai-oauth"
+                            )
+                            state = state or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
                                 if isinstance(tokens, dict):
@@ -1385,8 +1398,12 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "xai-oauth", state)
-                                        _save_auth_store(auth_store)
+                                        auth_mod._save_provider_state_to_source(
+                                            auth_store,
+                                            "xai-oauth",
+                                            state,
+                                            source_path,
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal xAI OAuth state: %s", clear_exc
@@ -1437,7 +1454,10 @@ class CredentialPool:
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
-                            state = _load_provider_state(auth_store, "openai-codex") or {}
+                            state, source_path = auth_mod._load_provider_state_with_source(
+                                auth_store, "openai-codex"
+                            )
+                            state = state or {}
                             if isinstance(state, dict):
                                 tokens = state.get("tokens") or {}
                                 if isinstance(tokens, dict):
@@ -1455,8 +1475,12 @@ class CredentialPool:
                                             "relogin_required": True,
                                             "at": datetime.now(timezone.utc).isoformat(),
                                         }
-                                        _save_provider_state(auth_store, "openai-codex", state)
-                                        _save_auth_store(auth_store)
+                                        auth_mod._save_provider_state_to_source(
+                                            auth_store,
+                                            "openai-codex",
+                                            state,
+                                            source_path,
+                                        )
                     except Exception as clear_exc:
                         logger.debug(
                             "Failed to clear terminal Codex OAuth state: %s", clear_exc
@@ -1498,7 +1522,10 @@ class CredentialPool:
                     try:
                         with _auth_store_lock():
                             auth_store = _load_auth_store()
-                            state = _load_provider_state(auth_store, "nous") or {
+                            state, source_path = auth_mod._load_provider_state_with_source(
+                                auth_store, "nous"
+                            )
+                            state = state or {
                                 "client_id": entry.client_id,
                                 "portal_base_url": entry.portal_base_url,
                                 "inference_base_url": entry.inference_base_url,
@@ -1519,8 +1546,12 @@ class CredentialPool:
                                     exc,
                                     reason="credential_pool_refresh_failure",
                                 )
-                                _save_provider_state(auth_store, "nous", state)
-                                _save_auth_store(auth_store)
+                                auth_mod._save_provider_state_to_source(
+                                    auth_store,
+                                    "nous",
+                                    state,
+                                    source_path,
+                                )
                     except Exception as clear_exc:
                         logger.debug("Failed to clear terminal Nous OAuth state: %s", clear_exc)
 
@@ -2855,7 +2886,18 @@ def load_pool(provider: str) -> CredentialPool:
         )
         changed |= _normalize_pool_priorities(provider, entries)
 
-    if changed:
+    # A shared-authority profile reads the canonical root pool directly. Keep
+    # load-time healing in memory, but do not let a read rewrite shared bytes.
+    # Explicit mutations and OAuth refreshes still use the normal write paths.
+    try:
+        authority = auth_mod.resolve_auth_authority()
+        shared_profile_read = bool(
+            authority.profile_id and authority.effective_mode == "shared"
+        )
+    except Exception:
+        shared_profile_read = False
+
+    if changed and not shared_profile_read:
         new_ids = {entry.id for entry in entries}
         write_credential_pool(
             provider,
