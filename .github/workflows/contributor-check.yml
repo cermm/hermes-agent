@@ -23,12 +23,33 @@ jobs:
 
       - name: Check for unmapped contributor emails
         id: check-emails
+        env:
+          BASE_REF: ${{ github.base_ref }}
+          EVENT_NAME: ${{ github.event_name }}
         run: |
-          # Get the merge base between this PR and main
-          MERGE_BASE=$(git merge-base origin/main HEAD)
+          # PRs may target a custom base branch, including in a fork whose main
+          # has diverged. Non-PR callers retain the existing origin/main fallback.
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            if [ -z "$BASE_REF" ]; then
+              echo "::error::pull_request event did not provide a base ref"
+              exit 1
+            fi
+            REMOTE_BASE_REF="refs/remotes/origin/${BASE_REF}"
+            if ! git check-ref-format "$REMOTE_BASE_REF" >/dev/null; then
+              echo "::error::pull_request event provided an invalid base ref"
+              exit 1
+            fi
+            if ! BASE_COMMIT=$(git rev-parse --verify "${REMOTE_BASE_REF}^{commit}"); then
+              echo "::error::pull_request base ref was not fetched"
+              exit 1
+            fi
+            MERGE_BASE=$(git merge-base "$BASE_COMMIT" HEAD)
+          else
+            MERGE_BASE=$(git merge-base origin/main HEAD)
+          fi
 
           # Find any new author emails in this PR's commits
-          NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+          NEW_EMAILS=$(git log "${MERGE_BASE}..HEAD" --format='%ae' --no-merges | sort -u)
 
           if [ -z "$NEW_EMAILS" ]; then
             echo "No new commits to check."

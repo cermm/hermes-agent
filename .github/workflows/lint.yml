@@ -170,3 +170,6 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+      - name: Audit auth-store consumers
+        run: python scripts/check_auth_store_consumers.py
