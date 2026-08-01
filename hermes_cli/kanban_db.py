@@ -5580,13 +5580,6 @@ def _configured_source_repo(
     project_id: Optional[str] = None,
     project_repo: Optional[str] = None,
 ) -> Path:
-    if requested is not None and requested.is_absolute():
-        linked_source = _repo_root_from_linked_worktree(requested)
-        if linked_source is not None:
-            return linked_source
-        requested_repo = _git_toplevel(requested)
-        if requested_repo is not None and requested.resolve(strict=False) == requested_repo:
-            return requested_repo
     if project_repo:
         repo = _git_toplevel(Path(project_repo).expanduser())
         if repo is not None:
@@ -5597,6 +5590,13 @@ def _configured_source_repo(
     repo = _board_default_repo_root(board)
     if repo is not None:
         return repo
+    if requested is not None and requested.is_absolute():
+        linked_source = _repo_root_from_linked_worktree(requested)
+        if linked_source is not None:
+            return linked_source
+        requested_repo = _git_toplevel(requested)
+        if requested_repo is not None and requested.resolve(strict=False) == requested_repo:
+            return requested_repo
     raise ValueError(
         "kanban.worktree_root policy could not resolve a source repository; "
         "set the board default_workdir, link a project primary repo, or pass a repo-root anchor"

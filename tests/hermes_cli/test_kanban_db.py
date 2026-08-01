@@ -2541,6 +2541,50 @@ def test_configured_worktree_root_revalidates_persisted_path_before_materializat
     assert not escaped.exists()
 
 
+def test_configured_worktree_root_rejects_existing_target_from_same_remote_clone(
+    kanban_home, tmp_path, monkeypatch
+):
+    source = tmp_path / "source"
+    wrong_clone = tmp_path / "wrong-clone"
+    policy_root = tmp_path / "external-worktrees"
+    for repo in (source, wrong_clone):
+        _init_git_repo(repo)
+        _set_remote_origin(repo)
+    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    kb.create_board("external-wt-identity", default_workdir=str(source))
+
+    with kb.connect(board="external-wt-identity") as conn:
+        tid = kb.create_task(
+            conn,
+            title="identity",
+            workspace_kind="worktree",
+            board="external-wt-identity",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+        target = Path(task.workspace_path)
+        target.parent.mkdir(parents=True, exist_ok=True)
+        subprocess.run(
+            [
+                "git",
+                "-C",
+                str(wrong_clone),
+                "worktree",
+                "add",
+                "-b",
+                "wrong/identity",
+                str(target),
+                "HEAD",
+            ],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+
+        with pytest.raises(ValueError, match="different git repository"):
+            kb.resolve_workspace(task, board="external-wt-identity")
+
+
 def test_configured_worktree_root_has_no_environment_override(monkeypatch):
     import hermes_cli.config as config
 
