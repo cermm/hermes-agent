@@ -15,6 +15,7 @@
     "write-translations": "docusaurus write-translations",
     "write-heading-ids": "docusaurus write-heading-ids",
     "typecheck": "tsc -p . --noEmit",
+    "test:ascii-guard": "node --test scripts/run-ascii-guard.test.mjs",
     "lint:diagrams": "node scripts/run-ascii-guard.mjs lint --exclude-code-blocks docs"
   },
   "dependencies": {

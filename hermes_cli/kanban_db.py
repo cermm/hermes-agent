@@ -88,6 +88,7 @@ from contextvars import ContextVar, Token
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional
+from urllib.parse import urlsplit
 
 from hermes_cli.sqlite_util import add_column_if_missing as _add_column_if_missing
 from toolsets import get_toolset_names
@@ -2549,7 +2550,25 @@ def create_task(
             (idempotency_key,),
         ).fetchone()
         if row:
-            return row["id"]
+            existing_id = row["id"]
+            existing = get_task(conn, existing_id)
+            if (
+                existing is not None
+                and existing.workspace_kind == "worktree"
+                and _configured_worktree_root() is not None
+            ):
+                target = _configured_create_worktree_target(
+                    workspace_path=existing.workspace_path,
+                    project_repo=None,
+                    project_id=existing.project_id,
+                    board=board,
+                    task_id=existing.id,
+                )
+                if target is None:
+                    raise ValueError("configured worktree policy unexpectedly resolved no target")
+                if existing.workspace_path != str(target):
+                    set_workspace_path(conn, existing_id, target)
+            return existing_id
 
     now = int(time.time())
 
@@ -2576,6 +2595,20 @@ def create_task(
     # Retry once on the extremely unlikely id collision.
     for attempt in range(2):
         task_id = _new_task_id()
+        insert_workspace_path = workspace_path
+        configured_target: Optional[Path] = None
+        if workspace_kind == "worktree":
+            configured_target = _configured_create_worktree_target(
+                workspace_path=workspace_path,
+                project_repo=project_repo,
+                project_id=project_id,
+                board=board,
+                task_id=task_id,
+            )
+            if configured_target is not None:
+                # Persist the final canonical target at publication time. The
+                # dispatcher revalidates it before any filesystem write.
+                insert_workspace_path = str(configured_target)
         try:
             with write_txn(conn):
                 # Determine task status from parent status, unless the caller
@@ -2615,8 +2648,8 @@ def create_task(
                 # these kill the random ``wt/<task-id>`` worker fallback and the
                 # unanchored ``.worktrees/<id>`` under the dispatcher's cwd.
                 if project_obj is not None and workspace_kind == "worktree":
-                    if project_repo and not workspace_path:
-                        workspace_path = os.path.join(
+                    if project_repo and not insert_workspace_path:
+                        insert_workspace_path = os.path.join(
                             project_repo, ".worktrees", task_id
                         )
                     if not branch_name:
@@ -2648,7 +2681,7 @@ def create_task(
                         created_by,
                         now,
                         workspace_kind,
-                        workspace_path,
+                        insert_workspace_path,
                         branch_name,
                         project_id,
                         tenant,
@@ -5401,6 +5434,207 @@ def _repo_root_for_worktree_target(path: Path) -> Optional[Path]:
         current = current.parent
 
 
+def _configured_worktree_root() -> Optional[Path]:
+    """Return the opt-in per-profile Kanban worktree root, if configured."""
+    from hermes_cli.config import load_config_readonly
+
+    config = load_config_readonly()
+    kanban_cfg = config.get("kanban") or {}
+    if not isinstance(kanban_cfg, dict):
+        raise ValueError("kanban config must be a mapping")
+    raw = kanban_cfg.get("worktree_root")
+    if raw is None or not str(raw).strip():
+        return None
+    root = Path(str(raw).strip()).expanduser()
+    if not root.is_absolute():
+        raise ValueError(
+            f"kanban.worktree_root must be an absolute path, got {str(raw)!r}"
+        )
+    resolved = root.resolve(strict=False)
+    for forbidden in (Path("/tmp"), Path("/mnt/c")):
+        if resolved == forbidden or forbidden in resolved.parents:
+            raise ValueError(
+                f"kanban.worktree_root must not be under {forbidden}: {resolved}"
+            )
+    return resolved
+
+
+def _git_remote_origin(repo_root: Path) -> Optional[str]:
+    try:
+        result = subprocess.run(
+            ["git", "-C", str(repo_root), "remote", "get-url", "origin"],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+    except Exception:
+        return None
+    if result.returncode != 0:
+        return None
+    value = (result.stdout or "").strip()
+    return value or None
+
+
+def _remote_owner_repo_namespace(repo_root: Path) -> str:
+    """Derive ``owner-repo`` from remote.origin.url or fail closed."""
+    remote = _git_remote_origin(repo_root)
+    if not remote:
+        raise ValueError(
+            f"kanban.worktree_root requires {repo_root} to have remote.origin.url "
+            "so Hermes can derive a stable owner/repository namespace"
+        )
+    if "://" in remote:
+        path = urlsplit(remote).path
+    elif re.match(r"^[^/]+@[^:]+:", remote):
+        path = remote.split(":", 1)[1]
+    else:
+        path = remote
+    parts = [part for part in path.replace("\\", "/").strip("/").split("/") if part]
+    if len(parts) < 2:
+        raise ValueError(
+            f"unable to derive owner/repository from remote.origin.url {remote!r}"
+        )
+    owner = re.sub(r"[^A-Za-z0-9._-]+", "-", parts[-2]).strip("-._")
+    repo = re.sub(r"[^A-Za-z0-9._-]+", "-", parts[-1].removesuffix(".git")).strip("-._")
+    if not owner or not repo:
+        raise ValueError(
+            f"unable to derive owner/repository from remote.origin.url {remote!r}"
+        )
+    return f"{owner}-{repo}"
+
+
+def _configured_worktree_namespace(repo_root: Path, policy_root: Path) -> Path:
+    resolved_root = policy_root.resolve(strict=False)
+    resolved_repo = repo_root.resolve(strict=False)
+    containing_repo = _repo_root_for_worktree_target(resolved_root)
+    if (
+        resolved_root == resolved_repo
+        or resolved_repo in resolved_root.parents
+        or containing_repo is not None
+    ):
+        raise ValueError(
+            f"kanban.worktree_root must be outside every git repository: {resolved_root}"
+        )
+    return (resolved_root / _remote_owner_repo_namespace(repo_root)).resolve(
+        strict=False
+    )
+
+
+def _validate_configured_worktree_target(
+    requested: Path, *, repo_root: Path, policy_root: Path
+) -> Path:
+    if not requested.is_absolute():
+        raise ValueError(
+            f"configured Kanban worktree path must be absolute, got {str(requested)!r}"
+        )
+    namespace = _configured_worktree_namespace(repo_root, policy_root)
+    resolved = requested.expanduser().resolve(strict=False)
+    if resolved.parent != namespace or not resolved.name:
+        raise ValueError(
+            f"Kanban worktree path {str(requested)!r} must resolve as a direct child "
+            f"of configured namespace {namespace}"
+        )
+    return resolved
+
+
+def _repo_root_from_linked_worktree(path: Path) -> Optional[Path]:
+    if not path.exists() or not _is_linked_worktree_checkout(path):
+        return None
+    common = _git_common_dir(path)
+    if common is None:
+        return None
+    if common.name == ".git":
+        candidate = common.parent
+        return _git_toplevel(candidate) or candidate.resolve(strict=False)
+    return None
+
+
+def _board_default_repo_root(board: Optional[str]) -> Optional[Path]:
+    board_slug = board if board else get_current_board()
+    raw = (read_board_metadata(board_slug).get("default_workdir") or "").strip()
+    if not raw:
+        return None
+    anchor = Path(raw).expanduser()
+    if not anchor.is_absolute():
+        raise ValueError(
+            f"board {board_slug!r} default_workdir {raw!r} is not absolute; "
+            "use an absolute path to a git repo"
+        )
+    return _git_toplevel(anchor)
+
+
+def _project_repo_root(project_id: Optional[str]) -> Optional[Path]:
+    if not project_id:
+        return None
+    try:
+        from hermes_cli import projects_db as _pdb
+
+        with _pdb.connect_closing() as conn:
+            project = _pdb.get_project(conn, project_id)
+    except Exception:
+        return None
+    if project is None or not project.primary_path:
+        return None
+    return _git_toplevel(Path(project.primary_path).expanduser())
+
+
+def _configured_source_repo(
+    *,
+    requested: Optional[Path],
+    board: Optional[str],
+    project_id: Optional[str] = None,
+    project_repo: Optional[str] = None,
+) -> Path:
+    if project_repo:
+        repo = _git_toplevel(Path(project_repo).expanduser())
+        if repo is not None:
+            return repo
+    repo = _project_repo_root(project_id)
+    if repo is not None:
+        return repo
+    repo = _board_default_repo_root(board)
+    if repo is not None:
+        return repo
+    if requested is not None and requested.is_absolute():
+        linked_source = _repo_root_from_linked_worktree(requested)
+        if linked_source is not None:
+            return linked_source
+        requested_repo = _git_toplevel(requested)
+        if requested_repo is not None and requested.resolve(strict=False) == requested_repo:
+            return requested_repo
+    raise ValueError(
+        "kanban.worktree_root policy could not resolve a source repository; "
+        "set the board default_workdir, link a project primary repo, or pass a repo-root anchor"
+    )
+
+
+def _configured_create_worktree_target(
+    *,
+    workspace_path: Optional[str],
+    project_repo: Optional[str],
+    project_id: Optional[str],
+    board: Optional[str],
+    task_id: str,
+) -> Optional[Path]:
+    policy_root = _configured_worktree_root()
+    if policy_root is None:
+        return None
+    requested = Path(workspace_path).expanduser() if workspace_path else None
+    repo_root = _configured_source_repo(
+        requested=requested,
+        board=board,
+        project_id=project_id,
+        project_repo=project_repo,
+    )
+    if requested is None or requested.resolve(strict=False) == repo_root:
+        namespace = _configured_worktree_namespace(repo_root, policy_root)
+        return (namespace / task_id).resolve(strict=False)
+    return _validate_configured_worktree_target(
+        requested, repo_root=repo_root, policy_root=policy_root
+    )
+
+
 def _ensure_git_worktree(repo_root: Path, target: Path, branch_name: str) -> None:
     """Materialize ``target`` as a linked git worktree under ``repo_root``."""
     target = target.expanduser()
@@ -5445,6 +5679,39 @@ def _resolve_worktree_workspace(
     anywhere, we fail loudly rather than guess.
     """
     branch_name = (task.branch_name or "").strip() or f"wt/{task.id}"
+
+    policy_root = _configured_worktree_root()
+    if policy_root is not None:
+        requested = Path(task.workspace_path).expanduser() if task.workspace_path else None
+        repo_root = _configured_source_repo(
+            requested=requested,
+            board=board,
+            project_id=task.project_id,
+        )
+        if requested is None or requested.resolve(strict=False) == repo_root:
+            namespace = _configured_worktree_namespace(repo_root, policy_root)
+            target = (namespace / task.id).resolve(strict=False)
+        else:
+            target = _validate_configured_worktree_target(
+                requested, repo_root=repo_root, policy_root=policy_root
+            )
+
+        if target.exists():
+            if not _is_linked_worktree_checkout(target):
+                raise ValueError(
+                    f"configured Kanban worktree target {target} exists but is not a linked git worktree"
+                )
+            source_common = _git_common_dir(repo_root)
+            target_common = _git_common_dir(target)
+            if source_common is None or target_common != source_common:
+                raise ValueError(
+                    f"configured Kanban worktree target {target} belongs to a different git repository"
+                )
+            actual_branch = _git_current_branch(target)
+            return target, actual_branch or branch_name
+        _ensure_git_worktree(repo_root, target, branch_name)
+        return target, branch_name
+
     if not task.workspace_path:
         # Anchor on the board's configured default_workdir, not Path.cwd().
         # The dispatcher's CWD is incidental (gateway launch dir) and using it
@@ -5515,15 +5782,15 @@ def resolve_workspace(task: Task, *, board: Optional[str] = None) -> Path:
       resolves against the dispatcher's CWD instead of a meaningful
       root.  Users who want a kanban-root-relative workspace should
       compute the absolute path themselves.
-    - ``worktree``: a real linked git worktree. If ``workspace_path`` names
-      a repo root, Hermes treats it as an anchor and materializes a linked
-      worktree at ``<repo>/.worktrees/<task-id>``. If ``workspace_path`` names
-      a concrete target path, Hermes creates/reuses that linked worktree. With
-      no ``workspace_path``, Hermes anchors on the board's ``default_workdir``
-      and materializes ``<repo>/.worktrees/<task-id>`` per task; if no
-      ``default_workdir`` is configured it raises rather than guessing from the
-      dispatcher's CWD. When ``branch_name`` is empty, Hermes uses
-      ``wt/<task-id>``.
+    - ``worktree``: a real linked git worktree. If ``kanban.worktree_root``
+      is configured, every target must resolve as a direct child of
+      ``<root>/<remote-owner>-<remote-repo>/``; Hermes validates this when the
+      task is created and again before dispatch/reclaim. If the setting is
+      empty, legacy behavior is unchanged: a repo-root anchor materializes at
+      ``<repo>/.worktrees/<task-id>`` and an explicit concrete target is used
+      as supplied. With no ``workspace_path``, the board's
+      ``default_workdir`` identifies the source repo. When ``branch_name`` is
+      empty, Hermes uses ``wt/<task-id>``.
 
     Persist the resolved path back to the task row via ``set_workspace_path``
     so subsequent runs reuse the same directory.

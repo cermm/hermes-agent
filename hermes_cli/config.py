@@ -2703,6 +2703,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Optional per-profile root for git worktree task materialization. When
+        # empty, Hermes preserves the legacy <repo>/.worktrees/<task-id>
+        # behavior. When set, worktree tasks are constrained to
+        # <root>/<remote-owner>-<remote-repo>/<task-leaf>.
+        "worktree_root": "",
         # Run the dispatcher inside the gateway process. On by default —
         # the cost is ~300µs every `dispatch_interval_seconds` when idle,
         # and gateway is the supervisor users already have. Set to false
