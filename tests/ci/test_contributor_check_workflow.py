@@ -6,6 +6,7 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
 import yaml
 
 
@@ -150,6 +151,60 @@ def test_pull_request_with_an_unfetched_base_ref_fails_closed(tmp_path: Path) ->
     _commit(repo, "candidate change", GITHUB_NOREPLY)
 
     result = _run_check(repo, tmp_path, event_name="pull_request", base_ref="missing")
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize(
+    "collision_ref",
+    ["refs/heads/origin/release", "refs/tags/origin/release"],
+)
+def test_custom_base_pr_uses_remote_ref_despite_a_colliding_local_ref(
+    tmp_path: Path, collision_ref: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    custom_base = _commit(
+        repo, "upstream work before the PR", "unmapped-upstream@example.com"
+    )
+    _git(repo, "update-ref", "refs/remotes/origin/release", custom_base)
+    candidate = _commit(repo, "candidate change", GITHUB_NOREPLY)
+    _git(repo, "update-ref", collision_ref, candidate)
+
+    result = _run_check(repo, tmp_path, event_name="pull_request", base_ref="release")
+
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert "All contributor emails are mapped" in result.stdout
+    assert "No new commits to check" not in result.stdout
+
+
+@pytest.mark.parametrize(
+    "collision_ref",
+    ["refs/heads/origin/release", "refs/tags/origin/release"],
+)
+def test_unfetched_base_does_not_fall_back_to_a_colliding_local_ref(
+    tmp_path: Path, collision_ref: str
+) -> None:
+    repo, _ = _repo(tmp_path)
+    candidate = _commit(repo, "candidate change", GITHUB_NOREPLY)
+    _git(repo, "update-ref", collision_ref, candidate)
+
+    result = _run_check(repo, tmp_path, event_name="pull_request", base_ref="release")
+
+    assert result.returncode != 0
+
+
+@pytest.mark.parametrize("suffix", ["^{commit}", "^0", "~1", ":history.txt"])
+def test_base_ref_revision_syntax_fails_closed(tmp_path: Path, suffix: str) -> None:
+    repo, root = _repo(tmp_path)
+    _git(repo, "update-ref", "refs/remotes/origin/release", root)
+    _commit(repo, "candidate change", GITHUB_NOREPLY)
+
+    result = _run_check(
+        repo,
+        tmp_path,
+        event_name="pull_request",
+        base_ref=f"release{suffix}",
+    )
 
     assert result.returncode != 0
 

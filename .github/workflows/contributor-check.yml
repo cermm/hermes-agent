@@ -34,7 +34,16 @@ jobs:
               echo "::error::pull_request event did not provide a base ref"
               exit 1
             fi
-            MERGE_BASE=$(git merge-base "origin/${BASE_REF}" HEAD)
+            REMOTE_BASE_REF="refs/remotes/origin/${BASE_REF}"
+            if ! git check-ref-format "$REMOTE_BASE_REF" >/dev/null; then
+              echo "::error::pull_request event provided an invalid base ref"
+              exit 1
+            fi
+            if ! BASE_COMMIT=$(git rev-parse --verify "${REMOTE_BASE_REF}^{commit}"); then
+              echo "::error::pull_request base ref was not fetched"
+              exit 1
+            fi
+            MERGE_BASE=$(git merge-base "$BASE_COMMIT" HEAD)
           else
             MERGE_BASE=$(git merge-base origin/main HEAD)
           fi
