@@ -755,12 +755,34 @@ All commands are also available as a slash command in the interactive CLI and in
 | `kanban.max_in_progress_per_profile` | unset (unlimited) | Per-profile variant of `max_in_progress` — caps how many tasks any single assignee profile may run concurrently. Useful when one profile is slow or rate-limited but others should keep flowing. Applies alongside the board-wide `max_in_progress`; both must allow a spawn for it to proceed. |
 | `kanban.auto_promote_children` | `true` | After `decompose_triage_task()` produces children with no parent-blocker dependencies, they're automatically promoted to `ready` so the dispatcher can pick them up. Set to `false` to require manual review — children stay in `todo` until you promote them. |
 | `kanban.default_workdir` | unset | Board-level default working directory applied to new tasks when neither `--workspace` nor the task itself overrides it. Per-task `workspace:` still wins. |
+| `kanban.worktree_root` | unset | Optional absolute policy root for `workspace_kind: worktree`. When set, Hermes derives `<root>/<remote-owner>-<remote-repo>/<task-id>` and creates the linked checkout there instead of inside the source repository. |
 
 ```yaml
 kanban:
   max_in_progress: 2
   auto_promote_children: false
   default_workdir: ~/work/active-project
+  worktree_root: ~/worktrees
+```
+
+`kanban.worktree_root` is a per-profile Kanban policy. It does not override
+explicit project source resolution: Hermes still finds the source repository
+from the linked project, board default, or task workspace, then derives the
+external target from that repository's `remote.origin.url`. The configured
+root must be absolute after `~` expansion, outside every Git repository, and
+must not live under `/tmp` or `/var/tmp`. On WSL, every Windows drive mount
+under `/mnt/<drive-letter>` (for example, `/mnt/c` or `/mnt/d`) is forbidden;
+Linux paths such as `/home/...` and non-drive mount namespaces remain valid.
+
+Hermes validates existing destinations fail-closed. A pre-existing target must
+be a linked worktree from the same Git common directory and must already be on
+the task's expected branch. Ordinary directories, a different clone with the
+same remote URL, and wrong-branch worktrees are rejected. If
+`kanban.worktree_root` is unset, the legacy repository-local `.worktrees/<id>`
+layout and explicit workspace behavior remain unchanged.
+
+```bash
+hermes config set kanban.worktree_root /absolute/path/outside/repos
 ```
 
 ### Scheduled task starts (`scheduled_at`)
