@@ -2202,6 +2202,11 @@ DEFAULT_CONFIG = {
     # each claimable ready task. One dispatcher per profile is sufficient;
     # running more than one on the same kanban.db will race for claims.
     "kanban": {
+        # Optional per-profile root for git worktree task materialization. When
+        # empty, Hermes preserves the legacy <repo>/.worktrees/<task-id>
+        # behavior. When set, worktree tasks are constrained to
+        # <root>/<remote-owner>-<remote-repo>/<task-leaf>.
+        "worktree_root": "",
         # Auto-subscribe the originating gateway/TUI session to task
         # completion + block events when ``kanban_create`` is called from
         # inside a session that has a persistent delivery channel. The

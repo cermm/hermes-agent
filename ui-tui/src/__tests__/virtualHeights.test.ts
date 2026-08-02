@@ -18,13 +18,15 @@ describe('virtual height estimates', () => {
   })
 
   it('uses compound user prompt width when estimating user message wrapping', () => {
-    // cols must clear the 20-col body-width floor for both prompts (gutter +
-    // horizontalReserve=4) so the wider 'Ψ >' prompt actually narrows the
-    // body enough to wrap an extra line vs the single-cell '❯' prompt.
-    const msg: Msg = { role: 'user', text: 'x'.repeat(23) }
+    const msg: Msg = { role: 'user', text: 'x'.repeat(21) }
 
-    expect(estimatedMsgHeight(msg, 30, { compact: false, details: false, userPrompt: '❯' })).toBe(3)
-    expect(estimatedMsgHeight(msg, 30, { compact: false, details: false, userPrompt: 'Ψ >' })).toBe(4)
+    // Non-Termux transcript width now reserves scrollbar + outer gap columns.
+    // At 26 cols both prompts floor to the same 20-col body, so use 28 cols to
+    // preserve the intended distinction: a 1-glyph prompt leaves 22 body cols
+    // (single wrapped row) while the wider compound prompt falls back to the
+    // 20-col floor (two wrapped rows).
+    expect(estimatedMsgHeight(msg, 28, { compact: false, details: false, userPrompt: '❯' })).toBe(3)
+    expect(estimatedMsgHeight(msg, 28, { compact: false, details: false, userPrompt: 'Ψ >' })).toBe(4)
   })
 
   it('adds one row for a group-boundary lead gap', () => {

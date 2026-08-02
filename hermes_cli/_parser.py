@@ -12,6 +12,8 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 
 import argparse
 
+from hermes_cli.result_metadata import parse_result_metadata_fd
+
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
@@ -285,6 +287,24 @@ def build_top_level_parser():
     )
     chat_parser.add_argument(
         "-q", "--query", help="Single query (non-interactive mode)"
+    )
+    result_metadata_transport = chat_parser.add_mutually_exclusive_group()
+    result_metadata_transport.add_argument(
+        "--result-meta-file",
+        metavar="ABSOLUTE_PATH",
+        help=(
+            "Atomically create a private JSON metadata sidecar for a single "
+            "--query (classic CLI only; destination must not exist)"
+        ),
+    )
+    result_metadata_transport.add_argument(
+        "--result-meta-fd",
+        type=parse_result_metadata_fd,
+        metavar="FD",
+        help=(
+            "Write JSON metadata as one frame to a pre-opened blocking FIFO write "
+            "descriptor after --query (classic CLI, POSIX/WSL only)"
+        ),
     )
     chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"

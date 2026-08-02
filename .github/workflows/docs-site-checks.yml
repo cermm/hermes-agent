@@ -44,6 +44,10 @@ jobs:
       - name: Regenerate per-skill docs pages + catalogs
         run: python3 website/scripts/generate-skill-docs.py
 
+      - name: Test ascii-guard invocation wrapper
+        run: npm run test:ascii-guard
+        working-directory: website
+
       - name: Lint docs diagrams
         run: npm run lint:diagrams
         working-directory: website

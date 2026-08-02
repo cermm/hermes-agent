@@ -8,6 +8,7 @@
     let
       hermes-agent = self'.packages.default;
       hermesVenv = hermes-agent.hermesVenv;
+      authAuthorityPython = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
 
       configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
 
@@ -32,6 +33,25 @@ def leaf_paths(d, prefix=""):
 json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
 ' > $out
       '';
+
+      authAuthoritySeed = pkgs.writeText "hermes-auth-authority-seed.json"
+        ''{"version":1,"providers":{"nous":{"refresh_token":"seed-token"}}}'';
+
+      forceOverwriteEval = builtins.tryEval (builtins.deepSeq
+        ((inputs.nixpkgs.lib.nixosSystem {
+          system = pkgs.system;
+          modules = [
+            inputs.self.nixosModules.default
+            ({ ... }: {
+              system.stateVersion = "24.11";
+              services.hermes-agent = {
+                enable = true;
+                authFileForceOverwrite = true;
+              };
+            })
+          ];
+        }).config.system.build.toplevel.drvPath)
+        true);
     in {
       packages.configKeys = configKeys;
 
@@ -75,6 +95,60 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           echo "ok" > $out/result
         '';
       } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # Exercise the activation helper and YAML contract through the same script
+        # invoked by the NixOS module: shared/profile routing, private modes,
+        # and preserve-on-repeat semantics are all build-time contracts.
+        auth-authority-activation = pkgs.runCommand "hermes-auth-authority-activation" { } ''
+          set -euo pipefail
+          ROOT=$(mktemp -d)
+          PROFILE="$ROOT/profiles/worker"
+          mkdir -p "$PROFILE"
+
+          printf 'auth:\n  authority: shared\n' > "$PROFILE/config.yaml"
+          SHARED_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$PROFILE" ${authAuthoritySeed})
+          echo "$SHARED_RESULT" | grep -q '"status": "created"'
+          test -f "$ROOT/auth.json"
+          test ! -e "$PROFILE/auth.json"
+          test "$(stat -c %a "$ROOT/auth.json")" = 600
+          test "$(stat -c %a "$ROOT/auth.lock")" = 600
+
+          ${pkgs.python3}/bin/python3 - "$ROOT/auth.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["providers"]["nous"]["refresh_token"] = "rotated-token"
+path.write_text(json.dumps(value))
+path.chmod(0o600)
+PY
+          REPEAT_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$PROFILE" ${authAuthoritySeed})
+          echo "$REPEAT_RESULT" | grep -q '"status": "preserved"'
+          grep -q 'rotated-token' "$ROOT/auth.json"
+
+          LOCAL="$ROOT/profiles/local"
+          mkdir -p "$LOCAL"
+          printf 'auth:\n  authority: profile\n' > "$LOCAL/config.yaml"
+          PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$LOCAL" ${authAuthoritySeed} >/dev/null
+          test -f "$LOCAL/auth.json"
+          test "$(stat -c %a "$LOCAL/auth.json")" = 600
+          test "$(stat -c %a "$LOCAL/auth.lock")" = 600
+
+          mkdir -p $out
+          echo ok > $out/result
+        '';
+
+        # The deprecated overwrite switch must fail module evaluation rather
+        # than becoming an inert or accidentally live activation control.
+        auth-force-overwrite-rejected =
+          if forceOverwriteEval.success then
+            throw "services.hermes-agent.authFileForceOverwrite=true unexpectedly evaluated"
+          else pkgs.runCommand "hermes-auth-force-overwrite-rejected" { } ''
+            mkdir -p $out
+            echo ok > $out/result
+          '';
+
         # Verify binaries exist and are executable
         package-contents = pkgs.runCommand "hermes-package-contents" { } ''
           set -e

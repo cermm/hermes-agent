@@ -39,6 +39,15 @@ def _init_git_repo(repo: Path) -> None:
     subprocess.run(["git", "-C", str(repo), "commit", "-m", "init"], check=True, capture_output=True, text=True)
 
 
+def _set_remote_origin(repo: Path, remote: str = "git@github.com:acme/widgets.git") -> None:
+    subprocess.run(
+        ["git", "-C", str(repo), "remote", "add", "origin", remote],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
 # ---------------------------------------------------------------------------
 # Schema / init
 # ---------------------------------------------------------------------------
@@ -560,6 +569,57 @@ def test_worktree_workspace_explicit_target_materializes_linked_worktree(kanban_
     ).stdout
     assert f"worktree {target}" in listed
     assert f"branch refs/heads/{branch}" in listed
+
+
+def test_configured_worktree_root_rejects_existing_target_from_same_remote_clone(
+    kanban_home, tmp_path, monkeypatch
+):
+    """Source identity is the git common-dir, not the shared remote URL (#352)."""
+    source = tmp_path / "source"
+    wrong_clone = tmp_path / "wrong-clone"
+    policy_root = tmp_path / "external-worktrees"
+    for repo in (source, wrong_clone):
+        _init_git_repo(repo)
+        _set_remote_origin(repo)
+    monkeypatch.setattr(
+        kb,
+        "_configured_worktree_root",
+        lambda: policy_root.resolve(),
+        raising=False,
+    )
+    kb.create_board("external-wt-identity", default_workdir=str(source))
+    target = policy_root / "acme-widgets" / "occupied"
+    target.parent.mkdir(parents=True)
+    subprocess.run(
+        [
+            "git",
+            "-C",
+            str(wrong_clone),
+            "worktree",
+            "add",
+            "-b",
+            "wrong/identity",
+            str(target),
+            "HEAD",
+        ],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+    with kb.connect(board="external-wt-identity") as conn:
+        tid = kb.create_task(
+            conn,
+            title="identity",
+            workspace_kind="worktree",
+            workspace_path=str(target),
+            board="external-wt-identity",
+        )
+        task = kb.get_task(conn, tid)
+        assert task is not None
+
+        with pytest.raises(ValueError, match="different git repository"):
+            kb.resolve_workspace(task, board="external-wt-identity")
 
 
 # ---------------------------------------------------------------------------

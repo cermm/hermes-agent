@@ -47,7 +47,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/compress [here [N] \| focus topic]` | Manually compress conversation context (flush memories + summarize). `/compress here [N]` summarizes everything except the most recent N exchanges (default 2), kept verbatim — pick your own compression boundary. A focus topic narrows what a full summary preserves. |
 | `/rollback` | List or restore filesystem checkpoints (usage: /rollback [number]) |
 | `/diff [staged\|all\|session] [--stat] [path...]` | Show git changes in the working directory. Default: unstaged changes plus untracked files. `staged` shows what's staged for commit, `all` everything since HEAD, and `session` the cumulative diff of everything Hermes changed here (from the earliest retained checkpoint baseline — requires checkpoints to be enabled; complements `/rollback diff <N>`). `--stat` prints just the changed-file summary; path arguments restrict the diff. |
-| `/snapshot [create\|restore <id>\|prune]` (alias: `/snap`) | Create or restore state snapshots of Hermes config/state. `create [label]` saves a snapshot, `restore <id>` reverts to it, `prune [N]` removes old snapshots, or list all with no args. |
+| `/snapshot [create\|restore <id>\|prune]` (alias: `/snap`) | Create or restore state snapshots. Plain `restore <id>` always skips auth. Restoring an encrypted auth envelope requires `/snapshot restore <id> --include-auth --auth-action restore-shared\|restore-profile --auth-passphrase-file PATH`; Hermes validates topology, gateway quiescence, and canonical locks before the transactional auth/config commit. |
 | `/stop` | Kill all running background processes |
 | `/queue <prompt>` (alias: `/q`) | Queue a prompt for the next turn (doesn't interrupt the current agent response). |
 | `/steer <prompt>` | Inject a mid-run note that arrives at the agent **after the next tool call** — no interrupt, no new user turn. The text is appended to the last tool result's content once the current tool completes, giving the agent new context without breaking the current tool-calling loop. Use this to nudge direction mid-task (e.g. "focus on the auth module" while the agent is running tests). |
@@ -132,8 +132,7 @@ Type `/` in the CLI to open the autocomplete menu. Built-in commands are case-in
 | `/copy [number]` | Copy the last assistant response to clipboard (or the Nth-from-last with a number). CLI-only. |
 | `/image <path>` | Attach a local image file for your next prompt. |
 | `/debug` | Upload debug report (system info + logs) and get shareable links. Also available in messaging. |
-| `/update` | Update Hermes Agent to the latest version. |
-| `/profile` | Show active profile name and home directory |
+| `/profile` | Show active profile name and home directory. Profile identity does not imply a local OAuth store; use `hermes auth status` to inspect the canonical auth authority. |
 
 ### Exit
 

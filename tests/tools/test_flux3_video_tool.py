@@ -210,7 +210,7 @@ class TestGating:
 
         # The profile's own store is empty, so this passes only via the
         # global-root fallback — without which the tools would be hidden.
-        assert flux3.peek_nous_access_token() is None
+        assert flux3.peek_nous_access_token() == "root-token"
         assert flux3.check_bfl_requirements() is True
 
     def test_the_credential_probe_never_forces_a_token_refresh(self, monkeypatch):
