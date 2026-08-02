@@ -86,37 +86,48 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # auth.json helpers — share the file with the rest of hermes-agent.
 
 def _auth_json_path() -> Path:
-    """Resolve ``~/.hermes/auth.json`` honouring the active Hermes profile."""
-    try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "auth.json"
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes")) / "auth.json"
+    """Resolve the configured canonical auth authority."""
+    from hermes_cli.auth_authority import get_auth_store_path
+
+    return get_auth_store_path()
 
 
 def _load_auth() -> Dict[str, Any]:
-    path = _auth_json_path()
-    if not path.exists():
-        return {}
-    try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("photon: could not read %s: %s", path, e)
-        return {}
+    from hermes_cli.auth import _load_auth_store
+
+    return _load_auth_store(_auth_json_path())
 
 
-def _save_auth(data: Dict[str, Any]) -> None:
+def _save_auth(
+    data: Dict[str, Any],
+    *,
+    pool_keys: tuple[str, ...] = ("photon", "photon_project", "photon_user"),
+    provider_keys: tuple[str, ...] = ("photon",),
+) -> None:
+    """Merge only Photon-owned state under the canonical store lock.
+
+    Callers commonly pass a whole-store snapshot loaded before doing network
+    work. Re-merging unrelated entries from that snapshot would overwrite
+    credentials rotated by another process while Photon was in flight.
+    """
+    from hermes_cli.auth import _auth_store_lock, _load_auth_store, _save_auth_store
+
     path = _auth_json_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
-    try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+    with _auth_store_lock(target_path=path):
+        current = _load_auth_store(path)
+        providers = data.get("providers")
+        if isinstance(providers, dict):
+            current_providers = current.setdefault("providers", {})
+            for key in provider_keys:
+                if key in providers:
+                    current_providers[key] = providers[key]
+        pool = data.get("credential_pool")
+        if isinstance(pool, dict):
+            current_pool = current.setdefault("credential_pool", {})
+            for key in pool_keys:
+                if key in pool:
+                    current_pool[key] = pool[key]
+        _save_auth_store(current, target_path=path)
 
 
 def load_photon_token() -> Optional[str]:
@@ -140,7 +151,55 @@ def store_photon_token(token: str) -> None:
     auth.setdefault("credential_pool", {})["photon"] = [
         {"access_token": token, "issued_at": int(time.time())}
     ]
-    _save_auth(auth)
+    _save_auth(auth, pool_keys=("photon",), provider_keys=())
+
+
+def clear_photon_token() -> None:
+    """Remove any stored Photon dashboard token from auth.json.
+
+    Used to discard a stale/expired token before re-authentication.
+    """
+    auth = _load_auth()
+    pool = auth.get("credential_pool", {})
+    photon = pool.get("photon", [])
+    pool_changed = isinstance(photon, list) and bool(photon)
+    if pool_changed:
+        pool["photon"] = []
+    # Also clear the legacy shape if present.
+    providers = auth.get("providers", {})
+    provider_changed = "photon" in providers
+    if provider_changed:
+        providers["photon"] = {}
+    if pool_changed or provider_changed:
+        _save_auth(
+            auth,
+            pool_keys=("photon",) if pool_changed else (),
+            provider_keys=("photon",) if provider_changed else (),
+        )
+
+
+def check_photon_token_valid(token: str) -> bool:
+    """Return True if the token is accepted by the dashboard API.
+
+    Delegates to :func:`validate_photon_token`, which checks both
+    ``/api/auth/get-session`` and ``/api/projects/`` — the device flow can
+    mint tokens that pass the session lookup but are rejected by the project
+    APIs, and setup's management calls all hit the project APIs.  A
+    definitive rejection (``PhotonDashboardAuthError``) is treated as stale;
+    transient failures (network blips, 5xx) are treated as "probably valid"
+    so they don't force an unnecessary re-login.
+    """
+    if not token:
+        return False
+    try:
+        validate_photon_token(token)
+        return True
+    except PhotonDashboardAuthError:
+        return False
+    except Exception:
+        # Transient error — don't force a re-auth; let the caller's
+        # management-call error propagate if the token really is bad.
+        return True
 
 
 def load_project_credentials() -> Tuple[Optional[str], Optional[str]]:
@@ -216,7 +275,7 @@ def store_project_credentials(
     if name:
         record["name"] = name
     auth.setdefault("credential_pool", {})["photon_project"] = [record]
-    _save_auth(auth)
+    _save_auth(auth, pool_keys=("photon_project",), provider_keys=())
     _persist_runtime_env(spectrum_project_id, project_secret)
 
 
@@ -241,7 +300,7 @@ def store_user_numbers(
     if dashboard_project_id:
         record["dashboard_project_id"] = dashboard_project_id
     auth.setdefault("credential_pool", {})["photon_user"] = [record]
-    _save_auth(auth)
+    _save_auth(auth, pool_keys=("photon_user",), provider_keys=())
 
 
 def _persist_runtime_env(spectrum_project_id: str, project_secret: str) -> None:
@@ -681,11 +740,19 @@ def create_project(
     resp = httpx.post(url, json=body, headers=_bearer(token), timeout=30.0)
     resp.raise_for_status()
     data = resp.json() or {}
+    if not isinstance(data, dict):
+        raise RuntimeError("Photon create-project returned an unexpected response")
     if data.get("error"):
         raise RuntimeError(f"Photon create-project failed: {data['error']}")
-    if not data.get("id"):
+    if data.get("succeed") is False:
+        raise RuntimeError(
+            f"Photon create-project failed: {data.get('message') or data}"
+        )
+    project_candidate = data.get("data")
+    project: Dict[str, Any] = project_candidate if isinstance(project_candidate, dict) else data
+    if not project.get("id"):
         raise RuntimeError("Photon create-project did not return a project id")
-    return data
+    return project
 
 
 def regenerate_project_secret(token: str, project_id: str) -> str:

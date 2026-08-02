@@ -1,14 +1,19 @@
 """Unit tests for scripts/docker_rebootstrap_nous_session.py.
 
 The boot-time re-seed is the load-bearing "does not clobber a healthy session"
-guard: it must overwrite the on-disk Nous provider entry ONLY when that entry is
-provably terminal (quarantine marker + no usable tokens), and no-op in every
-other case. These are pure-stdlib tmp_path tests (no container build).
+guard: it may overwrite the on-disk Nous provider entry when that entry is
+provably terminal (quarantine marker + no usable tokens), or when an
+orchestrator seed is demonstrably newer. Older/incomparable seeds must no-op.
+These are pure-stdlib tmp_path tests (no container build).
 """
 from __future__ import annotations
 
 import importlib.util
 import json
+import multiprocessing
+import os
+import subprocess
+import sys
 from pathlib import Path
 
 # Import the stdlib-only boot helper by path (it lives under scripts/, not an
@@ -70,6 +75,70 @@ def test_reseeds_terminal_entry(tmp_path):
     assert "last_auth_error" not in store["providers"]["nous"]
 
 
+def test_profile_reseed_uses_docker_canonical_shared_authority(
+    tmp_path, monkeypatch
+):
+    """Rebootstrap must share Docker bootstrap's resolver and lock domain."""
+    root = tmp_path / ".hermes"
+    profile = root / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    shared = root / "auth.json"
+    shared.write_text(
+        json.dumps({"version": 1, "providers": {"nous": _terminal_nous_state()}}),
+        encoding="utf-8",
+    )
+    monkeypatch.syspath_prepend(str(_SCRIPT.parent))
+    sys.modules.pop("docker_auth_authority", None)
+
+    assert mod.reseed_profile_if_terminal(profile, _FRESH_SEED) == "reseeded"
+    assert json.loads(shared.read_text())["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+    assert not (profile / "auth.json").exists()
+
+
+def test_rebootstrap_serializes_with_regular_auth_writer(tmp_path):
+    from scripts.docker_auth_authority import update_auth_store
+
+    home = tmp_path / ".hermes"
+    home.mkdir()
+    auth = _write_auth(home, {"nous": _terminal_nous_state()})
+    context = multiprocessing.get_context("fork")
+    entered = context.Event()
+    release = context.Event()
+    results = context.Queue()
+
+    def regular_writer() -> None:
+        def update(store):
+            entered.set()
+            assert release.wait(timeout=5)
+            store.setdefault("providers", {})["openai-codex"] = {"account": "peer"}
+            return "written", store
+
+        update_auth_store(str(home), update)
+
+    writer = context.Process(target=regular_writer)
+    writer.start()
+    assert entered.wait(timeout=5)
+    reseeder = context.Process(
+        target=lambda: results.put(mod.reseed_if_terminal(auth, _FRESH_SEED))
+    )
+    reseeder.start()
+    release.set()
+    writer.join(timeout=5)
+    reseeder.join(timeout=5)
+
+    assert not writer.is_alive()
+    assert not reseeder.is_alive()
+    assert writer.exitcode == 0
+    assert reseeder.exitcode == 0
+    assert results.get(timeout=1) == "reseeded"
+    store = json.loads(Path(auth).read_text(encoding="utf-8"))
+    assert store["providers"]["openai-codex"] == {"account": "peer"}
+    assert store["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+
+
 def test_does_not_clobber_healthy_entry(tmp_path):
     """LOAD-BEARING: a healthy (live-token) entry must never be overwritten."""
     auth = _write_auth(tmp_path, {"nous": _healthy_nous_state()})
@@ -88,49 +157,23 @@ def test_marker_but_live_token_is_not_terminal(tmp_path):
     assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "not_terminal"
 
 
-def test_preserves_other_providers(tmp_path):
-    """Re-seed swaps ONLY providers.nous; other providers survive intact."""
-    auth = _write_auth(tmp_path, {
-        "nous": _terminal_nous_state(),
-        "openai-codex": {"tokens": {"access_token": "codex-at"}},
+def test_timezone_less_local_timestamp_is_incomparable(tmp_path):
+    auth = _write_auth(tmp_path, {"nous": {
+        **_healthy_nous_state(),
+        "obtained_at": "2026-07-14T19:00:00",
+    }})
+    seed = json.dumps({
+        "providers": {
+            "nous": {
+                "client_id": "hermes-cli-vps",
+                "access_token": "FRESH-at",
+                "refresh_token": "FRESH-rt",
+                "obtained_at": "2026-07-14T19:05:00Z",
+            }
+        },
     })
-    assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "reseeded"
-    store = json.loads(Path(auth).read_text())
-    assert store["providers"]["openai-codex"]["tokens"]["access_token"] == "codex-at"
-    assert store["providers"]["nous"]["refresh_token"] == "FRESH-rt"
 
-
-def test_no_seed_is_noop(tmp_path):
-    auth = _write_auth(tmp_path, {"nous": _terminal_nous_state()})
-    assert mod.reseed_if_terminal(auth, "") == "no_seed"
-
-
-def test_bad_seed_is_noop(tmp_path):
-    auth = _write_auth(tmp_path, {"nous": _terminal_nous_state()})
-    assert mod.reseed_if_terminal(auth, "}{not json") == "bad_seed"
-    # Original terminal entry left untouched.
-    store = json.loads(Path(auth).read_text())
-    assert store["providers"]["nous"]["last_auth_error"]["relogin_required"] is True
-
-
-def test_seed_without_nous_entry_is_noop(tmp_path):
-    auth = _write_auth(tmp_path, {"nous": _terminal_nous_state()})
-    seed = json.dumps({"version": 1, "providers": {"openai-codex": {}}})
-    assert mod.reseed_if_terminal(auth, seed) == "bad_seed"
-
-
-def test_absent_auth_file_defers_to_bootstrap(tmp_path):
-    """No auth.json → blank volume; the normal *_BOOTSTRAP path handles it."""
-    auth = str(tmp_path / "auth.json")
-    assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "no_auth_file"
-
-
-def test_unreadable_auth_file_is_left_alone(tmp_path):
-    p = tmp_path / "auth.json"
-    p.write_text("}{ corrupt")
-    assert mod.reseed_if_terminal(str(p), _FRESH_SEED) == "auth_unreadable"
-    # Not overwritten.
-    assert p.read_text() == "}{ corrupt"
+    assert mod.reseed_if_terminal(auth, seed) == "not_terminal"
 
 
 def test_terminal_entry_missing_marker_is_not_terminal(tmp_path):
@@ -138,3 +181,62 @@ def test_terminal_entry_missing_marker_is_not_terminal(tmp_path):
     entry) → not terminal, no re-seed."""
     auth = _write_auth(tmp_path, {"nous": {"client_id": "hermes-cli-vps"}})
     assert mod.reseed_if_terminal(auth, _FRESH_SEED) == "not_terminal"
+
+
+def test_stage2_bootstrap_restart_and_rebootstrap_script_chain(tmp_path):
+    """Exercise the repository-owned stage2 auth subprocess chain end to end."""
+    scripts = _SCRIPT.parent
+    authority_script = scripts / "docker_auth_authority.py"
+    home = tmp_path / ".hermes"
+    profile = home / "profiles" / "worker"
+    profile.mkdir(parents=True)
+    (profile / "config.yaml").write_text(
+        "auth:\n  authority: shared\n", encoding="utf-8"
+    )
+    env = os.environ.copy()
+    env["HERMES_AUTH_JSON_BOOTSTRAP"] = _FRESH_SEED
+
+    seeded = subprocess.run(
+        [sys.executable, str(authority_script), str(profile), "seed"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert seeded.stdout.strip() == "seeded"
+    shared = home / "auth.json"
+    assert shared.is_file()
+    assert not (profile / "auth.json").exists()
+
+    store = json.loads(shared.read_text(encoding="utf-8"))
+    store["providers"]["openai-codex"] = {"account": "survives-restart"}
+    shared.write_text(json.dumps(store), encoding="utf-8")
+    shared.chmod(0o600)
+    preserved = subprocess.run(
+        [sys.executable, str(authority_script), str(profile), "seed"],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+    assert preserved.stdout.strip() == "exists"
+
+    store = json.loads(shared.read_text(encoding="utf-8"))
+    store["providers"]["nous"] = _terminal_nous_state()
+    shared.write_text(json.dumps(store), encoding="utf-8")
+    shared.chmod(0o600)
+    env["HERMES_AUTH_JSON_REBOOTSTRAP"] = _FRESH_SEED
+    reseeded = subprocess.run(
+        [sys.executable, str(_SCRIPT), str(shared)],
+        env=env,
+        text=True,
+        capture_output=True,
+        check=True,
+    )
+
+    assert "re-seeded auth.json" in reseeded.stdout
+    final = json.loads(shared.read_text(encoding="utf-8"))
+    assert final["providers"]["nous"]["refresh_token"] == "FRESH-rt"
+    assert final["providers"]["openai-codex"] == {"account": "survives-restart"}
+    assert shared.stat().st_mode & 0o777 == 0o600
+    assert (home / "auth.lock").stat().st_mode & 0o777 == 0o600

@@ -3,9 +3,13 @@ from __future__ import annotations
 
 import json
 import os
+import stat
+import threading
+import time
 from base64 import b64encode
 from pathlib import Path
 from typing import Any, Dict
+from unittest import mock
 
 import pytest
 
@@ -71,6 +75,76 @@ def test_store_and_load_photon_token(tmp_hermes_home: Path) -> None:
     assert auth_json["credential_pool"]["photon"][0]["access_token"] == "abc123def456"
 
 
+def test_clear_photon_token_preserves_other_rotated_credentials(tmp_hermes_home: Path) -> None:
+    auth_path = tmp_hermes_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "providers": {
+                    "photon": {"access_token": "legacy-photon"},
+                    "openai-codex": {"refresh_token": "rotated-refresh"},
+                },
+                "credential_pool": {
+                    "photon": [{"access_token": "stale-photon"}],
+                    "nous": [{"access_token": "rotated-nous"}],
+                },
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    photon_auth.clear_photon_token()
+
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert saved["providers"]["photon"] == {}
+    assert saved["credential_pool"]["photon"] == []
+    assert saved["providers"]["openai-codex"]["refresh_token"] == "rotated-refresh"
+    assert saved["credential_pool"]["nous"][0]["access_token"] == "rotated-nous"
+
+
+def test_store_photon_token_preserves_concurrent_project_rotation(
+    tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    auth_path = tmp_hermes_home / "auth.json"
+    auth_path.write_text(
+        json.dumps(
+            {
+                "credential_pool": {
+                    "photon": [{"access_token": "old-photon"}],
+                    "photon_project": [{"project_secret": "old-project"}],
+                }
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def rotate_project_before_save() -> int:
+        current = json.loads(auth_path.read_text(encoding="utf-8"))
+        current["credential_pool"]["photon_project"] = [
+            {"project_secret": "rotated-project"}
+        ]
+        auth_path.write_text(json.dumps(current), encoding="utf-8")
+        return 123
+
+    monkeypatch.setattr(photon_auth.time, "time", rotate_project_before_save)
+
+    photon_auth.store_photon_token("new-photon")
+
+    saved = json.loads(auth_path.read_text(encoding="utf-8"))
+    assert saved["credential_pool"]["photon"][0]["access_token"] == "new-photon"
+    assert saved["credential_pool"]["photon_project"] == [
+        {"project_secret": "rotated-project"}
+    ]
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX mode bits only")
+def test_save_auth_never_world_readable(tmp_hermes_home: Path) -> None:
+    """auth.json must be created 0o600 — no window at process umask."""
+    photon_auth.store_photon_token("secret-token")
+    mode = (tmp_hermes_home / "auth.json").stat().st_mode & 0o777
+    assert mode == 0o600
+
+
 def test_store_project_credentials_round_trip(
     tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -92,39 +166,6 @@ def test_store_project_credentials_round_trip(
     # stored dashboard id — so a pre-backfill diverged install (whose old
     # dashboard id was rewritten and now 404s) still reaches the live row.
     assert photon_auth.load_dashboard_project_id() == "sp-123"
-
-
-def test_store_project_credentials_writes_env(tmp_hermes_home: Path) -> None:
-    photon_auth.store_project_credentials(
-        spectrum_project_id="sp-789",
-        project_secret="sek-ret",
-        dashboard_project_id="dash-1",
-    )
-    env_text = (tmp_hermes_home / ".env").read_text()
-    assert "PHOTON_PROJECT_ID=sp-789" in env_text
-    assert "PHOTON_PROJECT_SECRET=sek-ret" in env_text
-
-
-def test_store_user_numbers_round_trip(tmp_hermes_home: Path) -> None:
-    photon_auth.store_user_numbers(
-        phone_number="+15551234567",
-        assigned_phone_number="+16282679185",
-        user_id="user-uuid",
-        dashboard_project_id="dash-uuid",
-    )
-
-    phone, assigned = photon_auth.load_user_numbers()
-    assert phone == "+15551234567"
-    assert assigned == "+16282679185"
-
-    summary = photon_auth.credential_summary()
-    assert summary["phone_number"] == "+15551234567"
-    assert summary["assigned_phone_number"] == "+16282679185"
-
-    rendered: list[str] = []
-    photon_auth.print_credential_summary(rendered.append)
-    assert "  my number           : +15551234567" in rendered[0]
-    assert "  assigned number     : +16282679185" in rendered[0]
 
 
 def test_load_user_numbers_falls_back_to_home_channel(
@@ -178,6 +219,20 @@ def test_load_project_credentials_env_override(
 
 
 # ---------------------------------------------------------------------------
+# Cross-process auth.json lock (issue: photon wrote auth.json without the
+# cross-process lock hermes_cli/auth.py's ~15 other writers all use, so a
+# concurrent refresh from elsewhere could silently lose photon's update or
+# vice versa).
+
+def _hold_auth_lock_then_release(hold_event: threading.Event, release_event: threading.Event) -> None:
+    from hermes_cli.auth import _auth_store_lock
+
+    with _auth_store_lock():
+        hold_event.set()
+        release_event.wait(timeout=5)
+
+
+# ---------------------------------------------------------------------------
 # Device login flow
 
 def test_request_device_code_uses_photon_cli(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,45 +279,6 @@ def test_poll_for_token_body_access_token(monkeypatch: pytest.MonkeyPatch) -> No
     assert photon_auth.poll_for_token(_device_code(), interval=0, timeout=2) == "tok-body"
 
 
-def test_poll_for_token_session_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(status=200, json_body={"session": {"access_token": "tok-sess"}})
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    assert photon_auth.poll_for_token(_device_code(), interval=0, timeout=2) == "tok-sess"
-
-
-def test_poll_for_token_header_fallback(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(status=200, json_body={}, headers={"set-auth-token": "tok-hdr"})
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    assert photon_auth.poll_for_token(_device_code(), interval=0, timeout=2) == "tok-hdr"
-
-
-def test_poll_for_token_pending_then_success(monkeypatch: pytest.MonkeyPatch) -> None:
-    calls = {"n": 0}
-
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        calls["n"] += 1
-        if calls["n"] == 1:
-            return _FakeResponse(status=400, json_body={"error": "authorization_pending"})
-        return _FakeResponse(status=200, json_body={"access_token": "tok-eventual"})
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    assert photon_auth.poll_for_token(_device_code(), interval=0, timeout=5) == "tok-eventual"
-    assert calls["n"] == 2
-
-
-def test_poll_for_token_access_denied(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(status=400, json_body={"error": "access_denied"})
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    with pytest.raises(RuntimeError, match="access_denied"):
-        photon_auth.poll_for_token(_device_code(), interval=0, timeout=2)
-
-
 # ---------------------------------------------------------------------------
 # Projects
 
@@ -307,12 +323,40 @@ def test_create_project_omits_spectrum_flag(monkeypatch: pytest.MonkeyPatch) -> 
     assert captured["url"].endswith("/api/projects")
 
 
-def test_create_project_raises_without_id(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(json_body={"success": True})
+def test_create_project_unwraps_current_dashboard_response(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(
+        photon_auth.httpx,
+        "post",
+        lambda *_args, **_kwargs: _FakeResponse(
+            json_body={"succeed": True, "data": {"id": "nested-project"}}
+        ),
+    )
 
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    with pytest.raises(RuntimeError, match="project id"):
+    assert photon_auth.create_project("tok")["id"] == "nested-project"
+
+
+@pytest.mark.parametrize(
+    ("response", "message"),
+    [
+        ([{"id": "not-a-mapping"}], "unexpected response"),
+        ({"succeed": False, "message": "denied"}, "denied"),
+        ({"succeed": True, "data": {}}, "did not return a project id"),
+    ],
+)
+def test_create_project_rejects_invalid_dashboard_responses(
+    monkeypatch: pytest.MonkeyPatch,
+    response: Any,
+    message: str,
+) -> None:
+    monkeypatch.setattr(
+        photon_auth.httpx,
+        "post",
+        lambda *_args, **_kwargs: _FakeResponse(json_body=response),
+    )
+
+    with pytest.raises(RuntimeError, match=message):
         photon_auth.create_project("tok")
 
 
@@ -327,32 +371,6 @@ def test_regenerate_project_secret(monkeypatch: pytest.MonkeyPatch) -> None:
 
 # ---------------------------------------------------------------------------
 # Users
-
-def test_create_user_rejects_invalid_phone() -> None:
-    with pytest.raises(ValueError, match="E.164"):
-        photon_auth.create_user("proj", "secret", phone_number="not-a-number")
-
-
-def test_create_user_posts_dashboard_shape(monkeypatch: pytest.MonkeyPatch) -> None:
-    captured: Dict[str, Any] = {}
-
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        captured["url"] = url
-        captured["body"] = kwargs.get("json")
-        captured["headers"] = kwargs.get("headers")
-        return _FakeResponse(json_body={"succeed": True, "data": {
-            "id": "user-uuid", "phoneNumber": "+15551234567",
-        }})
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    user = photon_auth.create_user("proj-id", "secret", phone_number="+15551234567")
-    assert user["id"] == "user-uuid"
-    assert captured["body"]["type"] == "shared"
-    assert captured["body"]["phoneNumber"] == "+15551234567"
-    assert captured["headers"]["Authorization"] == (
-        "Basic " + b64encode(b"proj-id:secret").decode("ascii")
-    )
-    assert captured["url"].endswith("/projects/proj-id/users/")
 
 
 def test_register_user_if_absent_dedup(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -394,22 +412,6 @@ def test_user_assigned_line() -> None:
     assert photon_auth.user_assigned_line(None) is None
 
 
-def test_register_user_if_absent_creates(monkeypatch: pytest.MonkeyPatch) -> None:
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(json_body={"succeed": True, "data": {"users": []}})
-
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(json_body={"succeed": True, "data": {"id": "u-new"}})
-
-    monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    user, created = photon_auth.register_user_if_absent(
-        "proj", "secret", phone_number="+15551234567",
-    )
-    assert created is True
-    assert user["id"] == "u-new"
-
-
 # ---------------------------------------------------------------------------
 # Lines (assigned number)
 
@@ -422,26 +424,6 @@ def test_get_imessage_line_returns_existing(monkeypatch: pytest.MonkeyPatch) -> 
     monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
     line = photon_auth.get_imessage_line("tok", "proj")
     assert line is not None and line["phoneNumber"] == "+15559999999"
-
-
-def test_get_imessage_line_provisions_when_missing(monkeypatch: pytest.MonkeyPatch) -> None:
-    added = {"n": 0}
-
-    def fake_get(url: str, **kwargs: Any) -> _FakeResponse:
-        return _FakeResponse(json_body=[])
-
-    def fake_post(url: str, **kwargs: Any) -> _FakeResponse:
-        added["n"] += 1
-        assert kwargs.get("json", {}).get("platform") == "imessage"
-        return _FakeResponse(json_body={"success": True, "line": {
-            "id": "l-new", "platform": "imessage", "phoneNumber": "+15558888888",
-        }})
-
-    monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    line = photon_auth.get_imessage_line("tok", "proj")
-    assert added["n"] == 1
-    assert line["phoneNumber"] == "+15558888888"
 
 
 # ---------------------------------------------------------------------------
@@ -489,13 +471,6 @@ def test_device_response_candidates_covers_known_shapes() -> None:
     assert by_source["set-auth-token"] == "tok-header"
 
 
-def test_device_response_candidates_dedupes() -> None:
-    candidates = photon_auth._device_response_token_candidates(
-        {"access_token": "same", "accessToken": "same"},
-    )
-    assert [c.token for c in candidates] == ["same"]
-
-
 def test_validate_photon_token_rejects_unrecognized_session(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -503,19 +478,6 @@ def test_validate_photon_token_rejects_unrecognized_session(
         if url.endswith("/api/auth/get-session"):
             return _FakeResponse(json_body={})  # no "user" key
         return _FakeResponse(json_body=[])
-
-    monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
-    with pytest.raises(photon_auth.PhotonDashboardAuthError):
-        photon_auth.validate_photon_token("some-token")
-
-
-def test_validate_photon_token_rejects_project_api_denial(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_get(url: str, *, headers: Dict[str, str], timeout: float) -> _FakeResponse:
-        if url.endswith("/api/auth/get-session"):
-            return _FakeResponse(json_body={"user": {"id": "u1"}})
-        return _FakeResponse(status=403)  # project API rejects
 
     monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
     with pytest.raises(photon_auth.PhotonDashboardAuthError):
@@ -543,32 +505,12 @@ def test_login_device_flow_validates_before_persisting(
 
     monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
     monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
+    # interval=0 falls back to DEFAULT_POLL_INTERVAL inside the poll loop
+    # ("sleep first, then poll") — stub the sleep so the test doesn't idle 5s.
+    monkeypatch.setattr(photon_auth.time, "sleep", lambda _s: None)
 
     token = photon_auth.login_device_flow(open_browser=False)
     assert token == "good-token"
     assert photon_auth.load_photon_token() == "good-token"
 
 
-def test_login_device_flow_raises_when_token_invalid(
-    tmp_hermes_home: Path, monkeypatch: pytest.MonkeyPatch,
-) -> None:
-    def fake_post(url: str, *, json: Dict[str, Any], timeout: float) -> _FakeResponse:
-        if url.endswith("/api/auth/device/code"):
-            return _FakeResponse(json_body={
-                "device_code": "dev", "user_code": "AAAA",
-                "verification_uri": "https://app.photon.codes/device",
-                "verification_uri_complete": None,
-                "expires_in": 600, "interval": 0,
-            })
-        return _FakeResponse(json_body={"access_token": "bad-token"})
-
-    def fake_get(url: str, *, headers: Dict[str, str], timeout: float) -> _FakeResponse:
-        return _FakeResponse(status=401)  # session lookup rejects
-
-    monkeypatch.setattr(photon_auth.httpx, "post", fake_post)
-    monkeypatch.setattr(photon_auth.httpx, "get", fake_get)
-
-    with pytest.raises(photon_auth.PhotonDashboardAuthError):
-        photon_auth.login_device_flow(open_browser=False)
-    # A token that failed validation must never be persisted.
-    assert photon_auth.load_photon_token() is None

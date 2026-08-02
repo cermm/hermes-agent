@@ -8,6 +8,7 @@
     let
       hermes-agent = self'.packages.default;
       hermesVenv = hermes-agent.hermesVenv;
+      authAuthorityPython = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
 
       configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
 
@@ -32,6 +33,25 @@ def leaf_paths(d, prefix=""):
 json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
 ' > $out
       '';
+
+      authAuthoritySeed = pkgs.writeText "hermes-auth-authority-seed.json"
+        ''{"version":1,"providers":{"nous":{"refresh_token":"seed-token"}}}'';
+
+      forceOverwriteEval = builtins.tryEval (builtins.deepSeq
+        ((inputs.nixpkgs.lib.nixosSystem {
+          system = pkgs.system;
+          modules = [
+            inputs.self.nixosModules.default
+            ({ ... }: {
+              system.stateVersion = "24.11";
+              services.hermes-agent = {
+                enable = true;
+                authFileForceOverwrite = true;
+              };
+            })
+          ];
+        }).config.system.build.toplevel.drvPath)
+        true);
     in {
       packages.configKeys = configKeys;
 
@@ -75,6 +95,60 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           echo "ok" > $out/result
         '';
       } // lib.optionalAttrs pkgs.stdenv.hostPlatform.isLinux {
+        # Exercise the activation helper and YAML contract through the same script
+        # invoked by the NixOS module: shared/profile routing, private modes,
+        # and preserve-on-repeat semantics are all build-time contracts.
+        auth-authority-activation = pkgs.runCommand "hermes-auth-authority-activation" { } ''
+          set -euo pipefail
+          ROOT=$(mktemp -d)
+          PROFILE="$ROOT/profiles/worker"
+          mkdir -p "$PROFILE"
+
+          printf 'auth:\n  authority: shared\n' > "$PROFILE/config.yaml"
+          SHARED_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$PROFILE" ${authAuthoritySeed})
+          echo "$SHARED_RESULT" | grep -q '"status": "created"'
+          test -f "$ROOT/auth.json"
+          test ! -e "$PROFILE/auth.json"
+          test "$(stat -c %a "$ROOT/auth.json")" = 600
+          test "$(stat -c %a "$ROOT/auth.lock")" = 600
+
+          ${pkgs.python3}/bin/python3 - "$ROOT/auth.json" <<'PY'
+import json, pathlib, sys
+path = pathlib.Path(sys.argv[1])
+value = json.loads(path.read_text())
+value["providers"]["nous"]["refresh_token"] = "rotated-token"
+path.write_text(json.dumps(value))
+path.chmod(0o600)
+PY
+          REPEAT_RESULT=$(PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$PROFILE" ${authAuthoritySeed})
+          echo "$REPEAT_RESULT" | grep -q '"status": "preserved"'
+          grep -q 'rotated-token' "$ROOT/auth.json"
+
+          LOCAL="$ROOT/profiles/local"
+          mkdir -p "$LOCAL"
+          printf 'auth:\n  authority: profile\n' > "$LOCAL/config.yaml"
+          PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+            "$LOCAL" ${authAuthoritySeed} >/dev/null
+          test -f "$LOCAL/auth.json"
+          test "$(stat -c %a "$LOCAL/auth.json")" = 600
+          test "$(stat -c %a "$LOCAL/auth.lock")" = 600
+
+          mkdir -p $out
+          echo ok > $out/result
+        '';
+
+        # The deprecated overwrite switch must fail module evaluation rather
+        # than becoming an inert or accidentally live activation control.
+        auth-force-overwrite-rejected =
+          if forceOverwriteEval.success then
+            throw "services.hermes-agent.authFileForceOverwrite=true unexpectedly evaluated"
+          else pkgs.runCommand "hermes-auth-force-overwrite-rejected" { } ''
+            mkdir -p $out
+            echo ok > $out/result
+          '';
+
         # Verify binaries exist and are executable
         package-contents = pkgs.runCommand "hermes-package-contents" { } ''
           set -e
@@ -127,13 +201,24 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           test -d ${hermes-agent}/share/hermes-agent/skills || (echo "FAIL: skills directory missing"; exit 1)
           echo "PASS: skills directory exists"
 
-          SKILL_COUNT=$(find ${hermes-agent}/share/hermes-agent/skills -name "SKILL.md" | wc -l)
+          # -L: skills/ is a symlink to the filtered source store path
+          SKILL_COUNT=$(find -L ${hermes-agent}/share/hermes-agent/skills -name "SKILL.md" | wc -l)
           test "$SKILL_COUNT" -gt 0 || (echo "FAIL: no SKILL.md files found in skills directory"; exit 1)
           echo "PASS: $SKILL_COUNT bundled skills found"
 
           grep -q "HERMES_BUNDLED_SKILLS" ${hermes-agent}/bin/hermes || \
             (echo "FAIL: HERMES_BUNDLED_SKILLS not in wrapper"; exit 1)
           echo "PASS: HERMES_BUNDLED_SKILLS set in wrapper"
+
+          # Optional skills ship via the wrapper too (pythonSrc excludes
+          # them from the wheel, so the env var is the only path in nix).
+          test -d ${hermes-agent}/share/hermes-agent/optional-skills || \
+            (echo "FAIL: optional-skills directory missing"; exit 1)
+          OPT_COUNT=$(find -L ${hermes-agent}/share/hermes-agent/optional-skills -name "SKILL.md" | wc -l)
+          test "$OPT_COUNT" -gt 0 || (echo "FAIL: no SKILL.md files in optional-skills"; exit 1)
+          grep -q "HERMES_OPTIONAL_SKILLS" ${hermes-agent}/bin/hermes || \
+            (echo "FAIL: HERMES_OPTIONAL_SKILLS not in wrapper"; exit 1)
+          echo "PASS: $OPT_COUNT optional skills found, HERMES_OPTIONAL_SKILLS set in wrapper"
 
           echo "=== All bundled skills checks passed ==="
           mkdir -p $out
@@ -169,7 +254,8 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           test -d ${hermes-agent}/share/hermes-agent/locales || (echo "FAIL: locales directory missing"; exit 1)
           echo "PASS: locales directory exists"
 
-          LOC_COUNT=$(find ${hermes-agent}/share/hermes-agent/locales -name "*.yaml" | wc -l)
+          # -L: locales/ is a symlink to the source store path
+          LOC_COUNT=$(find -L ${hermes-agent}/share/hermes-agent/locales -name "*.yaml" | wc -l)
           test "$LOC_COUNT" -ge 16 || (echo "FAIL: expected >=16 catalogs, found $LOC_COUNT"; exit 1)
           echo "PASS: $LOC_COUNT locale catalogs found"
 
@@ -180,7 +266,9 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
             (echo "FAIL: HERMES_BUNDLED_LOCALES not in wrapper"; exit 1)
           echo "PASS: HERMES_BUNDLED_LOCALES set in wrapper"
 
-          echo "=== Rendering via the wrapper override (HERMES_BUNDLED_LOCALES) ==="
+          # locales/ is a bare data dir (no __init__.py), shipped via a
+          # symlink + HERMES_BUNDLED_LOCALES (not via wheel data-files).
+          # Verify the wrapper override resolves real strings.
           export HOME=$(mktemp -d)
           RENDERED=$(cd "$HOME" && HERMES_BUNDLED_LOCALES=${hermes-agent}/share/hermes-agent/locales \
             ${hermesVenv}/bin/python3 -c "from agent import i18n; print(i18n.t('gateway.reset.header_default', lang='en'))")
@@ -188,21 +276,35 @@ json.dump(sorted(leaf_paths(DEFAULT_CONFIG)), sys.stdout, indent=2)
           test "$RENDERED" != "gateway.reset.header_default" || (echo "FAIL: i18n returned the raw key with HERMES_BUNDLED_LOCALES set"; exit 1)
           echo "PASS: i18n renders a human string via the wrapper override"
 
-          # Defense-in-depth check: the sealed venv must ALSO resolve catalogs
-          # with NO env var, via the wheel's setuptools data-files materialized
-          # into the venv data scheme. If a future uv2nix bump drops data-files,
-          # the wrapper override above would mask the regression at runtime while
-          # `pip install`/other sealed paths silently break — this catches it.
-          echo "=== Rendering WITHOUT the env var (data-files materialization) ==="
-          BARE_DIR=$(cd "$HOME" && ${hermesVenv}/bin/python3 -c "from agent import i18n; print(i18n._locales_dir())")
-          BARE=$(cd "$HOME" && ${hermesVenv}/bin/python3 -c "from agent import i18n; print(i18n.t('gateway.reset.header_default', lang='en'))")
-          echo "resolved dir (no env var): $BARE_DIR"
-          echo "rendered: $BARE"
-          test "$BARE" != "gateway.reset.header_default" || \
-            (echo "FAIL: sealed venv could not resolve locales without HERMES_BUNDLED_LOCALES — data-files materialization regressed"; exit 1)
-          echo "PASS: sealed venv resolves locales via data-files without the env var"
-
           echo "=== All bundled locales checks passed ==="
+          mkdir -p $out
+          echo "ok" > $out/result
+        '';
+
+        # Verify bundled optional-mcps catalog is present and resolvable.
+        # optional-mcps/ is a bare data dir shipped via symlink +
+        # HERMES_OPTIONAL_MCPS (not via wheel data-files).
+        bundled-mcps = pkgs.runCommand "hermes-bundled-mcps" { } ''
+          set -e
+          echo "=== Checking bundled optional-mcps ==="
+          test -d ${hermes-agent}/share/hermes-agent/optional-mcps || (echo "FAIL: optional-mcps directory missing"; exit 1)
+          echo "PASS: optional-mcps directory exists"
+
+          MANIFEST_COUNT=$(find -L ${hermes-agent}/share/hermes-agent/optional-mcps -name "manifest.yaml" | wc -l)
+          test "$MANIFEST_COUNT" -gt 0 || (echo "FAIL: no manifest.yaml files found"; exit 1)
+          echo "PASS: $MANIFEST_COUNT catalog manifests found"
+
+          grep -q "HERMES_OPTIONAL_MCPS" ${hermes-agent}/bin/hermes || \
+            (echo "FAIL: HERMES_OPTIONAL_MCPS not in wrapper"; exit 1)
+          echo "PASS: HERMES_OPTIONAL_MCPS set in wrapper"
+
+          export HOME=$(mktemp -d)
+          CATALOG=$(cd "$HOME" && ${hermes-agent}/bin/hermes mcp catalog 2>/dev/null || true)
+          echo "catalog output: $CATALOG"
+          test -n "$CATALOG" || (echo "FAIL: hermes mcp catalog returned empty"; exit 1)
+          echo "PASS: mcp catalog resolves entries"
+
+          echo "=== All bundled optional-mcps checks passed ==="
           mkdir -p $out
           echo "ok" > $out/result
         '';

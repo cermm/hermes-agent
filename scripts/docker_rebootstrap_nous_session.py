@@ -19,9 +19,11 @@ already has an auth.json.
 This script is the narrow, safe exception. An orchestrator that manages the
 container can supply a freshly-issued bootstrap session via
 ``HERMES_AUTH_JSON_REBOOTSTRAP`` (plus a restart). On boot we re-seed the Nous
-provider entry from that env **only when the on-disk Nous entry is provably
-terminal** (the quarantine marker above with no usable tokens left). Every other
-case is a no-op, so we never clobber a healthy or merely-rotating session.
+provider entry from that env when the on-disk entry is provably terminal, or
+when the orchestrator seed's ``obtained_at`` is newer than the local session.
+The latter matters because an orchestrator may revoke the previous session
+before restart while its still-present local tokens look healthy. Older or
+incomparable seeds remain no-ops, so a retained env cannot roll auth backward.
 
 Design constraints
 ------------------
@@ -36,7 +38,9 @@ from __future__ import annotations
 
 import json
 import os
+from pathlib import Path
 import sys
+from datetime import datetime, timezone
 from typing import Any, Optional
 
 # Env var the orchestrator sets to the re-seed payload. Deliberately DISTINCT
@@ -44,6 +48,7 @@ from typing import Any, Optional
 # paths can never be confused: BOOTSTRAP seeds a fresh volume; REBOOTSTRAP
 # overwrites a terminally-dead Nous entry on an existing volume.
 REBOOTSTRAP_ENV = "HERMES_AUTH_JSON_REBOOTSTRAP"
+BOOTSTRAP_CLIENT_ID = "hermes-cli-vps"
 
 
 def _nous_entry_is_terminal(nous_state: Any) -> bool:
@@ -70,8 +75,9 @@ def _nous_entry_is_terminal(nous_state: Any) -> bool:
 def _extract_nous_from_seed(seed_raw: str) -> Optional[dict]:
     """Pull the ``providers.nous`` block out of a HERMES_AUTH_JSON_REBOOTSTRAP
     payload. The payload is a full auth.json document (same shape as
-    HERMES_AUTH_JSON_BOOTSTRAP). Returns None if it can't be parsed or carries no
-    nous entry — caller treats None as "nothing to do"."""
+    HERMES_AUTH_JSON_BOOTSTRAP). Returns None unless it carries the expected VPS
+    bootstrap client plus non-empty access and refresh tokens — caller treats
+    None as "nothing to do"."""
     try:
         seed = json.loads(seed_raw)
     except (ValueError, TypeError):
@@ -84,7 +90,52 @@ def _extract_nous_from_seed(seed_raw: str) -> Optional[dict]:
     nous = providers.get("nous")
     if not isinstance(nous, dict) or not nous:
         return None
+    if nous.get("client_id") != BOOTSTRAP_CLIENT_ID:
+        return None
+    if not (
+        isinstance(nous.get("access_token"), str)
+        and nous["access_token"].strip()
+        and isinstance(nous.get("refresh_token"), str)
+        and nous["refresh_token"].strip()
+    ):
+        return None
     return nous
+
+
+def _parse_timestamp(value: Any) -> Optional[datetime]:
+    """Parse an OAuth timestamp without guessing when either side is malformed."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except (ValueError, OverflowError):
+        return None
+    if parsed.tzinfo is None:
+        return None
+    try:
+        return parsed.astimezone(timezone.utc)
+    except (OverflowError, ValueError):
+        return None
+
+
+def _seed_is_newer(local_nous: Any, seed_nous: dict) -> bool:
+    """Whether NAS supplied a bootstrap session newer than the local one.
+
+    NAS mints the replacement before restarting the machine and revokes the
+    previous session.  A healthy-looking local entry can therefore already be
+    stale.  ``obtained_at`` is the server-issued ordering signal that lets boot
+    apply a genuinely newer replacement without allowing an old retained env
+    value to roll credentials back on later restarts.
+    """
+    if not isinstance(local_nous, dict):
+        return False
+    local_obtained = _parse_timestamp(local_nous.get("obtained_at"))
+    seed_obtained = _parse_timestamp(seed_nous.get("obtained_at"))
+    return bool(
+        local_obtained is not None
+        and seed_obtained is not None
+        and seed_obtained > local_obtained
+    )
 
 
 def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
@@ -95,8 +146,9 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
       - "no_auth_file"     — auth.json absent (blank volume → let the normal
                              HERMES_AUTH_JSON_BOOTSTRAP path handle it)
       - "auth_unreadable"  — auth.json present but unparseable (leave as-is)
-      - "not_terminal"     — on-disk nous entry is healthy/absent → no-op
-      - "reseeded"         — nous entry was terminal; replaced from seed
+      - "not_terminal"     — local entry is healthy and at least as new → no-op
+      - "reseeded"         — terminal entry replaced from seed
+      - "reseeded_newer"   — healthy-but-stale entry replaced by a newer seed
     """
     if not seed_raw:
         return "no_seed"
@@ -105,51 +157,58 @@ def reseed_if_terminal(auth_path: str, seed_raw: str) -> str:
     if seed_nous is None:
         return "bad_seed"
 
-    if not os.path.exists(auth_path):
-        # Blank volume — this is the normal first-boot case, not a re-seed.
-        return "no_auth_file"
-
     try:
-        with open(auth_path, "r", encoding="utf-8") as fh:
-            store = json.load(fh)
-    except (OSError, ValueError):
-        # Corrupt/unreadable auth.json: do NOT overwrite blindly. A separate
-        # concern; leave it for the operator / other recovery paths.
-        return "auth_unreadable"
+        from docker_auth_authority import update_auth_store
+    except ModuleNotFoundError:  # imported as scripts.* by unit tests/dev tooling
+        from scripts.docker_auth_authority import update_auth_store
 
-    if not isinstance(store, dict):
-        return "auth_unreadable"
+    def update(store: dict[str, object]):
+        providers = store.get("providers")
+        if not isinstance(providers, dict):
+            providers = {}
+            store["providers"] = providers
 
-    providers = store.get("providers")
-    if not isinstance(providers, dict):
-        providers = {}
-        store["providers"] = providers
+        local_nous = providers.get("nous")
+        terminal = _nous_entry_is_terminal(local_nous)
+        newer_seed = _seed_is_newer(local_nous, seed_nous)
+        if not terminal and not newer_seed:
+            return "not_terminal", None
 
-    if not _nous_entry_is_terminal(providers.get("nous")):
-        # Healthy, rotating, or absent nous entry — the load-bearing guard.
-        # Never clobber a good session; this is what makes the re-seed safe to
-        # push on every restart.
-        return "not_terminal"
+        providers["nous"] = seed_nous
+        return ("reseeded" if terminal else "reseeded_newer"), store
 
-    # Surgical replacement: swap ONLY providers.nous, preserve everything else.
-    providers["nous"] = seed_nous
+    return update_auth_store(
+        Path(auth_path).parent,
+        update,
+        expected_auth_path=auth_path,
+    )
 
-    tmp_path = f"{auth_path}.rebootstrap.tmp"
-    with open(tmp_path, "w", encoding="utf-8") as fh:
-        json.dump(store, fh)
-    os.replace(tmp_path, auth_path)
+
+def reseed_profile_if_terminal(profile_home: Path, seed_raw: str) -> str:
+    """Resolve and update auth through Docker's canonical authority helper."""
     try:
-        os.chmod(auth_path, 0o600)
-    except OSError:
-        pass
-    return "reseeded"
+        from docker_auth_authority import resolve_auth_authority
+    except ModuleNotFoundError:  # imported as scripts.* by unit tests/dev tooling
+        from scripts.docker_auth_authority import resolve_auth_authority
+
+    authority = resolve_auth_authority(str(profile_home))
+    return reseed_if_terminal(str(authority["auth_path"]), seed_raw)
 
 
 def main() -> int:
     auth_path = sys.argv[1] if len(sys.argv) > 1 else ""
     if not auth_path:
         home = os.environ.get("HERMES_HOME", "")
-        auth_path = os.path.join(home, "auth.json") if home else "auth.json"
+        if home:
+            try:
+                from docker_auth_authority import resolve_auth_authority
+
+                auth_path = resolve_auth_authority(home)["auth_path"]
+            except Exception as exc:
+                print(f"[rebootstrap] authority resolution failed (ignored): {exc}", file=sys.stderr)
+                return 0
+        else:
+            auth_path = "auth.json"
     seed_raw = os.environ.get(REBOOTSTRAP_ENV, "")
 
     try:
@@ -160,6 +219,9 @@ def main() -> int:
 
     if result == "reseeded":
         print("[rebootstrap] Nous bootstrap session was terminal; re-seeded auth.json from "
+              f"{REBOOTSTRAP_ENV}")
+    elif result == "reseeded_newer":
+        print("[rebootstrap] Applied newer orchestrator-issued Nous bootstrap session from "
               f"{REBOOTSTRAP_ENV}")
     else:
         # Quiet by default for the common no-op cases; still emit a breadcrumb.

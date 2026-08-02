@@ -1,5 +1,6 @@
 import { describe, expect, it } from 'vitest'
 
+import type { StatusBarSegments } from '../components/appChrome.js'
 import { busyIndicatorWidth, statusBarSegments, statusRuleWidths } from '../components/appChrome.js'
 
 describe('statusRuleWidths', () => {
@@ -69,7 +70,7 @@ describe('statusBarSegments', () => {
       voice: true,
       bg: true,
       subagents: true
-    })
+    } satisfies StatusBarSegments)
   })
 
   it('collapses the context bar to a token count on narrow terminals', () => {
@@ -81,8 +82,7 @@ describe('statusBarSegments', () => {
   })
 
   it('sheds tail segments in priority order as the terminal narrows', () => {
-    // The context bar is the last tail segment to survive; lower-priority
-    // tail segments disappear monotonically as width shrinks.
+    // the context bar is the last of the tail to go.
     const order: (keyof ReturnType<typeof statusBarSegments>)[] = [
       'bar',
       'duration',

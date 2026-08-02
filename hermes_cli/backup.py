@@ -8,6 +8,8 @@ Backup and import commands for hermes CLI.
 HERMES_HOME root.
 """
 
+import base64
+import hashlib
 import json
 import logging
 import os
@@ -16,10 +18,12 @@ import sqlite3
 import sys
 import tempfile
 import time
+import uuid
 import zipfile
+from contextlib import ExitStack
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
@@ -130,6 +134,470 @@ _SECRET_FILE_NAMES = {".env", "auth.json", "state.db"}
 # relative to the user's home directory, and restored to their original
 # home-relative location on import. Anything not under home is skipped.
 _EXTERNAL_PREFIX = "_external/"
+_AUTH_MANIFEST = "_auth/manifest.json"
+_AUTH_ENVELOPE = "_auth/authority.enc"
+
+
+def _auth_passphrase(args) -> bytes:
+    raw_path = getattr(args, "auth_passphrase_file", None)
+    if not raw_path:
+        raise ValueError(
+            "encrypted auth passphrase file is required (--auth-passphrase-file)"
+        )
+    value = Path(raw_path).expanduser().read_bytes().rstrip(b"\r\n")
+    if not value:
+        raise ValueError("auth passphrase file is empty")
+    return value
+
+
+def _encrypt_auth(raw: bytes, passphrase: bytes) -> tuple[bytes, dict[str, Any]]:
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    salt = os.urandom(16)
+    nonce = os.urandom(12)
+    key = Scrypt(salt=salt, length=32, n=2**15, r=8, p=1).derive(passphrase)
+    encrypted = AESGCM(key).encrypt(nonce, raw, b"hermes-auth-backup-v1")
+    manifest = {
+        "schema": 1,
+        "cipher": "AES-256-GCM",
+        "kdf": "scrypt",
+        "scrypt": {"n": 2**15, "r": 8, "p": 1},
+        "salt": base64.b64encode(salt).decode("ascii"),
+        "nonce": base64.b64encode(nonce).decode("ascii"),
+        "sha256": hashlib.sha256(raw).hexdigest(),
+    }
+    return encrypted, manifest
+
+
+def _decrypt_auth(encrypted: bytes, manifest: dict[str, Any], passphrase: bytes) -> bytes:
+    from cryptography.exceptions import InvalidTag
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.scrypt import Scrypt
+
+    params = manifest["scrypt"]
+    salt = base64.b64decode(manifest["salt"], validate=True)
+    nonce = base64.b64decode(manifest["nonce"], validate=True)
+    key = Scrypt(
+        salt=salt,
+        length=32,
+        n=int(params["n"]),
+        r=int(params["r"]),
+        p=int(params["p"]),
+    ).derive(passphrase)
+    try:
+        raw = AESGCM(key).decrypt(nonce, encrypted, b"hermes-auth-backup-v1")
+    except InvalidTag as exc:
+        raise ValueError("auth backup passphrase or ciphertext is invalid") from exc
+    if hashlib.sha256(raw).hexdigest() != manifest["sha256"]:
+        raise ValueError("decrypted auth digest does not match backup manifest")
+    return raw
+
+
+def _atomic_private_write(path: Path, raw: bytes) -> None:
+    """Atomically replace a private state file with mode 0600."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    staged_path: Optional[Path] = None
+    try:
+        with tempfile.NamedTemporaryFile(dir=str(path.parent), delete=False) as staged:
+            staged.write(raw)
+            staged.flush()
+            os.fsync(staged.fileno())
+            staged_path = Path(staged.name)
+        os.chmod(staged_path, 0o600)
+        os.replace(staged_path, path)
+        directory_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    finally:
+        if staged_path is not None:
+            staged_path.unlink(missing_ok=True)
+
+
+_AUTH_RESTORE_TERMINAL_PHASES = frozenset({"committed", "rolled_back", "aborted"})
+
+
+def _restore_identity(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {"exists": False}
+    raw = path.read_bytes()
+    return {
+        "exists": True,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+    }
+
+
+def _restore_matches(path: Path, expected: Optional[dict[str, Any]]) -> bool:
+    return expected is not None and _restore_identity(path) == expected
+
+
+def _restore_journals_root() -> Path:
+    return get_default_hermes_root() / "state-snapshots" / "auth-restores"
+
+
+def _write_restore_journal(path: Path, journal: dict[str, Any]) -> None:
+    _atomic_private_write(
+        path, (json.dumps(journal, indent=2, sort_keys=True) + "\n").encode("utf-8")
+    )
+
+
+def _restore_previous(path: Path, backup: Path, expected: dict[str, Any]) -> None:
+    if expected.get("exists"):
+        if not backup.is_file():
+            raise RuntimeError(f"auth restore backup is missing: {backup}")
+        _atomic_private_write(path, backup.read_bytes())
+    else:
+        path.unlink(missing_ok=True)
+        directory_fd = os.open(
+            str(path.parent), os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+    if not _restore_matches(path, expected):
+        raise RuntimeError(f"auth restore rollback verification failed: {path.name}")
+
+
+def _recover_auth_restore_journal(journal_path: Path) -> str:
+    from hermes_cli.auth import _auth_transition_lock
+
+    with _auth_transition_lock():
+        return _recover_auth_restore_journal_locked(journal_path)
+
+
+def _recover_auth_restore_journal_locked(journal_path: Path) -> str:
+    from hermes_cli.auth import _auth_store_locks
+
+    journal = json.loads(journal_path.read_text(encoding="utf-8"))
+    phase = str(journal.get("phase") or "unknown")
+    if phase in _AUTH_RESTORE_TERMINAL_PHASES:
+        return phase
+
+    root = get_default_hermes_root().resolve(strict=False)
+    auth_target = Path(journal["auth_target"]).resolve(strict=False)
+    config_path = Path(journal["config_path"]).resolve(strict=False)
+    for path in (auth_target, config_path):
+        try:
+            path.relative_to(root)
+        except ValueError as exc:
+            raise RuntimeError("auth restore journal target escapes Hermes root") from exc
+
+    current_dir = Path(journal["current_dir"]).resolve(strict=False)
+    try:
+        current_dir.relative_to(root)
+    except ValueError as exc:
+        raise RuntimeError("auth restore backup path escapes Hermes root") from exc
+
+    old_auth = journal["preconditions"]["auth"]
+    old_config = journal["preconditions"]["config"]
+    new_auth = journal["postconditions"]["auth"]
+    new_config = journal["postconditions"]["config"]
+    lock_paths = sorted(
+        {auth_target, config_path},
+        key=lambda path: os.fsencode(str(path.resolve(strict=False))),
+    )
+
+    with _auth_store_locks(lock_paths, transaction_target=auth_target):
+        auth_is_old = _restore_matches(auth_target, old_auth)
+        auth_is_new = _restore_matches(auth_target, new_auth)
+        config_is_old = _restore_matches(config_path, old_config)
+        config_is_new = _restore_matches(config_path, new_config)
+
+        if phase in {"planned", "backed_up"} and auth_is_old and config_is_old:
+            journal["phase"] = "aborted"
+            journal["aborted_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            return "aborted"
+
+        if auth_is_new and config_is_new:
+            journal["phase"] = "committed"
+            journal["committed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            return "committed"
+
+        if not (auth_is_old or auth_is_new) or not (config_is_old or config_is_new):
+            journal["phase"] = "manual_required"
+            journal["reason"] = "restore_state_changed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise RuntimeError(
+                "auth restore state changed after interruption; manual recovery required"
+            )
+
+        backup_identities = journal.get("backup_identities") or {}
+        backup_paths = {
+            "auth": current_dir / "auth.json",
+            "config": current_dir / "config.yaml",
+        }
+        invalid_backups = [
+            name
+            for name, backup_path in backup_paths.items()
+            if not _restore_matches(backup_path, backup_identities.get(name))
+        ]
+        if invalid_backups:
+            journal["phase"] = "manual_required"
+            journal["reason"] = "backup_verification_failed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise RuntimeError(
+                "auth restore backup verification failed: "
+                + ", ".join(invalid_backups)
+            )
+
+        try:
+            _restore_previous(auth_target, backup_paths["auth"], old_auth)
+            _restore_previous(config_path, backup_paths["config"], old_config)
+        except Exception:
+            journal["phase"] = "manual_required"
+            journal["reason"] = "rollback_verification_failed"
+            journal["manual_required_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise
+
+        journal["phase"] = (
+            "aborted" if phase in {"planned", "backed_up"} else "rolled_back"
+        )
+        journal[f"{journal['phase']}_at"] = datetime.now(timezone.utc).isoformat()
+        _write_restore_journal(journal_path, journal)
+        return str(journal["phase"])
+
+
+def _recover_incomplete_auth_restores() -> list[str]:
+    journals_dir = _restore_journals_root() / "journals"
+    if not journals_dir.is_dir():
+        return []
+    results: list[str] = []
+    for journal_path in sorted(journals_dir.glob("*.json")):
+        journal = json.loads(journal_path.read_text(encoding="utf-8"))
+        if journal.get("phase") not in _AUTH_RESTORE_TERMINAL_PHASES:
+            results.append(_recover_auth_restore_journal(journal_path))
+    return results
+
+
+def _restore_auth_transactionally(
+    raw: bytes,
+    auth_action: str,
+    *,
+    config_home: Optional[Path] = None,
+    restored_config_raw: Optional[bytes] = None,
+    failure_injector: Optional[Callable[[str], None]] = None,
+) -> None:
+    from hermes_cli.auth import _auth_transition_lock
+
+    with _auth_transition_lock():
+        _restore_auth_transaction_locked(
+            raw,
+            auth_action,
+            config_home=config_home,
+            restored_config_raw=restored_config_raw,
+            failure_injector=failure_injector,
+        )
+
+
+def _restore_auth_transaction_locked(
+    raw: bytes,
+    auth_action: str,
+    *,
+    config_home: Optional[Path] = None,
+    restored_config_raw: Optional[bytes] = None,
+    failure_injector: Optional[Callable[[str], None]] = None,
+) -> None:
+    """Durably commit auth plus topology config, recovering interrupted restores."""
+    import yaml
+    from hermes_cli.auth import _auth_store_locks, _validate_auth_store_structure
+
+    if auth_action not in {"restore-shared", "restore-profile"}:
+        raise ValueError(f"unsupported auth restore action: {auth_action}")
+    _validate_auth_store_structure(json.loads(raw.decode("utf-8")))
+
+    _recover_incomplete_auth_restores()
+    home = Path(config_home or get_hermes_home()).resolve(strict=False)
+    authority = "shared" if auth_action == "restore-shared" else "profile"
+    auth_target = (
+        get_default_hermes_root() / "auth.json"
+        if authority == "shared"
+        else home / "auth.json"
+    ).resolve(strict=False)
+    config_path = home / "config.yaml"
+    lock_paths = sorted(
+        {auth_target, config_path},
+        key=lambda path: os.fsencode(str(path.resolve(strict=False))),
+    )
+
+    with _auth_store_locks(lock_paths, transaction_target=auth_target):
+        # Close the gateway-start window between the unlocked preflight and
+        # authority mutation. The transition gate and both store/config locks
+        # are held here, so a successful check remains authoritative through
+        # the commit below.
+        _assert_auth_restore_quiescent(home, auth_action)
+        old_auth = auth_target.read_bytes() if auth_target.exists() else None
+        old_config = config_path.read_bytes() if config_path.exists() else None
+        config: dict[str, Any] = {}
+        config_source = (
+            restored_config_raw if restored_config_raw is not None else old_config
+        )
+        if config_source is not None:
+            loaded = yaml.safe_load(config_source.decode("utf-8")) or {}
+            if not isinstance(loaded, dict):
+                raise ValueError("config.yaml must contain a YAML mapping")
+            config = loaded
+        auth_config = config.setdefault("auth", {})
+        if not isinstance(auth_config, dict):
+            auth_config = {}
+            config["auth"] = auth_config
+        auth_config["authority"] = authority
+        config_raw = yaml.safe_dump(
+            config, sort_keys=False, default_flow_style=False
+        ).encode("utf-8")
+
+        operation_id = uuid.uuid4().hex
+        restore_root = _restore_journals_root()
+        current_dir = restore_root / "current-store" / operation_id
+        current_dir.mkdir(parents=True, mode=0o700)
+        current_dir.chmod(0o700)
+        journal_path = restore_root / "journals" / f"{operation_id}.json"
+        journal = {
+            "version": 1,
+            "operation_id": operation_id,
+            "phase": "planned",
+            "auth_action": auth_action,
+            "auth_target": str(auth_target),
+            "config_path": str(config_path),
+            "current_dir": str(current_dir),
+            "preconditions": {
+                "auth": _restore_identity(auth_target),
+                "config": _restore_identity(config_path),
+            },
+            "postconditions": {
+                "auth": {
+                    "exists": True,
+                    "sha256": hashlib.sha256(raw).hexdigest(),
+                    "size": len(raw),
+                },
+                "config": {
+                    "exists": True,
+                    "sha256": hashlib.sha256(config_raw).hexdigest(),
+                    "size": len(config_raw),
+                },
+            },
+        }
+        _write_restore_journal(journal_path, journal)
+        if failure_injector:
+            failure_injector("planned")
+
+        if old_auth is not None:
+            _atomic_private_write(current_dir / "auth.json", old_auth)
+        if old_config is not None:
+            _atomic_private_write(current_dir / "config.yaml", old_config)
+        journal["phase"] = "backed_up"
+        journal["backup_identities"] = {
+            "auth": _restore_identity(current_dir / "auth.json"),
+            "config": _restore_identity(current_dir / "config.yaml"),
+        }
+        _write_restore_journal(journal_path, journal)
+        if failure_injector:
+            failure_injector("backed_up")
+
+        try:
+            journal["phase"] = "auth_write_pending"
+            _write_restore_journal(journal_path, journal)
+            if failure_injector:
+                failure_injector("auth_write_pending")
+            _atomic_private_write(auth_target, raw)
+            if failure_injector:
+                failure_injector("auth_written")
+            journal["phase"] = "auth_written"
+            _write_restore_journal(journal_path, journal)
+
+            journal["phase"] = "config_write_pending"
+            _write_restore_journal(journal_path, journal)
+            if failure_injector:
+                failure_injector("config_write_pending")
+            _atomic_private_write(config_path, config_raw)
+            if failure_injector:
+                failure_injector("config_written")
+            journal["phase"] = "config_written"
+            _write_restore_journal(journal_path, journal)
+
+            if not _restore_matches(auth_target, journal["postconditions"]["auth"]):
+                raise RuntimeError("restored auth postcondition verification failed")
+            if not _restore_matches(config_path, journal["postconditions"]["config"]):
+                raise RuntimeError("restored config postcondition verification failed")
+            journal["phase"] = "committed"
+            journal["committed_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+        except Exception:
+            _restore_previous(
+                auth_target, current_dir / "auth.json", journal["preconditions"]["auth"]
+            )
+            _restore_previous(
+                config_path,
+                current_dir / "config.yaml",
+                journal["preconditions"]["config"],
+            )
+            journal["phase"] = "rolled_back"
+            journal["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
+            _write_restore_journal(journal_path, journal)
+            raise
+
+
+def _assert_auth_restore_quiescent(home: Path, auth_action: str) -> None:
+    """Fail closed if any gateway can write the selected auth authority."""
+    from gateway.status import (
+        get_running_pid,
+        read_runtime_status,
+        runtime_status_pid_is_live,
+    )
+    from hermes_cli.auth_authority import resolve_auth_authority
+
+    if auth_action not in {"restore-shared", "restore-profile"}:
+        raise ValueError(f"unsupported auth restore action: {auth_action}")
+    root = get_default_hermes_root()
+    target = (
+        root / "auth.json"
+        if auth_action == "restore-shared"
+        else home / "auth.json"
+    ).resolve(strict=False)
+    candidates = {root.resolve(strict=False), home.resolve(strict=False)}
+    profiles_root = root / "profiles"
+    if profiles_root.is_dir():
+        candidates.update(
+            path.resolve(strict=False)
+            for path in profiles_root.iterdir()
+            if path.is_dir()
+        )
+
+    for candidate in sorted(candidates, key=lambda path: os.fsencode(str(path))):
+        authority = resolve_auth_authority(
+            profile_home=candidate,
+            shared_root=root,
+            enforce_migration=False,
+            enforce_restore=False,
+        )
+        if authority.auth_path.resolve(strict=False) != target:
+            continue
+        pid = get_running_pid(candidate / "gateway.pid", cleanup_stale=False)
+        if pid is None:
+            runtime = read_runtime_status(candidate / "gateway_state.json")
+            if (
+                isinstance(runtime, dict)
+                and runtime.get("gateway_state") in {"starting", "running", "degraded"}
+                and runtime_status_pid_is_live(runtime)
+            ):
+                raw_pid = runtime.get("pid")
+                if isinstance(raw_pid, int) and raw_pid > 0:
+                    pid = raw_pid
+        if pid is not None:
+            raise RuntimeError(
+                f"gateway for {candidate} is running (PID {pid}); stop all "
+                "gateways sharing the auth authority before restore"
+            )
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
@@ -235,6 +703,8 @@ def _should_exclude(rel_path: Path) -> bool:
 
 def _should_skip_backup_file(abs_path: Path, rel_path: Path, out_path: Path) -> bool:
     """Return True when a candidate file should not be written to a backup zip."""
+    if rel_path.name in {"auth.json", "auth.lock"}:
+        return True
     if _should_exclude(rel_path):
         return True
 
@@ -257,23 +727,235 @@ def _safe_copy_db(src: Path, dst: Path) -> bool:
     """Copy a SQLite database safely using the backup() API.
 
     Handles WAL mode — produces a consistent snapshot even while
-    the DB is being written to.  Falls back to raw copy on failure.
+    the DB is being written to. Fail closed if a consistent snapshot cannot
+    be created: copying only the live main file can omit committed WAL data.
     """
+    conn = None
+    backup_conn = None
     try:
         conn = sqlite3.connect(f"file:{src}?mode=ro", uri=True)
         backup_conn = sqlite3.connect(str(dst))
         conn.backup(backup_conn)
-        backup_conn.close()
-        conn.close()
         return True
     except Exception as exc:
         logger.warning("SQLite safe copy failed for %s: %s", src, exc)
         try:
-            shutil.copy2(src, dst)
-            return True
-        except Exception as exc2:
-            logger.error("Raw copy also failed for %s: %s", src, exc2)
-            return False
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return False
+    finally:
+        for connection in (backup_conn, conn):
+            if connection is not None:
+                try:
+                    connection.close()
+                except Exception:
+                    pass
+
+
+def is_zeroed_sqlite_file(
+    path: Path, *, probe_bytes: int = 100, force: bool = False
+) -> bool:
+    """True when *path* looks like the #68474 zeroed-state.db signature.
+
+    Signature: size > 0, first *probe_bytes* are all NUL (no ``SQLite format 3``
+    header). Used at SessionDB open and for snapshot diagnostics so a silent
+    all-zero file becomes a guided recovery instead of a generic failure.
+    """
+    try:
+        size = path.stat().st_size
+    except OSError:
+        return False
+    if size <= 0:
+        return False
+    from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+    head = read_header_bytes_preopen(
+        path, length=max(16, probe_bytes), force=force
+    )
+    if not head:
+        return False
+    if head.startswith(b"SQLite format 3"):
+        return False
+    return all(byte == 0 for byte in head)
+
+
+
+# ---------------------------------------------------------------------------
+# SQLite integrity verification
+# ---------------------------------------------------------------------------
+
+_SQLITE_HEADER = b"SQLite format 3\0"
+
+# Default ceiling above which ``PRAGMA integrity_check`` is skipped in favour
+# of the (O(1)) header + structural probe. ``integrity_check`` walks every
+# b-tree page in the file, so its cost scales with database size: on a 30 GB
+# state.db it runs for many minutes of pegged CPU with no output, which reads
+# to the user as a hung `hermes update` (#70553 follow-up). Sessions databases
+# in the tens of GB are normal for heavy users, so the size-unbounded check is
+# never an acceptable default on the update path.
+DEFAULT_INTEGRITY_CHECK_MAX_BYTES = 2 << 30  # 2 GiB
+
+
+def verify_sqlite_integrity(
+    path: Path,
+    *,
+    check_header: bool = True,
+    run_pragma: bool = True,
+    max_bytes: int = DEFAULT_INTEGRITY_CHECK_MAX_BYTES,
+) -> dict:
+    """Verify that a SQLite database at *path* is intact.
+
+    Checks, in order:
+      1. File exists and has an expected minimum size.
+      2. SQLite header magic bytes are present.
+      3. For files at or under ``max_bytes``, a read-only
+         ``PRAGMA integrity_check``. For larger files, a cheap structural
+         probe (schema read) instead — see ``max_bytes``.
+
+    Args:
+        path: Path to the database file.
+        check_header: When true (default), verify the SQLite header magic.
+        run_pragma: When true (default), run ``PRAGMA integrity_check`` via
+            a read-only connection and verify the result is ``"ok"``.
+        max_bytes: Size ceiling for the full ``PRAGMA integrity_check``.
+            Files larger than this fall back to the header check plus a
+            cheap structural probe, because ``integrity_check`` pages
+            through the ENTIRE file — minutes of silent pegged CPU on a
+            multi-GB database. Defaults to
+            :data:`DEFAULT_INTEGRITY_CHECK_MAX_BYTES` (2 GiB); pass ``0``
+            to force the full check regardless of size.
+
+    Returns:
+        A dict with keys:
+          - ``valid`` (bool): true when all requested checks passed.
+          - ``message`` (str): human-readable outcome or error detail.
+          - ``size`` (int | None): file size in bytes, or None if stat failed.
+    """
+    result: dict = {"valid": False, "message": "", "size": None}
+
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        result["message"] = f"not found: {path}"
+        return result
+    except OSError as exc:
+        result["message"] = f"cannot stat: {exc}"
+        return result
+
+    result["size"] = st.st_size
+
+    if st.st_size < 100:  # SQLite minimum viable size (header + 1 page)
+        result["message"] = f"too small ({st.st_size} bytes) to be a valid SQLite database"
+        return result
+
+    oversized = max_bytes > 0 and st.st_size > max_bytes
+
+    if check_header:
+        # Byte-level read: refused when a live connection exists, because
+        # close() would cancel this process's POSIX locks on the file (see
+        # hermes_cli.sqlite_safe_read). Verification targets snapshots and
+        # backup artifacts, which are offline by construction.
+        from hermes_cli.sqlite_safe_read import read_header_bytes_preopen
+
+        head = read_header_bytes_preopen(path, length=len(_SQLITE_HEADER))
+        if head is None:
+            result["valid"] = False
+            result["message"] = "cannot read header"
+            return result
+        if head != _SQLITE_HEADER:
+            result["valid"] = False
+            result["message"] = (
+                f"missing SQLite header magic (got {head[:16].hex()!r})"
+            )
+            return result
+
+    if oversized:
+        # Too large to page through PRAGMA integrity_check (which is O(file
+        # size) and would peg a CPU for minutes on a multi-GB state.db).
+        # Fall back to a cheap O(1) structural probe: the header check above
+        # catches the #68474 zeroed signature, and opening the DB read-only
+        # plus reading sqlite_master + the page geometry catches the
+        # malformed-schema and truncated-header-page classes. Both are
+        # constant-time — they parse the schema, they do not walk the data.
+        run_pragma = False
+        probe = None
+        try:
+            probe = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            probe.execute("PRAGMA schema_version").fetchone()
+            probe.execute("SELECT count(*) FROM sqlite_master").fetchone()
+            result["valid"] = True
+            result["message"] = (
+                f"size {st.st_size:,} bytes exceeds max_bytes {max_bytes:,}; "
+                "skipped PRAGMA integrity_check (header + schema probe passed)"
+            )
+        except sqlite3.DatabaseError as exc:
+            result["valid"] = False
+            result["message"] = f"schema probe failed: {exc}"
+            return result
+        except Exception as exc:
+            result["valid"] = False
+            result["message"] = f"schema probe error: {exc}"
+            return result
+        finally:
+            if probe is not None:
+                try:
+                    probe.close()
+                except Exception:
+                    pass
+
+    if run_pragma:
+        conn = None
+        try:
+            conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, timeout=1.0)
+            cursor = conn.execute("PRAGMA integrity_check")
+            rows = cursor.fetchall()
+            if len(rows) == 1 and rows[0][0] == "ok":
+                result["valid"] = True
+                result["message"] = "integrity check passed"
+                return result
+            errors = [str(r[0]) for r in rows]
+            result["message"] = f"integrity check failed: {'; '.join(errors[:5])}"
+            return result
+        except sqlite3.DatabaseError as exc:
+            result["message"] = f"cannot open database: {exc}"
+            return result
+        except Exception as exc:
+            result["message"] = f"integrity check error: {exc}"
+            return result
+        finally:
+            if conn is not None:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+
+    result["valid"] = True
+    if not result["message"]:
+        result["message"] = "header check passed"
+    return result
+
+
+def copy_db_and_verify(src: Path, dst: Path) -> bool:
+    """Like :func:`_safe_copy_db` but verifies the destination after copy.
+
+    Returns True only when the copy succeeded AND the destination is valid
+    SQLite (header + integrity check). Verification honours the default
+    size ceiling — a multi-GB destination gets the header + schema probe
+    rather than a full ``PRAGMA integrity_check`` that would page through
+    the whole file.
+    """
+    if not _safe_copy_db(src, dst):
+        return False
+    integrity = verify_sqlite_integrity(dst, run_pragma=True)
+    if not integrity.get("valid"):
+        try:
+            dst.unlink(missing_ok=True)
+        except OSError:
+            pass
+        logger.warning("Backup of %s failed integrity verification: %s", src, integrity.get("message"))
+        return False
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -296,6 +978,22 @@ def run_backup(args) -> None:
     if not hermes_root.is_dir():
         print(f"Error: Hermes home directory not found at {hermes_root}")
         sys.exit(1)
+
+    auth_mode = getattr(args, "auth_mode", "exclude")
+    encrypted_auth: Optional[tuple[bytes, dict[str, Any]]] = None
+    if auth_mode == "include-encrypted":
+        from hermes_cli.auth import _auth_store_locks
+        from hermes_cli.auth_authority import resolve_auth_authority
+
+        with _auth_store_locks() as (auth_path, _fallback):
+            authority = resolve_auth_authority()
+            if not auth_path.is_file():
+                raise ValueError("authoritative auth store does not exist")
+            encrypted, manifest = _encrypt_auth(
+                auth_path.read_bytes(), _auth_passphrase(args)
+            )
+        manifest["authority"] = authority.effective_mode
+        encrypted_auth = encrypted, manifest
 
     # Determine output path
     if args.output:
@@ -340,6 +1038,8 @@ def run_backup(args) -> None:
             fpath = dp / fname
             rel = fpath.relative_to(hermes_root)
 
+            if fpath.name in {"auth.json", "auth.lock"}:
+                continue
             if _should_skip_backup_file(fpath, rel, out_path):
                 continue
 
@@ -369,12 +1069,16 @@ def run_backup(args) -> None:
             arcname = _EXTERNAL_PREFIX + rel_to_home.as_posix()
             external_to_add.append((fpath, arcname))
 
-    if not files_to_add and not external_to_add:
+    if not files_to_add and not external_to_add and encrypted_auth is None:
         print("No files to back up.")
         return
 
     # Create the zip
-    file_count = len(files_to_add) + len(external_to_add)
+    file_count = (
+        len(files_to_add)
+        + len(external_to_add)
+        + (2 if encrypted_auth else 0)
+    )
     print(f"Backing up {file_count} files ...")
 
     total_bytes = 0
@@ -382,6 +1086,13 @@ def run_backup(args) -> None:
     t0 = time.monotonic()
 
     with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        if encrypted_auth is not None:
+            encrypted, manifest = encrypted_auth
+            zf.writestr(_AUTH_ENVELOPE, encrypted)
+            zf.writestr(
+                _AUTH_MANIFEST,
+                json.dumps(manifest, sort_keys=True) + "\n",
+            )
         for i, (abs_path, rel_path) in enumerate(files_to_add, 1):
             try:
                 # Safe copy for SQLite databases (handles WAL mode)
@@ -429,7 +1140,10 @@ def run_backup(args) -> None:
 
     # Summary
     print()
-    print(f"Backup complete: {out_path}")
+    if errors:
+        print(f"Backup incomplete: {out_path}")
+    else:
+        print(f"Backup complete: {out_path}")
     print(f"  Files:       {file_count}")
     print(f"  Original:    {_format_size(total_bytes)}")
     print(f"  Compressed:  {_format_size(zip_size)}")
@@ -461,7 +1175,8 @@ def run_backup(args) -> None:
         if len(errors) > 10:
             print(f"  ... and {len(errors) - 10} more")
 
-    print(f"\nRestore with: hermes import {out_path.name}")
+    if not errors:
+        print(f"\nRestore with: hermes import {out_path.name}")
 
 
 # ---------------------------------------------------------------------------
@@ -544,6 +1259,56 @@ def run_import(args) -> None:
         members = [n for n in zf.namelist() if not n.endswith("/")]
         file_count = len(members)
 
+        legacy_auth = [
+            name
+            for name in members
+            if Path(name).name == "auth.json" and not name.startswith("_auth/")
+        ]
+        if legacy_auth:
+            print(
+                "Error: backup contains auth.json without an unambiguous "
+                "authority manifest; import refused"
+            )
+            sys.exit(1)
+
+        auth_action = getattr(args, "auth_action", "skip")
+        has_encrypted_auth = (
+            _AUTH_MANIFEST in members and _AUTH_ENVELOPE in members
+        )
+        restored_auth_raw: Optional[bytes] = None
+        if auth_action != "skip":
+            if not has_encrypted_auth:
+                print("Error: backup contains no encrypted auth authority")
+                sys.exit(1)
+            try:
+                manifest = json.loads(zf.read(_AUTH_MANIFEST))
+                restored_auth_raw = _decrypt_auth(
+                    zf.read(_AUTH_ENVELOPE),
+                    manifest,
+                    _auth_passphrase(args),
+                )
+                from hermes_cli.auth import _validate_auth_store_structure
+
+                _validate_auth_store_structure(json.loads(restored_auth_raw))
+            except (KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                print(f"Error: encrypted auth restore failed: {exc}")
+                sys.exit(1)
+            expected_authority = (
+                "shared" if auth_action == "restore-shared" else "profile"
+            )
+            if manifest.get("authority") != expected_authority:
+                print(
+                    "Error: auth backup topology does not match the selected "
+                    f"restore action ({manifest.get('authority')!r} vs "
+                    f"{expected_authority!r})"
+                )
+                sys.exit(1)
+            try:
+                _assert_auth_restore_quiescent(get_hermes_home(), auth_action)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"Error: auth restore preflight failed: {exc}")
+                sys.exit(1)
+
         print(f"Backup contains {file_count} files")
         print(f"Target: {display_hermes_home()}")
 
@@ -575,11 +1340,14 @@ def run_import(args) -> None:
         errors = []
         restored = 0
         restored_external = 0
+        restored_config_raw: Optional[bytes] = None
         skipped_runtime: list[str] = []
         home_dir = Path.home().resolve()
         t0 = time.monotonic()
 
         for member in members:
+            if member in {_AUTH_MANIFEST, _AUTH_ENVELOPE}:
+                continue
             # External memory-provider state captured under the reserved
             # ``_external/`` arc prefix restores to its original home-relative
             # location (e.g. ~/.honcho/config.json), NOT under HERMES_HOME.
@@ -621,6 +1389,23 @@ def run_import(args) -> None:
             if not rel:
                 continue
 
+            # When auth is restored, config.yaml is part of the authority
+            # transaction below. Do not overwrite its rollback preimage during
+            # ordinary archive extraction.
+            if restored_auth_raw is not None:
+                active_home = get_hermes_home().resolve(strict=False)
+                try:
+                    active_config_rel = str(
+                        (active_home / "config.yaml").relative_to(
+                            hermes_root.resolve(strict=False)
+                        )
+                    )
+                except ValueError:
+                    active_config_rel = "config.yaml"
+                if rel == active_config_rel:
+                    restored_config_raw = zf.read(member)
+                    continue
+
             # Never overwrite volatile gateway/process runtime state. These are
             # namespaced to the machine/container the backup was taken on;
             # clobbering them (especially gateway_state.json) breaks the gateway
@@ -654,6 +1439,18 @@ def run_import(args) -> None:
                 print(f"  {restored}/{file_count} files ...")
 
         elapsed = time.monotonic() - t0
+
+        if restored_auth_raw is not None:
+            try:
+                _restore_auth_transactionally(
+                    restored_auth_raw,
+                    auth_action,
+                    config_home=get_hermes_home(),
+                    restored_config_raw=restored_config_raw,
+                )
+            except Exception as exc:
+                print(f"Error: transactional auth restore failed: {exc}")
+                sys.exit(1)
 
         # Summary
         print()
@@ -756,12 +1553,13 @@ _QUICK_STATE_FILES = (
     "state.db",
     "config.yaml",
     ".env",
-    "auth.json",
     "cron/jobs.json",
+    "cron/executions.db",
     "gateway_state.json",
     "channel_directory.json",
     "channel_aliases.json",
     "processes.json",
+    "gateway/discord_message_recovery.db",  # Discord reconnect replay ledger
     # Per-profile user-created stores that live outside the git checkout and
     # are therefore destroyed if the update flow removes/replaces the file and
     # the post-update schema-init re-creates an empty one (issue #52889). All
@@ -794,17 +1592,61 @@ def create_quick_snapshot(
     label: Optional[str] = None,
     hermes_home: Optional[Path] = None,
     keep: Optional[int] = None,
+    max_file_size: Optional[int] = None,
+    auth_mode: str = "exclude",
+    auth_passphrase_file: Optional[str] = None,
 ) -> Optional[str]:
     """Create a quick state snapshot of critical files.
 
     Copies STATE_FILES to a timestamped directory under state-snapshots/.
     Auto-prunes old snapshots beyond the keep limit.
 
+    Args:
+        max_file_size: When set, individual files larger than this many bytes
+            are skipped (with a printed warning) instead of copied. Used by
+            the pre-update safety snapshot so a multi-GB ``state.db`` can
+            never stall ``hermes update`` or silently eat disk — the small
+            pairing/cron/config files the snapshot exists to protect are
+            always captured. ``None`` (default) copies everything, which
+            preserves manual ``/snapshot`` and ``hermes backup --quick``
+            behavior.
+
     Returns:
         Snapshot ID (timestamp-based), or None if no files found.
     """
     home = hermes_home or get_hermes_home()
     root = _quick_snapshot_root(home)
+    auth_passphrase: Optional[bytes] = None
+    if auth_mode == "include-encrypted":
+        from types import SimpleNamespace
+
+        # Fail before creating a partial snapshot when encrypted auth was
+        # explicitly requested but cannot be produced.
+        auth_passphrase = _auth_passphrase(
+            SimpleNamespace(auth_passphrase_file=auth_passphrase_file)
+        )
+
+    def _too_large(path: Path, rel_name: str) -> bool:
+        """True (and warn) when ``path`` exceeds the max_file_size cap."""
+        if max_file_size is None:
+            return False
+        try:
+            size = path.stat().st_size
+        except OSError:
+            return False
+        if size <= max_file_size:
+            return False
+        print(
+            f"  ⚠ Snapshot: skipping {rel_name} "
+            f"({_format_size(size)} exceeds {_format_size(max_file_size)} limit)"
+        )
+        logger.warning(
+            "Quick snapshot skipped %s: %d bytes exceeds %d byte limit",
+            rel_name,
+            size,
+            max_file_size,
+        )
+        return True
 
     ts = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
     snap_id = f"{ts}-{label}" if label else ts
@@ -812,6 +1654,13 @@ def create_quick_snapshot(
     snap_dir.mkdir(parents=True, exist_ok=True)
 
     manifest: Dict[str, int] = {}  # rel_path -> file size
+    authority_manifest: Optional[Dict[str, Any]] = None
+    failed_dbs: list[str] = []  # present *.db that could not be snapshotted
+    # #68805: track protected DB files skipped for size — they are snapshot
+    # incompleteness just like a failed copy, so pruning must be suppressed
+    # to preserve the older complete snapshot that may contain the only
+    # recoverable database.
+    oversized_skipped: list[str] = []
 
     for rel in _QUICK_STATE_FILES:
         src = home / rel
@@ -831,6 +1680,10 @@ def create_quick_snapshot(
                 # the board databases + their metadata to restore a board.
                 if "/workspaces/" in f"/{sub_rel}/" or "/attachments/" in f"/{sub_rel}/":
                     continue
+                if _too_large(sub, sub_rel):
+                    if sub.suffix == ".db":
+                        oversized_skipped.append(sub_rel)
+                    continue
                 dst = snap_dir / sub_rel
                 dst.parent.mkdir(parents=True, exist_ok=True)
                 try:
@@ -839,6 +1692,16 @@ def create_quick_snapshot(
                     # snapshot time) is captured consistently.
                     if sub.suffix == ".db":
                         if not _safe_copy_db(sub, dst):
+                            failed_dbs.append(sub_rel)
+                            print(
+                                f"  ⚠ Snapshot: SQLite safe copy FAILED for {sub_rel} "
+                                f"— file may be locked or corrupted"
+                            )
+                            if is_zeroed_sqlite_file(sub):
+                                print(
+                                    f"  ⚠ Snapshot: {sub_rel} looks ZEROED "
+                                    f"(no SQLite header; {sub.stat().st_size} bytes of NULs?)"
+                                )
                             continue
                     else:
                         shutil.copy2(sub, dst)
@@ -850,12 +1713,27 @@ def create_quick_snapshot(
         if not src.is_file():
             continue
 
+        if _too_large(src, rel):
+            if src.suffix == ".db":
+                oversized_skipped.append(rel)
+            continue
+
         dst = snap_dir / rel
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
             if src.suffix == ".db":
                 if not _safe_copy_db(src, dst):
+                    failed_dbs.append(rel)
+                    print(
+                        f"  ⚠ Snapshot: SQLite safe copy FAILED for {rel} "
+                        f"— file may be locked or corrupted"
+                    )
+                    if is_zeroed_sqlite_file(src):
+                        print(
+                            f"  ⚠ Snapshot: {rel} looks ZEROED "
+                            f"(no SQLite header; {src.stat().st_size} bytes)"
+                        )
                     continue
             else:
                 shutil.copy2(src, dst)
@@ -863,8 +1741,56 @@ def create_quick_snapshot(
         except (OSError, PermissionError) as exc:
             logger.warning("Could not snapshot %s: %s", rel, exc)
 
+    if auth_mode == "include-encrypted":
+        assert auth_passphrase is not None
+        try:
+            from hermes_cli.auth import _auth_store_locks
+            from hermes_cli.auth_authority import resolve_auth_authority
+
+            encrypted_result: Optional[tuple[bytes, dict[str, Any]]] = None
+            with _auth_store_locks() as (auth_src, _fallback):
+                authority = resolve_auth_authority(profile_home=home)
+                if auth_src.is_file() and not _too_large(auth_src, "auth authority"):
+                    encrypted_result = _encrypt_auth(
+                        auth_src.read_bytes(),
+                        auth_passphrase,
+                    )
+            if encrypted_result is not None:
+                encrypted, authority_manifest = encrypted_result
+                authority_manifest["authority"] = authority.effective_mode
+                auth_dst = snap_dir / _AUTH_ENVELOPE
+                auth_dst.parent.mkdir(parents=True, exist_ok=True)
+                auth_dst.write_bytes(encrypted)
+                auth_dst.chmod(0o600)
+                manifest[_AUTH_ENVELOPE] = auth_dst.stat().st_size
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            logger.warning("Could not snapshot auth authority: %s", exc)
+
+    if failed_dbs:
+        # Critical: update path used to log-and-continue with exit 0, so a
+        # missing state.db backup looked like a successful pre-update snapshot
+        # (#68474). Surface this on stdout where operators actually look.
+        print(
+            "  ⚠ CRITICAL: could not snapshot DB file(s): "
+            + ", ".join(failed_dbs)
+        )
+        print(
+            "  ⚠ If sessions disappear after update, check "
+            f"{root} and run: hermes snapshot list"
+        )
+        logger.error(
+            "Quick snapshot failed to capture DB file(s): %s",
+            ", ".join(failed_dbs),
+        )
+
     if not manifest:
         shutil.rmtree(snap_dir, ignore_errors=True)
+        if failed_dbs:
+            # Distinguish "nothing to snapshot" from "state.db present but unreadable"
+            print(
+                "  ⚠ Snapshot aborted: no files captured "
+                f"(failed DBs: {', '.join(failed_dbs)})"
+            )
         return None
 
     # Write manifest
@@ -875,6 +1801,9 @@ def create_quick_snapshot(
         "file_count": len(manifest),
         "total_size": sum(manifest.values()),
         "files": manifest,
+        "auth_authority": authority_manifest,
+        "failed_dbs": failed_dbs,
+        "oversized_skipped": oversized_skipped,
     }
     with open(snap_dir / "manifest.json", "w", encoding="utf-8") as f:
         json.dump(meta, f, indent=2)
@@ -882,7 +1811,28 @@ def create_quick_snapshot(
     # Auto-prune. Defaults preserve historical manual /snapshot behavior; callers
     # with known high-churn safety snapshots (for example pre-update) can pass a
     # smaller keep value so large state.db copies do not accumulate indefinitely.
-    _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+    # #68805 review: skip pruning when a present DB failed to capture OR was
+    # skipped for size — either way the snapshot is incomplete and the older
+    # snapshot may contain the only recoverable database.
+    incomplete = failed_dbs or oversized_skipped
+    if not incomplete:
+        _prune_quick_snapshots(root, keep=_QUICK_DEFAULT_KEEP if keep is None else keep)
+    else:
+        if oversized_skipped:
+            print(
+                "  ⚠ Skipping snapshot prune: DB file(s) skipped for size: "
+                + ", ".join(oversized_skipped)
+            )
+            logger.warning(
+                "Quick snapshot skipped oversized DB file(s): %s",
+                ", ".join(oversized_skipped),
+            )
+        logger.warning(
+            "Skipping snapshot prune because %d DB(s) failed to capture "
+            "and/or %d were oversized — preserving older snapshots as "
+            "recovery source",
+            len(failed_dbs), len(oversized_skipped),
+        )
 
     logger.info("State snapshot created: %s (%d files)", snap_id, len(manifest))
     return snap_id
@@ -917,6 +1867,10 @@ def list_quick_snapshots(
 def restore_quick_snapshot(
     snapshot_id: str,
     hermes_home: Optional[Path] = None,
+    *,
+    include_auth: bool = False,
+    auth_action: str = "skip",
+    auth_passphrase_file: Optional[str] = None,
 ) -> bool:
     """Restore state from a quick snapshot.
 
@@ -951,8 +1905,49 @@ def restore_quick_snapshot(
     with open(manifest_path, encoding="utf-8") as f:
         meta = json.load(f)
 
+    auth_restore_raw: Optional[bytes] = None
+    if include_auth:
+        if auth_action not in {"restore-shared", "restore-profile"}:
+            logger.error("include_auth requires an explicit auth_action")
+            return False
+        archived = meta.get("auth_authority")
+        if not isinstance(archived, dict):
+            logger.error("Snapshot contains no encrypted auth authority")
+            return False
+        expected_authority = (
+            "shared" if auth_action == "restore-shared" else "profile"
+        )
+        if archived.get("authority") != expected_authority:
+            logger.error(
+                "auth backup topology does not match the selected restore action"
+            )
+            return False
+        try:
+            from types import SimpleNamespace
+
+            envelope = snap_dir / _AUTH_ENVELOPE
+            envelope.resolve().relative_to(snap_dir.resolve())
+            passphrase = _auth_passphrase(
+                SimpleNamespace(auth_passphrase_file=auth_passphrase_file)
+            )
+            auth_restore_raw = _decrypt_auth(
+                envelope.read_bytes(),
+                archived,
+                passphrase,
+            )
+            from hermes_cli.auth import _validate_auth_store_structure
+
+            _validate_auth_store_structure(json.loads(auth_restore_raw))
+            _assert_auth_restore_quiescent(home, auth_action)
+        except (OSError, RuntimeError, ValueError, json.JSONDecodeError) as exc:
+            logger.error("Auth restore preflight failed: %s", exc)
+            return False
+
     restored = 0
+    restored_config_raw: Optional[bytes] = None
     for rel in meta.get("files", {}):
+        if rel.startswith(("_auth_authority/", "_auth/")):
+            continue
         # Security: reject absolute paths and traversals in manifest entries
         src = snap_dir / rel
         try:
@@ -971,6 +1966,10 @@ def restore_quick_snapshot(
         if not src.exists():
             continue
 
+        if auth_restore_raw is not None and rel == "config.yaml":
+            restored_config_raw = src.read_bytes()
+            continue
+
         dst.parent.mkdir(parents=True, exist_ok=True)
 
         try:
@@ -985,6 +1984,19 @@ def restore_quick_snapshot(
             restored += 1
         except (OSError, PermissionError) as exc:
             logger.error("Failed to restore %s: %s", rel, exc)
+
+    if auth_restore_raw is not None:
+        try:
+            _restore_auth_transactionally(
+                auth_restore_raw,
+                auth_action,
+                config_home=home,
+                restored_config_raw=restored_config_raw,
+            )
+            restored += 1
+        except (OSError, PermissionError, RuntimeError, ValueError) as exc:
+            logger.error("Failed to restore auth authority: %s", exc)
+            return False
 
     logger.info("Restored %d files from snapshot %s", restored, snapshot_id)
     return restored > 0
@@ -1010,7 +2022,11 @@ def _count_cron_jobs(path: Path) -> Optional[int]:
     if not path.is_file():
         return None
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        # utf-8-sig: same dialect as cron/jobs.load_jobs — Windows editors
+        # may leave a UTF-8 BOM that plain utf-8 json.load rejects. Without
+        # it a BOM'd jobs.json counts as "unreadable" (None) and the
+        # post-update cron-loss auto-restore safety net silently disables.
+        with open(path, "r", encoding="utf-8-sig") as f:
             data = json.load(f)
     except (OSError, json.JSONDecodeError):
         return None
@@ -1131,7 +2147,11 @@ def prune_quick_snapshots(
 def run_quick_backup(args) -> None:
     """CLI entry point for hermes backup --quick."""
     label = getattr(args, "label", None)
-    snap_id = create_quick_snapshot(label=label)
+    snap_id = create_quick_snapshot(
+        label=label,
+        auth_mode=getattr(args, "auth_mode", "exclude"),
+        auth_passphrase_file=getattr(args, "auth_passphrase_file", None),
+    )
     if snap_id:
         print(f"State snapshot created: {snap_id}")
         snaps = list_quick_snapshots()
@@ -1177,6 +2197,7 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     if not files_to_add:
         return None
 
+    sqlite_snapshot_failed = False
     try:
         with zipfile.ZipFile(out_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             for abs_path, rel_path in files_to_add:
@@ -1191,8 +2212,14 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
                         ) as tmp:
                             tmp_db = Path(tmp.name)
                         try:
-                            if _safe_copy_db(abs_path, tmp_db):
-                                zf.write(tmp_db, arcname=str(rel_path))
+                            if not _safe_copy_db(abs_path, tmp_db):
+                                logger.warning(
+                                    "Full-zip backup aborted: SQLite snapshot failed for %s",
+                                    rel_path,
+                                )
+                                sqlite_snapshot_failed = True
+                                break
+                            zf.write(tmp_db, arcname=str(rel_path))
                         finally:
                             tmp_db.unlink(missing_ok=True)
                     else:
@@ -1203,6 +2230,13 @@ def _write_full_zip_backup(out_path: Path, hermes_root: Path) -> Optional[Path]:
     except OSError as exc:
         logger.warning("Full-zip backup: zip write failed: %s", exc)
         # Best-effort cleanup of partial file
+        try:
+            out_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+
+    if sqlite_snapshot_failed:
         try:
             out_path.unlink(missing_ok=True)
         except OSError:
@@ -1239,7 +2273,7 @@ def _prune_pre_update_backups(backup_dir: Path, keep: int) -> int:
     than no backup at all (and the wrapper in ``main.py`` would still print
     a misleading ``Saved: <path>`` line for a file that no longer exists).
     Operators who genuinely don't want a backup should set
-    ``updates.pre_update_backup: false`` in config — that gates creation.
+    ``updates.pre_update_backup: off`` in config — that gates creation.
     """
     keep = max(keep, 1)
     if not backup_dir.exists():

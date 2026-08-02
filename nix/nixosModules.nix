@@ -28,6 +28,7 @@
 
   let
     cfg = config.services.hermes-agent;
+    authAuthorityPython = pkgs.python3.withPackages (ps: [ ps.pyyaml ]);
     effectivePackage =
       if cfg.extraPythonPackages == [ ] && cfg.extraDependencyGroups == [ ]
       then cfg.package
@@ -42,9 +43,23 @@
       merge = _loc: defs: lib.foldl' lib.recursiveUpdate { } (map (d: d.value) defs);
     };
 
-    # Generate config.yaml from Nix attrset (YAML is a superset of JSON)
-    configJson = builtins.toJSON cfg.settings;
+    # Generate config.yaml from Nix attrset (YAML is a superset of JSON).
+    # terminal.cwd replaces the deprecated MESSAGING_CWD env var — hermes
+    # reads it from config.yaml and bridges it to TERMINAL_CWD internally.
+    # recursiveUpdate: cfg.settings wins, so an explicit
+    # settings.terminal.cwd overrides the workingDirectory default.
+    # Container mode uses the in-container mount path.
+    effectiveWorkDir = if cfg.container.enable then containerWorkDir else cfg.workingDirectory;
+    authSettings = { auth.authority = cfg.authAuthority; };
+    configJson = builtins.toJSON (
+      lib.recursiveUpdate
+        (lib.recursiveUpdate { terminal.cwd = effectiveWorkDir; } cfg.settings)
+        authSettings
+    );
     generatedConfigFile = pkgs.writeText "hermes-config.yaml" configJson;
+    generatedAuthConfigFile = pkgs.writeText "hermes-auth-authority.yaml" (
+      builtins.toJSON authSettings
+    );
     configFile = if cfg.configFile != null then cfg.configFile else generatedConfigFile;
 
     configMergeScript = pkgs.callPackage ./configMergeScript.nix { };
@@ -54,7 +69,6 @@
     # CLI/TUI without hitting EACCES; otherwise group-read-only (0640). Secrets
     # (.env) stay 0640 regardless — see below.
     configYamlMode = if cfg.addToSystemPackages then "0660" else "0640";
-
     # Generate .env from non-secret environment attrset
     envFileContent = lib.concatStringsSep "\n" (
       lib.mapAttrsToList (k: v: "${k}=${v}") cfg.environment
@@ -310,8 +324,21 @@
       authFileForceOverwrite = mkOption {
         type = types.bool;
         default = false;
-        description = "Always overwrite auth.json from authFile on activation.";
+        description = ''
+          Deprecated unsafe compatibility option. Setting this to true is
+          rejected; live auth stores are never overwritten during activation.
+        '';
       };
+
+      authAuthority = mkOption {
+        type = types.enum [ "shared" "profile" ];
+        default = "shared";
+        description = ''
+          Authoritative auth-store class. The NixOS service uses the default
+          profile, so shared and profile both target stateDir/.hermes/auth.json.
+        '';
+      };
+
 
       # ── Documents ────────────────────────────────────────────────────────
       documents = mkOption {
@@ -668,20 +695,16 @@
       {
         assertions = let
           names = map lib.getName cfg.extraPlugins;
-        in [{
-          assertion = (lib.length names) == (lib.length (lib.unique names));
-          message = "services.hermes-agent.extraPlugins: duplicate plugin names detected: ${toString names}. If using fetchFromGitHub, set name = \"plugin-name\" to disambiguate.";
-        }];
-      }
-
-      # ── Assertions ─────────────────────────────────────────────────────
-      {
-        assertions = let
-          names = map lib.getName cfg.extraPlugins;
-        in [{
-          assertion = (lib.length names) == (lib.length (lib.unique names));
-          message = "services.hermes-agent.extraPlugins: duplicate plugin names detected: ${toString names}. If using fetchFromGitHub, set name = \"plugin-name\" to disambiguate.";
-        }];
+        in [
+          {
+            assertion = (lib.length names) == (lib.length (lib.unique names));
+            message = "services.hermes-agent.extraPlugins: duplicate plugin names detected: ${toString names}. If using fetchFromGitHub, set name = \"plugin-name\" to disambiguate.";
+          }
+          {
+            assertion = !cfg.authFileForceOverwrite;
+            message = "services.hermes-agent.authFileForceOverwrite=true is no longer supported because activation must not overwrite a live credential store. Preserve the current store and use `hermes auth migrate-shared` or an explicit encrypted backup restore instead.";
+          }
+        ];
       }
 
       # ── Warnings ──────────────────────────────────────────────────────
@@ -754,6 +777,9 @@
           # hermes-group users can save settings via the CLI/TUI, else 0640).
           ${if cfg.configFile != null then ''
             install -o ${cfg.user} -g ${cfg.group} -m ${configYamlMode} -D ${configFile} ${cfg.stateDir}/.hermes/config.yaml
+            ${configMergeScript} ${generatedAuthConfigFile} ${cfg.stateDir}/.hermes/config.yaml
+            chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
+            chmod ${configYamlMode} ${cfg.stateDir}/.hermes/config.yaml
           '' else ''
             ${configMergeScript} ${generatedConfigFile} ${cfg.stateDir}/.hermes/config.yaml
             chown ${cfg.user}:${cfg.group} ${cfg.stateDir}/.hermes/config.yaml
@@ -820,13 +846,11 @@
 
           # Seed auth file if provided
           ${lib.optionalString (cfg.authFile != null) ''
-            ${if cfg.authFileForceOverwrite then ''
-              install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-            '' else ''
-              if [ ! -f ${cfg.stateDir}/.hermes/auth.json ]; then
-                install -o ${cfg.user} -g ${cfg.group} -m 0600 ${cfg.authFile} ${cfg.stateDir}/.hermes/auth.json
-              fi
-            ''}
+            PYTHONPATH=${../scripts} ${authAuthorityPython}/bin/python3 ${../scripts/nix_auth_authority.py} \
+              ${lib.escapeShellArg "${cfg.stateDir}/.hermes"} \
+              ${lib.escapeShellArg cfg.authFile} \
+              --uid "$(${pkgs.coreutils}/bin/id -u ${cfg.user})" \
+              --gid "$(${pkgs.coreutils}/bin/id -g ${cfg.group})"
           ''}
 
           # Seed .env from Nix-declared environment + environmentFiles.
@@ -883,7 +907,8 @@
             HOME = cfg.stateDir;
             HERMES_HOME = "${cfg.stateDir}/.hermes";
             HERMES_MANAGED = "true";
-            MESSAGING_CWD = cfg.workingDirectory;
+            # Working directory is declared via terminal.cwd in the merged
+            # config.yaml (see configJson above) — MESSAGING_CWD is deprecated.
           };
 
           serviceConfig = {
@@ -980,7 +1005,6 @@
                 --env HERMES_HOME=${containerDataDir}/.hermes \
                 --env HERMES_MANAGED=true \
                 --env HOME=${containerHomeDir} \
-                --env MESSAGING_CWD=${containerWorkDir} \
                 ${lib.concatStringsSep " " cfg.container.extraOptions} \
                 ${cfg.container.image} \
                 ${containerDataDir}/current-package/bin/hermes gateway run --replace ${lib.concatStringsSep " " cfg.extraArgs}

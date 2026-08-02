@@ -17,10 +17,13 @@
   ...
 }:
 let
+  # apps/shared ships as a file: workspace dep of apps/desktop, so its
+  # source must be in the filtered src tree too.
   npm = hermesNpmLib.mkNpmPassthru {
-    folder = "apps/desktop";
-    attr = "desktop";
-    pname = "hermes-desktop";
+    dirs = [
+      "apps/desktop"
+      "apps/shared"
+    ];
   };
 
   packageJson = builtins.fromJSON (builtins.readFile (npm.src + "/apps/desktop/package.json"));
@@ -28,7 +31,7 @@ let
 
   electronHeaders = pkgs.fetchurl {
     url = "https://artifacts.electronjs.org/headers/dist/v${electron.version}/node-v${electron.version}-headers.tar.gz";
-    sha256 = "sha256-zi/QMwRZ0+FwE9XTE+DiSIeJXAwxmLKEaBWD5W3pMOI=";
+    sha256 = "sha256-f8bSbLRmtbP93CJAvEBs+sHWDZ1xP2bcpLhC1EnOmZU=";
   };
 
   # node-pty ships no Electron-tagged prebuild we can trust to match this

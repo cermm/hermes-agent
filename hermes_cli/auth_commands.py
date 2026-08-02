@@ -314,8 +314,9 @@ def auth_add_command(args) -> None:
             _oauth_default_label(provider, len(pool.entries()) + 1),
         )
         # Add a distinct, self-contained pool entry per account (matching the
-        # xai-oauth / qwen-oauth patterns) instead of
-        # routing through the singleton ``_save_codex_tokens`` save path.
+        # qwen-oauth / minimax-oauth multi-account patterns, and the
+        # xai-oauth path below) instead of routing through the singleton
+        # ``_save_codex_tokens`` save path.
         # The singleton round-trip collapsed every added account into the
         # latest login: a second ``hermes auth add openai-codex`` overwrote
         # the first account's singleton-mirrored ``device_code`` entry rather
@@ -349,19 +350,40 @@ def auth_add_command(args) -> None:
             timeout_seconds=getattr(args, "timeout", None) or 20.0,
             open_browser=not getattr(args, "no_browser", False),
         )
-        auth_mod._save_xai_oauth_tokens(
-            creds["tokens"],
-            discovery=creds.get("discovery"),
-            redirect_uri=creds.get("redirect_uri", ""),
+        label = (getattr(args, "label", None) or "").strip() or label_from_token(
+            creds["tokens"]["access_token"],
+            _oauth_default_label(provider, len(pool.entries()) + 1),
+        )
+        # Add a distinct, self-contained pool entry per account (matching the
+        # openai-codex / qwen-oauth / minimax-oauth patterns) instead of
+        # routing through the singleton ``_save_xai_oauth_tokens`` save path.
+        # The singleton round-trip collapsed every added account into the
+        # latest login: a second ``hermes auth add xai-oauth`` overwrote the
+        # first account's singleton-mirrored ``device_code`` entry rather than
+        # creating an independent one. ``manual:device_code`` entries refresh
+        # from their own token pair (``_sync_xai_oauth_entry_from_auth_store``
+        # only adopts the singleton for ``source=="device_code"``), so they
+        # need no singleton shadow.
+        entry = PooledCredential(
+            provider=provider,
+            id=uuid.uuid4().hex[:6],
+            label=label,
+            auth_type=AUTH_TYPE_OAUTH,
+            priority=0,
+            source=SOURCE_MANUAL_DEVICE_CODE,
+            access_token=creds["tokens"]["access_token"],
+            refresh_token=creds["tokens"].get("refresh_token"),
+            base_url=creds.get("base_url") or auth_mod.DEFAULT_XAI_OAUTH_BASE_URL,
             last_refresh=creds.get("last_refresh"),
-            auth_mode="oauth_device_code",
         )
-        pool = load_pool(provider)
-        entry = next((e for e in pool.entries() if getattr(e, "source", "") == "device_code"), None)
-        shown_label = entry.label if entry is not None else label_from_token(
-            creds["tokens"]["access_token"], _oauth_default_label(provider, 1)
-        )
-        print(f'Saved {provider} OAuth credentials: "{shown_label}"')
+        first_credential = not pool.entries()
+        pool.add_entry(entry)
+        # Adding the first xAI credential should make it the active provider
+        # (the old singleton save path did this implicitly via
+        # _save_provider_state). Subsequent adds leave the active provider as-is.
+        if first_credential:
+            auth_mod.mark_provider_active_if_unset(provider)
+        print(f'Added {provider} OAuth credential #{len(pool.entries())}: "{entry.label}"')
         return
 
     if provider == "qwen-oauth":
@@ -486,8 +508,54 @@ def auth_reset_command(args) -> None:
 
 def auth_status_command(args) -> None:
     provider = _normalize_provider(getattr(args, "provider", "") or "")
+    if getattr(args, "all_profiles", False):
+        if provider:
+            raise SystemExit("--all-profiles cannot be combined with a provider")
+        from hermes_cli.auth_authority import auth_authority_status
+        from hermes_cli.profiles import _get_default_hermes_home
+
+        root = _get_default_hermes_home()
+        profiles_root = root / "profiles"
+        homes = [("default", root)]
+        if profiles_root.is_dir():
+            homes.extend(
+                (path.name, path)
+                for path in sorted(profiles_root.iterdir(), key=lambda item: item.name)
+                if path.is_dir()
+            )
+        print("Authentication authority by profile")
+        for name, home in homes:
+            status = auth_authority_status(profile_home=home, shared_root=root)
+            store = "present" if status["exists"] else "not created"
+            print(
+                f"  {name}: mode={status['effective_mode']} "
+                f"provenance={status['provenance']} store={store}"
+            )
+        return
     if not provider:
-        raise SystemExit("Provider is required. Example: `hermes auth status spotify`.")
+        from hermes_cli.auth_authority import auth_authority_status
+
+        status = auth_authority_status()
+        print("Authentication authority")
+        print(f"  mode: {status['effective_mode']} (requested: {status['requested_mode']})")
+        print(f"  provenance: {status['provenance']}")
+        print(f"  store: {'present' if status['exists'] else 'not created'}")
+        if status["permissions"]:
+            print(f"  permissions: {status['permissions']}")
+        if status["legacy_compatibility"]:
+            print("  warning: legacy profile-local compatibility mode is active")
+        if status["conflicting_store"]:
+            print("  warning: a non-authoritative auth store also exists")
+        migration = status.get("migration")
+        if migration:
+            print(
+                f"  migration: plan {migration['plan_id']} is {migration['phase']}"
+            )
+            print(
+                "  recovery: hermes auth migrate-shared --recover "
+                f"--plan-id {migration['plan_id']}"
+            )
+        return
     status = auth_mod.get_auth_status(provider)
     if not status.get("logged_in"):
         reason = status.get("error")
@@ -506,6 +574,73 @@ def auth_status_command(args) -> None:
 
 def auth_logout_command(args) -> None:
     auth_mod.logout_command(SimpleNamespace(provider=getattr(args, "provider", None)))
+
+
+def auth_migrate_shared_command(args) -> None:
+    from hermes_cli.auth_migration import (
+        AuthMigrationError,
+        apply_shared_migration,
+        plan_shared_migration,
+        recover_shared_migration,
+        rollback_shared_migration,
+    )
+
+    try:
+        if getattr(args, "recover", False):
+            plan_id = getattr(args, "plan_id", None)
+            if not plan_id:
+                raise AuthMigrationError("--recover requires --plan-id")
+            print(f"Auth migration recovery state: {recover_shared_migration(plan_id=plan_id)}")
+            return
+        if getattr(args, "rollback", False):
+            plan_id = getattr(args, "plan_id", None)
+            if not plan_id:
+                raise AuthMigrationError("--rollback requires --plan-id")
+            print(
+                "Auth migration rollback state: "
+                f"{rollback_shared_migration(plan_id=plan_id)}"
+            )
+            return
+        if getattr(args, "dry_run", False):
+            plan = plan_shared_migration(
+                all_profiles=bool(getattr(args, "all_profiles", False)),
+                profile=getattr(args, "profile", None),
+            )
+            print("Auth migration dry-run")
+            print(f"  plan_id: {plan.plan_id}")
+            print(f"  plan_digest: {plan.plan_digest}")
+            print(f"  target: {plan.manifest['target_class']}")
+            for source in plan.manifest["sources"]:
+                providers = ", ".join(source["providers"]) or "none"
+                overlaps = ", ".join(source["overlapping_providers"]) or "none"
+                print(
+                    f"  profile {source['profile']}: providers={providers}; "
+                    f"overlap={overlaps}"
+                )
+            print("Review this plan, then rerun with --apply, both plan values, and an explicit conflict policy.")
+            return
+        plan_id = getattr(args, "plan_id", None)
+        plan_digest = getattr(args, "plan_digest", None)
+        if not plan_id or not plan_digest:
+            raise AuthMigrationError("--apply requires --plan-id and --plan-digest from a dry-run")
+        applied = apply_shared_migration(
+            plan_id=plan_id,
+            plan_digest=plan_digest,
+            conflict_policy=getattr(args, "conflict_policy", "abort"),
+        )
+        print(f"Auth migration committed: {applied}")
+    except AuthMigrationError as exc:
+        raise SystemExit(str(exc)) from exc
+
+
+def auth_migrate_recover_command(args) -> None:
+    from hermes_cli.auth_migration import AuthMigrationError, recover_shared_migration
+
+    try:
+        phase = recover_shared_migration(plan_id=getattr(args, "plan_id", ""))
+        print(f"Auth migration recovery state: {phase}")
+    except AuthMigrationError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def auth_spotify_command(args) -> None:
@@ -772,6 +907,12 @@ def auth_command(args) -> None:
         return
     if action == "logout":
         auth_logout_command(args)
+        return
+    if action == "migrate-shared":
+        auth_migrate_shared_command(args)
+        return
+    if action == "migrate-recover":
+        auth_migrate_recover_command(args)
         return
     if action == "spotify":
         auth_spotify_command(args)
