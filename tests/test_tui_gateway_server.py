@@ -678,6 +678,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     try:
         server._start_agent_build(sid, session)
         assert ready.wait(timeout=10)
+        assert session.get("agent_error") is None
     finally:
         server._sessions.pop(sid, None)
 
@@ -731,10 +732,47 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     try:
         server._start_agent_build(sid, session)
         assert ready.wait(timeout=10)
+        assert session.get("agent_error") is None
     finally:
         server._sessions.pop(sid, None)
 
     assert scopes == [{"PROXMOX_TOKEN": "grace-secret"}]
+
+
+def test_agent_build_late_callback_failure_is_not_treated_as_success(monkeypatch):
+    """A ready build with a late callback failure must retain its error contract."""
+    def _fail_late(_sid):
+        raise RuntimeError("late callback failure")
+
+    monkeypatch.setattr(
+        server,
+        "_make_agent",
+        lambda *args, **kwargs: type("Agent", (), {"model": "test"})(),
+    )
+    monkeypatch.setattr(
+        "tui_gateway.entry.ensure_mcp_discovery_started", lambda: None
+    )
+    monkeypatch.setattr(server, "_wire_callbacks", _fail_late)
+    monkeypatch.setattr(server, "_config_model_target", lambda: ("", ""))
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    ready = threading.Event()
+    sid = "test-late-build-failure-sid"
+    session = {
+        "agent_ready": ready,
+        "session_key": "test-late-build-failure-key",
+    }
+
+    server._sessions[sid] = session
+    try:
+        server._start_agent_build(sid, session)
+        assert ready.wait(timeout=10)
+        assert session.get("agent_error") == "late callback failure"
+        wait_error = server._wait_agent(session, "test-rid", timeout=0)
+        assert wait_error is not None
+        assert "late callback failure" in wait_error["error"]["message"]
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_profile_configured_cwd_reads_target_profile(tmp_path):
