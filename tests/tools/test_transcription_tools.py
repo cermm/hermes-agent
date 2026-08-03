@@ -1226,7 +1226,11 @@ class TestRunCommandSttIdleTimeout:
         with pytest.raises(subprocess.TimeoutExpired) as excinfo:
             _run_command_stt(
                 self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
+                # Leave enough time for the child and pipe-reader threads to
+                # be scheduled under a loaded test runner.  The emitted line
+                # resets this idle deadline; the following 30-second stall is
+                # still what triggers the timeout.
+                timeout=2.0,
             )
 
         assert "starting pass 1" in (excinfo.value.stderr or "")
