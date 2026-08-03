@@ -14,6 +14,7 @@ import pytest
 from hermes_constants import reset_hermes_home_override, set_hermes_home_override
 from hermes_cli.active_sessions import active_session_registry_snapshot
 from hermes_cli.browser_connect import ChromeDebugLaunch
+from tools import async_delegation as ad
 from tui_gateway import server
 
 
@@ -3782,13 +3783,13 @@ def test_ws_orphan_reap_retries_when_delegation_lookup_fails(monkeypatch):
         def start(self):
             return None
 
-    def _raise_lookup_error(_origin_ui_session_id):
+    def _raise_lookup_error(*_args, **_kwargs):
         raise RuntimeError("delegation registry unavailable")
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
     monkeypatch.setattr(
-        async_delegation, "active_for_session", _raise_lookup_error
+        async_delegation, "has_live_for_session", _raise_lookup_error
     )
     monkeypatch.setattr(
         server,
@@ -3866,6 +3867,86 @@ def test_ws_orphan_reap_spares_reattached_session(monkeypatch):
         _finalized=True,
     )
     assert server._ws_session_is_orphaned(done) is False
+
+
+def test_ws_orphan_reap_spares_detached_session_with_running_async_delegation(monkeypatch):
+    """A detached desktop session with live background delegation is parked.
+
+    Regression for Desktop session switches / transient WS detaches: the parent
+    turn is idle, but a background delegate_task still owns the session's
+    return address. Reaping immediately interrupts the child and turns its
+    completion into an unowned orphan.
+    """
+    timers = []
+    closed = []
+
+    class _Timer:
+        def __init__(self, _delay, fn):
+            self.fn = fn
+            timers.append(self)
+
+        def start(self):
+            return None
+
+    class _DB:
+        def get_session(self, _session_id):
+            return {"id": "sess_bg", "source": "desktop"}
+
+    monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
+    monkeypatch.setattr(server.threading, "Timer", _Timer)
+    monkeypatch.setattr(server, "_get_db", lambda: _DB())
+    monkeypatch.setattr(
+        server,
+        "_teardown_popped_session",
+        lambda session, *, end_reason="tui_close": (
+            closed.append((session["_sid"], end_reason)) if session is not None else None
+        ),
+    )
+
+    server._sessions["bg-sid"] = _session(
+        transport=server._detached_ws_transport,
+        running=False,
+        session_key="sess_bg",
+    )
+    ad._reset_for_tests()
+    try:
+        with ad._records_lock:
+            ad._records["deleg_bg"] = {
+                "delegation_id": "deleg_bg",
+                "status": "running",
+                "session_key": "sess_bg",
+                "origin_ui_session_id": "bg-sid",
+                "interrupt_fn": lambda: None,
+            }
+
+        server._schedule_ws_orphan_reap("bg-sid")
+        assert len(timers) == 1
+
+        timers.pop(0).fn()
+
+        assert closed == []
+        assert "bg-sid" in server._sessions
+        assert len(timers) == 1
+
+        with ad._records_lock:
+            ad._records["deleg_bg"]["status"] = "finalizing"
+            ad._records["deleg_bg"]["interrupt_fn"] = None
+
+        timers.pop(0).fn()
+
+        assert closed == []
+        assert "bg-sid" in server._sessions
+        assert len(timers) == 1
+
+        with ad._records_lock:
+            ad._records["deleg_bg"]["status"] = "completed"
+
+        timers.pop(0).fn()
+
+        assert closed == [("bg-sid", "ws_orphan_reap")]
+    finally:
+        ad._reset_for_tests()
+        server._sessions.pop("bg-sid", None)
 
 
 def test_ws_orphan_reap_disabled_when_grace_zero(monkeypatch):
@@ -8914,6 +8995,59 @@ def test_prompt_submit_history_version_match_persists_normally(monkeypatch):
         assert len(complete_calls) == 1
         _, _, payload = complete_calls[0]
         assert "warning" not in payload
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_snapshots_history_after_pending_model_switch(monkeypatch):
+    marker = {"role": "user", "content": "[model switched]"}
+    seen = {}
+
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, **_kwargs):
+            seen["history"] = conversation_history
+            return {
+                "final_response": "reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    def _apply_pending(_sid, session):
+        with session["history_lock"]:
+            session["history"].append(marker)
+            session["history_version"] += 1
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    server._sessions["sid"]["pending_model_switch"] = {"raw": "new-model"}
+    emits = []
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_apply_pending_model_switch", _apply_pending)
+        monkeypatch.setattr(server, "_sync_agent_model_with_config", lambda *_a: None)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda *_a: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: emits.append(a))
+
+        server.handle_request(
+            {"id": "1", "method": "prompt.submit", "params": {"session_id": "sid", "text": "hi"}}
+        )
+
+        assert seen["history"] == [marker]
+        assert server._sessions["sid"]["history"][-1] == {
+            "role": "assistant", "content": "reply"
+        }
+        complete = [a for a in emits if a[0] == "message.complete"]
+        assert "warning" not in complete[0][2]
     finally:
         server._sessions.pop("sid", None)
 
