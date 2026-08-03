@@ -609,6 +609,9 @@ class TestPrefetchServerRetainVisibility:
 
         provider._client = self._client_with_ops(["pending", "pending", "completed"])
         provider._client.arecall = AsyncMock(side_effect=_recall)
+        # Exercise the polling contract without coupling this unit test to
+        # scheduler availability during a loaded parallel suite.
+        provider._RETAIN_OP_POLL_INTERVAL_S = 0.01
 
         provider.sync_turn("hello", "world")
         provider._retain_queue.join()

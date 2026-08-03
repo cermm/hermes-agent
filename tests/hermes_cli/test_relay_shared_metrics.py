@@ -342,6 +342,35 @@ def test_cross_process_model_call_updates_are_transactional(tmp_path):
     assert restarted.counter_snapshot()[0]["value"] == 20
 
 
+def test_model_call_update_waits_for_a_brief_competing_writer(tmp_path):
+    database_path = tmp_path / "metrics.sqlite3"
+    outbox_directory = tmp_path / "outbox"
+    store = SharedMetricsStore(database_path, outbox_directory)
+    lock_acquired = threading.Event()
+    release_lock = threading.Event()
+
+    def hold_write_lock() -> None:
+        with sqlite3.connect(database_path) as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            lock_acquired.set()
+            assert release_lock.wait(timeout=5)
+
+    holder = threading.Thread(target=hold_write_lock)
+    holder.start()
+    try:
+        assert lock_acquired.wait(timeout=5)
+        timer = threading.Timer(0.5, release_lock.set)
+        timer.start()
+        store.record_model_call(_dimensions(), "test-version")
+        timer.join(timeout=2)
+    finally:
+        release_lock.set()
+        holder.join(timeout=5)
+
+    assert not holder.is_alive()
+    assert store.counter_snapshot()[0]["value"] == 1
+
+
 
 
 @pytest.mark.skipif(os.name == "nt", reason="POSIX permission modes are unavailable")

@@ -282,6 +282,7 @@ def detect_audio_environment() -> dict:
     """
     warnings = []   # hard-fail: these block voice mode
     notices = []     # informational: logged but don't block
+    is_termux = _is_termux_environment()
     termux_mic_cmd = _termux_microphone_command()
     termux_app_installed = _termux_api_app_installed()
     termux_capture = bool(termux_mic_cmd and termux_app_installed)
@@ -335,8 +336,13 @@ def detect_audio_environment() -> dict:
     # downgrade to a notice (keeps the same recording guidance visible,
     # but doesn't block /voice on for TTS-only usage).
     try:
-        with open('/proc/version', 'r', encoding="utf-8") as f:
-            if 'microsoft' in f.read().lower():
+        # Termux and WSL are mutually exclusive runtimes. A container host or
+        # test may expose a Microsoft kernel string beneath a Termux userspace;
+        # the working Termux capture path is authoritative in that case.
+        if not is_termux:
+            with open('/proc/version', 'r', encoding="utf-8") as f:
+                is_wsl = 'microsoft' in f.read().lower()
+            if is_wsl:
                 if has_forwarded_audio:
                     notices.append("Running in WSL with a reachable PulseAudio/PipeWire sound server")
                 elif _wsl_powershell_tts_available():

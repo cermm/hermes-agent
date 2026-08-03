@@ -205,6 +205,9 @@ class TestDetectAudioEnvironment:
         monkeypatch.delenv("SSH_CONNECTION", raising=False)
         monkeypatch.delenv("PULSE_SERVER", raising=False)
         monkeypatch.setattr("tools.voice_mode._pulse_socket_reachable", lambda: False)
+        monkeypatch.setattr(
+            "tools.voice_mode._wsl_powershell_tts_available", lambda: False
+        )
         monkeypatch.setattr("tools.voice_mode._import_audio",
                             lambda: (MagicMock(), MagicMock()))
 
