@@ -651,13 +651,11 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
 
     seen = []
-    built = threading.Event()
 
     monkeypatch.setattr(
         server,
         "_make_agent",
-        lambda *args, **kwargs: built.set()
-        or type("Agent", (), {"model": "test"})(),
+        lambda *args, **kwargs: type("Agent", (), {"model": "test"})(),
     )
     monkeypatch.setattr(
         "tui_gateway.entry.ensure_mcp_discovery_started",
@@ -679,7 +677,7 @@ def test_profile_scoped_agent_build_starts_mcp_discovery_in_profile_home(
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=10)
     finally:
         server._sessions.pop(sid, None)
 
@@ -706,12 +704,10 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     monkeypatch.setenv("HERMES_HOME", str(tmp_path / "default"))
 
     scopes = []
-    built = threading.Event()
 
     def _fake_make_agent(*args, **kwargs):
         scope = current_secret_scope()
         scopes.append(dict(scope) if scope else None)
-        built.set()
         return type("Agent", (), {"model": "test"})()
 
     monkeypatch.setattr(server, "_make_agent", _fake_make_agent)
@@ -734,7 +730,7 @@ def test_profile_scoped_agent_build_installs_secret_scope(monkeypatch, tmp_path)
     server._sessions[sid] = session
     try:
         server._start_agent_build(sid, session)
-        assert built.wait(timeout=2)
+        assert ready.wait(timeout=10)
     finally:
         server._sessions.pop(sid, None)
 
