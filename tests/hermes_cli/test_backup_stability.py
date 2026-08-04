@@ -79,14 +79,14 @@ def test_atomic_output_rejects_preexisting_partial_symlink(
     target = tmp_path / "attacker-controlled"
     target.write_bytes(b"do not overwrite")
     real_open = backup.os.open
-    planted_partial = None
+    planted_partial = False
 
-    def plant_symlink_then_open(path, flags, mode=0o777):
+    def plant_symlink_then_open(path, flags, mode=0o777, **kwargs):
         nonlocal planted_partial
-        partial = Path(path)
-        partial.symlink_to(target)
-        planted_partial = partial
-        return real_open(path, flags, mode)
+        if flags & os.O_CREAT:
+            os.symlink(target, path, dir_fd=kwargs.get("dir_fd"))
+            planted_partial = True
+        return real_open(path, flags, mode, **kwargs)
 
     monkeypatch.setattr(backup.os, "open", plant_symlink_then_open)
 
@@ -95,8 +95,7 @@ def test_atomic_output_rejects_preexisting_partial_symlink(
             archive.write(b"credential-bearing backup")
 
     assert target.read_bytes() == b"do not overwrite"
-    assert planted_partial is not None
-    assert planted_partial.is_symlink()
+    assert planted_partial
     assert not final.exists()
 
 
@@ -118,6 +117,47 @@ def test_atomic_output_refuses_to_publish_replaced_partial_inode(tmp_path) -> No
     assert attacker.read_bytes() == b"attacker payload"
     assert partial is not None
     assert partial.is_symlink()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory-descriptor publication is POSIX-only")
+def test_atomic_output_publishes_opened_inode_when_staging_path_is_swapped_before_replace(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import backup
+
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+    real_replace = backup.os.replace
+    partial = None
+    attacker_partial = None
+    attacked = False
+
+    def swap_visible_path_then_replace(source, destination, *args, **kwargs) -> None:
+        nonlocal attacked, attacker_partial
+        if not attacked and Path(destination).name == final.name:
+            attacked = True
+            assert partial is not None
+            if partial.parent == tmp_path:
+                partial.rename(tmp_path / "displaced-partial")
+                attacker_partial = partial
+            else:
+                visible_staging = partial.parent
+                visible_staging.rename(tmp_path / "displaced-staging")
+                visible_staging.mkdir()
+                attacker_partial = visible_staging / partial.name
+            attacker_partial.write_bytes(b"attacker payload")
+        real_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(backup.os, "replace", swap_visible_path_then_replace)
+
+    with _atomic_output_path(final) as (archive, yielded_partial):
+        partial = yielded_partial
+        archive.write(b"complete")
+
+    assert attacked
+    assert final.read_bytes() == b"complete"
+    assert attacker_partial is not None
+    assert attacker_partial.read_bytes() == b"attacker payload"
 
 
 def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:

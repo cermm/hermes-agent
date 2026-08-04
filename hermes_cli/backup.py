@@ -670,8 +670,8 @@ def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
 
 @contextmanager
 def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
-    """Yield a private sibling file and publish its exact inode after close."""
-    partial_path = final_path.with_name(
+    """Yield a private file and atomically publish its opened inode."""
+    staging_name = (
         f".{final_path.name}.{os.getpid()}-{threading.get_ident()}-"
         f"{secrets.token_hex(12)}.partial"
     )
@@ -679,11 +679,78 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
     flags |= getattr(os, "O_BINARY", 0)
     flags |= getattr(os, "O_NOFOLLOW", 0)
 
+    use_directory_fds = os.name == "posix"
+    parent_fd = -1
+    staging_fd = -1
+    staging_opened = None
+    partial_name = "archive.partial"
+    partial_path = final_path.with_name(staging_name)
     fd = -1
     archive = None
     opened = None
+
+    def _same_inode(current, expected) -> bool:
+        return expected is not None and (current.st_dev, current.st_ino) == (
+            expected.st_dev,
+            expected.st_ino,
+        )
+
+    def _remove_owned_partial() -> None:
+        try:
+            if use_directory_fds and staging_fd >= 0:
+                current = os.stat(partial_name, dir_fd=staging_fd, follow_symlinks=False)
+            else:
+                current = os.stat(partial_path, follow_symlinks=False)
+        except OSError:
+            return
+        if not _same_inode(current, opened):
+            return
+        try:
+            if use_directory_fds and staging_fd >= 0:
+                os.unlink(partial_name, dir_fd=staging_fd)
+            else:
+                partial_path.unlink(missing_ok=True)
+        except OSError:
+            pass
+
+    def _remove_owned_staging_directory() -> None:
+        if not use_directory_fds or parent_fd < 0 or staging_opened is None:
+            return
+        try:
+            current = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
+        except OSError:
+            return
+        if not _same_inode(current, staging_opened):
+            return
+        try:
+            os.rmdir(staging_name, dir_fd=parent_fd)
+        except OSError:
+            pass
+
     try:
-        fd = os.open(partial_path, flags, 0o600)
+        if use_directory_fds:
+            directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            parent_fd = os.open(final_path.parent, directory_flags)
+            os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+            directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+            staging_fd = os.open(staging_name, directory_flags, dir_fd=parent_fd)
+            if hasattr(os, "fchmod"):
+                os.fchmod(staging_fd, 0o700)
+            staging_opened = os.fstat(staging_fd)
+            current_staging = os.stat(
+                staging_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(current_staging.st_mode)
+                or staging_opened.st_uid != os.geteuid()
+                or not _same_inode(current_staging, staging_opened)
+            ):
+                raise RuntimeError("backup staging directory was replaced during creation")
+            partial_path = final_path.parent / staging_name / partial_name
+            fd = os.open(partial_name, flags, 0o600, dir_fd=staging_fd)
+        else:
+            partial_path = final_path.with_name(staging_name)
+            fd = os.open(partial_path, flags, 0o600)
         opened = os.fstat(fd)
         if hasattr(os, "fchmod"):
             os.fchmod(fd, 0o600)
@@ -694,16 +761,36 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
 
         archive.flush()
         os.fsync(archive.fileno())
-        current = os.stat(partial_path, follow_symlinks=False)
-        if not stat.S_ISREG(current.st_mode) or (
-            current.st_dev,
-            current.st_ino,
-        ) != (opened.st_dev, opened.st_ino):
+        if use_directory_fds:
+            current = os.stat(partial_name, dir_fd=staging_fd, follow_symlinks=False)
+        else:
+            current = os.stat(partial_path, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode) or not _same_inode(current, opened):
             raise RuntimeError("backup partial path was replaced during creation")
 
-        archive.close()
-        archive = None
-        os.replace(partial_path, final_path)
+        if use_directory_fds:
+            os.replace(
+                partial_name,
+                final_path.name,
+                src_dir_fd=staging_fd,
+                dst_dir_fd=parent_fd,
+            )
+            published = os.stat(
+                final_path.name, dir_fd=parent_fd, follow_symlinks=False
+            )
+        else:
+            # Windows does not permit replacing a file while this handle is open.
+            archive.close()
+            archive = None
+            os.replace(partial_path, final_path)
+            published = os.stat(final_path, follow_symlinks=False)
+        if not stat.S_ISREG(published.st_mode) or not _same_inode(published, opened):
+            raise RuntimeError("backup output inode changed during publication")
+
+        if archive is not None:
+            archive.close()
+            archive = None
+        _remove_owned_staging_directory()
     except BaseException:
         if archive is not None:
             try:
@@ -715,20 +802,20 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
                 os.close(fd)
             except OSError:
                 pass
-        try:
-            current = os.stat(partial_path, follow_symlinks=False)
-        except OSError:
-            pass
-        else:
-            if opened is not None and (
-                current.st_dev,
-                current.st_ino,
-            ) == (opened.st_dev, opened.st_ino):
-                try:
-                    partial_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        _remove_owned_partial()
+        _remove_owned_staging_directory()
         raise
+    finally:
+        if staging_fd >= 0:
+            try:
+                os.close(staging_fd)
+            except OSError:
+                pass
+        if parent_fd >= 0:
+            try:
+                os.close(parent_fd)
+            except OSError:
+                pass
 
 
 def _collect_memory_provider_external_paths() -> List[Path]:
