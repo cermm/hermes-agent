@@ -115,8 +115,8 @@ function redactSecrets(text) {
 // per-user `/var/folders/xx/yyyy…/T/` (~49 bytes), and OpenSSH binds a
 // TEMPORARY listener at `<ControlPath>.<16 random chars>` while establishing
 // the master — so a path that itself fits 104 still overflows at bind time. We
-// root under a short per-user base (`~/.hermes/desktop-ssh`) so even worst case
-// (~72 bytes on macOS) stays clear. Windows has no AF_UNIX sun_path limit.
+// root under a short uid-scoped base (`/tmp/hermes-desktop-ssh-<uid>`) so HOME
+// length cannot consume the socket budget. Windows has no AF_UNIX sun_path limit.
 function controlSocketPath(user, host, port, baseDir?, identity: any = {}) {
   const dir = baseDir || defaultControlDir()
   const keyPathIdentity = path.normalize(String(identity.keyPath || ''))
@@ -137,13 +137,17 @@ function controlSocketPath(user, host, port, baseDir?, identity: any = {}) {
 }
 
 function defaultControlDir() {
-  // POSIX: a SHORT, PER-USER base stays under the socket limit AND avoids a
-  // world-shared /tmp dir (no symlink-hijack surface). Created 0700 in open().
   if (process.platform === 'win32') {
     return path.join(os.tmpdir(), 'hermes-desktop-ssh')
   }
 
-  return path.join(os.homedir(), '.hermes', 'desktop-ssh')
+  // POSIX: use a fixed short root so an isolated/long HOME cannot overflow
+  // sun_path. The numeric uid keeps users separate; open() creates the leaf
+  // 0700 and rejects symlinks, non-directories, and foreign ownership before
+  // passing its socket path to OpenSSH.
+  const uid = typeof process.getuid === 'function' ? process.getuid() : os.userInfo().uid
+
+  return path.join('/tmp', `hermes-desktop-ssh-${uid}`)
 }
 
 // Command construction (pure — the unit tests exercise these directly)

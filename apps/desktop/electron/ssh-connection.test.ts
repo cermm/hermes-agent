@@ -4,7 +4,7 @@ import fs from 'node:fs'
 import os from 'node:os'
 import path from 'node:path'
 
-import { test } from 'vitest'
+import { test, vi } from 'vitest'
 
 import {
   baseSshOptions,
@@ -66,18 +66,73 @@ test('controlSocketPath is stable, short, and host-distinct', () => {
   assert.match(a, /\/[0-9a-f]{16}\.sock$/)
 })
 
-test('controlSocketPath default base stays under sun_path even with the temp-listener suffix', () => {
+test('controlSocketPath default POSIX base stays under sun_path with a long HOME and temp-listener suffix', () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
   // OpenSSH binds a temporary listener at `<ControlPath>.<16 random chars>` (a
-  // 17-byte suffix) while opening the master. The macOS regression was the
-  // default base under os.tmpdir() (/var/folders/.../T/) pushing it over 104.
-  const p = controlSocketPath('hermes', 'remote-build-server', 22) // no baseDir → default
-  const worstCase = `${p}.0123456789abcdef` // mimic the .<16-char> temp suffix
-  assert.ok(
-    worstCase.length <= 104,
-    `default control socket + temp suffix must fit sun_path (got ${worstCase.length}: ${worstCase})`
-  )
-  // And it must NOT live under the deeply-nested macOS per-user temp dir.
-  assert.ok(!p.includes('/var/folders/'), 'default base must not be os.tmpdir() on macOS')
+  // 17-byte suffix) while opening the master. Isolated evidence runs deliberately
+  // use a long HOME, so the runtime default must not inherit HOME's length.
+  const originalHome = process.env.HOME
+  const longHome = path.join('/tmp', `hermes-isolated-home-${'x'.repeat(96)}`)
+
+  process.env.HOME = longHome
+
+  try {
+    const p = controlSocketPath('hermes', 'remote-build-server', 22) // no baseDir → default
+    const worstCase = `${p}.0123456789abcdef` // mimic the .<16-char> temp suffix
+
+    assert.ok(
+      worstCase.length <= 104,
+      `default control socket + temp suffix must fit sun_path (got ${worstCase.length}: ${worstCase})`
+    )
+    assert.ok(!p.startsWith(longHome), 'default POSIX control path must be independent of HOME length')
+    assert.equal(
+      path.dirname(p),
+      path.join('/tmp', `hermes-desktop-ssh-${process.getuid!()}`),
+      'default POSIX control directory must remain isolated by numeric uid'
+    )
+  } finally {
+    if (originalHome === undefined) {
+      delete process.env.HOME
+    } else {
+      process.env.HOME = originalHome
+    }
+  }
+})
+
+test('open() rejects a foreign-owned default POSIX control directory before dialing a master', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const currentUid = process.getuid!()
+  const defaultDir = path.join('/tmp', `hermes-desktop-ssh-${currentUid}`)
+  const mkdir = vi.spyOn(fs, 'mkdirSync').mockImplementation(() => undefined as never)
+
+  const lstat = vi.spyOn(fs, 'lstatSync').mockReturnValue({
+    isSymbolicLink: () => false,
+    isDirectory: () => true,
+    uid: currentUid + 1,
+    mode: 0o40700
+  } as fs.Stats)
+
+  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn })
+
+  try {
+    await assert.rejects(conn.open(), /owned by uid|unsafe/i)
+    assert.equal(mkdir.mock.calls[0]?.[0], defaultDir)
+    assert.equal(lstat.mock.calls[0]?.[0], defaultDir)
+    assert.ok(
+      !spawnFn.calls.some(args => args.includes('-M')),
+      'foreign-owned default dir must fail before master dial'
+    )
+  } finally {
+    lstat.mockRestore()
+    mkdir.mockRestore()
+  }
 })
 
 test('baseSshOptions carries the house ControlMaster/BatchMode/accept-new policy', () => {
