@@ -682,7 +682,7 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
     use_directory_fds = os.name == "posix"
     parent_fd = -1
     staging_fd = -1
-    staging_opened = None
+    staging_identity = None
     partial_name = "archive.partial"
     partial_path = final_path.with_name(staging_name)
     fd = -1
@@ -714,13 +714,13 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
             pass
 
     def _remove_owned_staging_directory() -> None:
-        if not use_directory_fds or parent_fd < 0 or staging_opened is None:
+        if not use_directory_fds or parent_fd < 0 or staging_identity is None:
             return
         try:
             current = os.stat(staging_name, dir_fd=parent_fd, follow_symlinks=False)
         except OSError:
             return
-        if not _same_inode(current, staging_opened):
+        if not _same_inode(current, staging_identity):
             return
         try:
             os.rmdir(staging_name, dir_fd=parent_fd)
@@ -732,6 +732,14 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
             directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             parent_fd = os.open(final_path.parent, directory_flags)
             os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
+            staging_identity = os.stat(
+                staging_name, dir_fd=parent_fd, follow_symlinks=False
+            )
+            if (
+                not stat.S_ISDIR(staging_identity.st_mode)
+                or staging_identity.st_uid != os.geteuid()
+            ):
+                raise RuntimeError("backup staging directory was replaced during creation")
             directory_flags |= getattr(os, "O_NOFOLLOW", 0)
             staging_fd = os.open(staging_name, directory_flags, dir_fd=parent_fd)
             if hasattr(os, "fchmod"):
@@ -743,7 +751,8 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
             if (
                 not stat.S_ISDIR(current_staging.st_mode)
                 or staging_opened.st_uid != os.geteuid()
-                or not _same_inode(current_staging, staging_opened)
+                or not _same_inode(staging_opened, staging_identity)
+                or not _same_inode(current_staging, staging_identity)
             ):
                 raise RuntimeError("backup staging directory was replaced during creation")
             partial_path = final_path.parent / staging_name / partial_name

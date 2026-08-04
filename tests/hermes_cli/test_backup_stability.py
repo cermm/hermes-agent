@@ -55,6 +55,36 @@ def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
     assert not partial.exists()
 
 
+@pytest.mark.skipif(os.name != "posix", reason="directory-descriptor staging is POSIX-only")
+def test_atomic_output_removes_owned_staging_directory_when_staging_open_fails(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import backup
+
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+    entries_before = {path.name for path in tmp_path.iterdir()}
+    real_open = backup.os.open
+    injected = False
+
+    def fail_staging_open(path, flags, mode=0o777, **kwargs):
+        nonlocal injected
+        if not injected and kwargs.get("dir_fd") is not None and not flags & os.O_CREAT:
+            injected = True
+            raise PermissionError("injected staging open failure")
+        return real_open(path, flags, mode, **kwargs)
+
+    monkeypatch.setattr(backup.os, "open", fail_staging_open)
+
+    with pytest.raises(PermissionError, match="injected staging open failure"):
+        with _atomic_output_path(final):
+            raise AssertionError("staging setup unexpectedly completed")
+
+    assert injected
+    assert final.read_bytes() == b"previous"
+    assert {path.name for path in tmp_path.iterdir()} == entries_before
+
+
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
 def test_atomic_output_descriptor_is_private_under_permissive_umask(tmp_path) -> None:
     final = tmp_path / "backup.zip"
