@@ -1637,6 +1637,11 @@ class LocalEnvironment(BaseEnvironment):
                 proc.kill()
             except Exception:
                 pass
+            finally:
+                try:
+                    proc.wait(timeout=0.2)
+                except (subprocess.TimeoutExpired, OSError):
+                    pass
 
     def _update_cwd(self, result: dict):
         """Update cwd from the stdout marker emitted by the wrapped command.

@@ -122,6 +122,39 @@ def test_kill_process_reaps_wrapper_when_group_exits_after_sigterm(monkeypatch):
     assert wait_calls == [0.2]
 
 
+def test_kill_process_reaps_wrapper_after_fallback_kill(monkeypatch):
+    """The POSIX error fallback must reap the direct child after killing it."""
+    env = object.__new__(LocalEnvironment)
+    events = []
+    alive = True
+
+    def wait(timeout):
+        events.append(("wait", timeout))
+        if alive:
+            raise subprocess.TimeoutExpired("bash", timeout)
+
+    def kill():
+        nonlocal alive
+        events.append(("kill",))
+        alive = False
+
+    proc = SimpleNamespace(
+        pid=12345,
+        poll=lambda: None if alive else 0,
+        wait=wait,
+        kill=kill,
+    )
+
+    def denied_getpgid(_pid):
+        raise PermissionError
+
+    monkeypatch.setattr(os, "getpgid", denied_getpgid)
+
+    env._kill_process(proc)
+
+    assert events == [("wait", 0.2), ("kill",), ("wait", 0.2)]
+
+
 def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():
     """When KeyboardInterrupt arrives mid-poll, the subprocess group must be
     killed before the exception is re-raised."""
