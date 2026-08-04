@@ -77,6 +77,7 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
         pid=12345,
         _hermes_pgid=67890,
         poll=lambda: 0,
+        wait=lambda timeout: None,
         kill=lambda: None,
     )
     killpg_calls = []
@@ -95,6 +96,30 @@ def test_kill_process_uses_cached_pgid_if_wrapper_already_exited(monkeypatch):
     env._kill_process(proc)
 
     assert killpg_calls == [(67890, signal.SIGTERM), (67890, 0)]
+
+
+def test_kill_process_reaps_wrapper_when_group_exits_after_sigterm(monkeypatch):
+    """A fast group exit must not bypass wait() and leave the wrapper defunct."""
+    env = object.__new__(LocalEnvironment)
+    wait_calls = []
+    proc = SimpleNamespace(
+        pid=12345,
+        poll=lambda: 0,
+        wait=lambda timeout: wait_calls.append(timeout),
+        kill=lambda: None,
+    )
+
+    monkeypatch.setattr(os, "getpgid", lambda _pid: 67890)
+
+    def fake_killpg(_pgid, sig):
+        if sig == 0:
+            raise ProcessLookupError
+
+    monkeypatch.setattr(os, "killpg", fake_killpg)
+
+    env._kill_process(proc)
+
+    assert wait_calls == [0.2]
 
 
 def test_wait_for_process_kills_subprocess_on_keyboardinterrupt():

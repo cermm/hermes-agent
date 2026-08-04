@@ -868,10 +868,12 @@ class TestIsStaleConnectionError:
 
 
     def test_detects_botocore_read_timeout(self):
-        pytest.importorskip("botocore", reason="botocore required for Bedrock exception tests")
+        exceptions = pytest.importorskip(
+            "botocore.exceptions",
+            reason="botocore exceptions required for Bedrock exception tests",
+        )
         from agent.bedrock_adapter import is_stale_connection_error
-        from botocore.exceptions import ReadTimeoutError
-        exc = ReadTimeoutError(endpoint_url="https://bedrock.example")
+        exc = exceptions.ReadTimeoutError(endpoint_url="https://bedrock.example")
         assert is_stale_connection_error(exc) is True
 
 

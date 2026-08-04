@@ -1599,33 +1599,39 @@ class LocalEnvironment(BaseEnvironment):
                     pass
             else:
                 try:
-                    pgid = os.getpgid(proc.pid)
-                except ProcessLookupError:
-                    pgid = getattr(proc, "_hermes_pgid", None)
-                    if pgid is None:
-                        raise
+                    try:
+                        pgid = os.getpgid(proc.pid)
+                    except ProcessLookupError:
+                        pgid = getattr(proc, "_hermes_pgid", None)
+                        if pgid is None:
+                            raise
 
-                try:
-                    os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
-                except ProcessLookupError:
-                    return
+                    try:
+                        os.killpg(pgid, signal.SIGTERM)  # windows-footgun: ok — POSIX process-group SIGTERM (guarded by _IS_WINDOWS above)
+                    except ProcessLookupError:
+                        return
 
-                # Wait on the process group, not just the shell wrapper. Under
-                # load the wrapper can exit before grandchildren do; returning
-                # at that point leaves orphaned process-group members behind.
-                if _wait_for_group_exit(pgid, 1.0):
-                    return
+                    # Wait on the process group, not just the shell wrapper. Under
+                    # load the wrapper can exit before grandchildren do; returning
+                    # at that point leaves orphaned process-group members behind.
+                    if _wait_for_group_exit(pgid, 1.0):
+                        return
 
-                try:
-                    # POSIX-only: _IS_WINDOWS is handled by the outer branch.
-                    os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
-                except ProcessLookupError:
-                    return
-                _wait_for_group_exit(pgid, 2.0)
-                try:
-                    proc.wait(timeout=0.2)
-                except (subprocess.TimeoutExpired, OSError):
-                    pass
+                    try:
+                        # POSIX-only: _IS_WINDOWS is handled by the outer branch.
+                        os.killpg(pgid, signal.SIGKILL)  # windows-footgun: ok — POSIX process-group SIGKILL
+                    except ProcessLookupError:
+                        return
+                    _wait_for_group_exit(pgid, 2.0)
+                finally:
+                    # Reap our direct child on every exit path. The process
+                    # group can disappear between killpg(0) probes before the
+                    # wrapper's zombie becomes observable; returning without
+                    # wait() then leaves a defunct group leader behind.
+                    try:
+                        proc.wait(timeout=0.2)
+                    except (subprocess.TimeoutExpired, OSError):
+                        pass
         except (ProcessLookupError, PermissionError, OSError):
             try:
                 proc.kill()
