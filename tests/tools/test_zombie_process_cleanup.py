@@ -462,6 +462,22 @@ class TestDelegationCleanup:
         child_started = threading.Event()
         release_child = threading.Event()
         child_finished = threading.Event()
+
+        from tools.daemon_pool import DaemonThreadPoolExecutor
+
+        class _ChildStartedExecutor(DaemonThreadPoolExecutor):
+            def submit(self, *args, **kwargs):
+                future = super().submit(*args, **kwargs)
+                # _run_single_child starts its 0.1s result timeout only after
+                # submit returns. Establish that run_conversation entered and
+                # opened its Relay turn first, so scheduler delay cannot make
+                # this lifecycle test time out before its fixture exists.
+                assert child_started.wait(timeout=5)
+                return future
+
+        monkeypatch.setattr(
+            "tools.daemon_pool.DaemonThreadPoolExecutor", _ChildStartedExecutor
+        )
         parent = MagicMock()
         parent._active_children = []
         parent._active_children_lock = threading.Lock()

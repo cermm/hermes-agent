@@ -4877,7 +4877,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
 ):
     import queue as _queue_mod
 
-    from tools.process_registry import process_registry
+    import tools.process_registry as process_registry_module
+    from tools.process_registry import ProcessRegistry
 
     _configure_immediate_prompt_run(
         monkeypatch, tmp_path, immediate_threads=False
@@ -4903,6 +4904,16 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
             return {"final_response": "", "messages": []}
 
     monkeypatch.setattr(server.threading, "Thread", _recording_thread)
+    # Use a fresh registry, not just a fresh queue on the process-global
+    # registry. Pollers retained by earlier session.init tests capture that
+    # singleton and would otherwise race this test for its replacement queue,
+    # occasionally consuming both requeued events under loaded scheduling.
+    # _run_prompt_submit imports the registry lazily, so this still exercises
+    # the real drain/requeue path while isolating unrelated consumers.
+    test_registry = ProcessRegistry()
+    while not test_registry.completion_queue.empty():
+        test_registry.completion_queue.get_nowait()
+    monkeypatch.setattr(process_registry_module, "process_registry", test_registry)
     session = _session(
         session_key="session-a",
         agent=_BlockingNotificationAgent(turns),
@@ -4919,10 +4930,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         }
         for index in range(1, 4)
     ]
-    isolated_queue: _queue_mod.Queue = _queue_mod.Queue()
+    isolated_queue: _queue_mod.Queue = test_registry.completion_queue
     for event in events:
         isolated_queue.put(event)
-    monkeypatch.setattr(process_registry, "completion_queue", isolated_queue)
     server._sessions["sid_a"] = session
 
     try:
@@ -4931,14 +4941,9 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         assert nested_started.wait(timeout=5)
         threads[0].join(timeout=5)
         assert not threads[0].is_alive()
-        # Membership, not order: the completion_queue is process-global, and
-        # notification pollers leaked by earlier session.init tests in this
-        # file legitimately steal-and-requeue foreign-session events (see
-        # _notification_poller_loop's belongs-elsewhere branch), rotating the
-        # queue. The requeue contract is that batch_2 and batch_3 both remain
-        # queued (never consumed) while batch_1's turn is in flight — so drain
-        # with a deadline (an event may be transiently held by a poller
-        # mid-cycle) and assert exactly {batch_2, batch_3} come back.
+        # The nested prompt runs on a real thread, so allow a bounded interval
+        # for its drain loop to return the exact unstarted suffix. Membership
+        # is the contract here, not queue position.
         queued: dict = {}
         deadline = time.time() + 5.0
         while time.time() < deadline and set(queued) != {
@@ -4959,8 +4964,8 @@ def test_run_prompt_submit_requeues_all_unstarted_notifications_with_real_thread
         while not isolated_queue.empty():
             isolated_queue.get_nowait()
         for event in events:
-            process_registry._completion_consumed.discard(event["session_id"])
-            process_registry._poll_observed.discard(event["session_id"])
+            test_registry._completion_consumed.discard(event["session_id"])
+            test_registry._poll_observed.discard(event["session_id"])
 
 
 def test_run_prompt_submit_delivers_completion_owned_through_compression_lineage(
