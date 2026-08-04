@@ -118,17 +118,14 @@ test('open() rejects a foreign-owned default POSIX control directory before dial
     mode: 0o40700
   } as fs.Stats)
 
-  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const spawnFn = scriptedSpawn({ code: 0 })
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn })
 
   try {
     await assert.rejects(conn.open(), /owned by uid|unsafe/i)
     assert.equal(mkdir.mock.calls[0]?.[0], defaultDir)
     assert.equal(lstat.mock.calls[0]?.[0], defaultDir)
-    assert.ok(
-      !spawnFn.calls.some(args => args.includes('-M')),
-      'foreign-owned default dir must fail before master dial'
-    )
+    assert.equal(spawnFn.calls.length, 0, 'foreign-owned default dir must fail before check or master dial')
   } finally {
     lstat.mockRestore()
     mkdir.mockRestore()
@@ -772,16 +769,61 @@ test('runSsh delivers stdinData to the child and does not log it', async () => {
   assert.equal(stdinWritten, 'secret-token-value', 'stdinData must be written to child.stdin')
 })
 
-test('open() rejects a control-dir that is a symlink', async () => {
+test('open() rejects a responsive mux under a symlinked control dir without spawning ssh', async () => {
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'))
   const real = path.join(tmp, 'real')
   const link = path.join(tmp, 'link')
   fs.mkdirSync(real, { mode: 0o700 })
   fs.symlinkSync(real, link)
-  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+  const spawnFn = scriptedSpawn({ code: 0 })
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: link })
   await assert.rejects(conn.open(), /symlink|unsafe/i)
+  assert.equal(spawnFn.calls.length, 0, 'hostile responsive mux must not bypass control-dir validation')
   fs.rmSync(tmp, { recursive: true, force: true })
+})
+
+test('every POSIX mux operation rejects a non-directory control leaf before touching the control path', async () => {
+  if (process.platform === 'win32') {
+    return
+  }
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'))
+  const invalidDir = path.join(tmp, 'control-file')
+  fs.writeFileSync(invalidDir, 'not a directory')
+  const unlink = vi.spyOn(fs, 'unlinkSync')
+
+  const operations: Array<[string, (conn: SshConnection) => Promise<unknown>]> = [
+    ['liveness check', conn => conn.isAlive()],
+    ['mux exec verification', conn => conn._verifyMuxChannel()],
+    ['stale-master eviction', conn => conn._evictStaleMaster()],
+    ['exec', conn => conn.exec('exit 0')],
+    ['forward', conn => conn.forward(5000, 6000)],
+    ['cancel forward', conn => conn.cancelForward(5000, 6000)],
+    ['interactive terminal', async conn => conn.buildInteractiveArgs('')],
+    [
+      'close',
+      conn => {
+        conn._opened = true
+
+        return conn.close()
+      }
+    ]
+  ]
+
+  try {
+    for (const [name, operation] of operations) {
+      const spawnFn = scriptedSpawn({ code: 0 })
+      const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: invalidDir })
+
+      await assert.rejects(operation(conn), /not a directory|unsafe/i, name)
+      assert.equal(spawnFn.calls.length, 0, `${name} must validate before spawning ssh`)
+    }
+
+    assert.equal(unlink.mock.calls.length, 0, 'invalid control dir must not authorize socket eviction')
+  } finally {
+    unlink.mockRestore()
+    fs.rmSync(tmp, { recursive: true, force: true })
+  }
 })
 
 test('open() enforces 0700 on an existing control dir with lax permissions', async () => {
@@ -792,7 +834,13 @@ test('open() enforces 0700 on an existing control dir with lax permissions', asy
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), 'ssh-test-'))
   const dir = path.join(tmp, 'ctrl')
   fs.mkdirSync(dir, { mode: 0o755 })
-  const spawnFn = scriptedSpawn(args => (args.includes('check') ? { code: 255 } : { code: 0 }))
+
+  const spawnFn = scriptedSpawn(args => {
+    assert.equal(fs.statSync(dir).mode & 0o777, 0o700, 'control dir must be tightened before every ssh spawn')
+
+    return args.includes('check') ? { code: 255 } : { code: 0 }
+  })
+
   const conn = new SshConnection({ host: 'box', user: 'me' }, { spawnFn, controlDir: dir })
   await conn.open()
   const stat = fs.statSync(dir)

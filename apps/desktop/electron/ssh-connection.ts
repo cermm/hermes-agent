@@ -535,10 +535,50 @@ class SshConnection {
     return err
   }
 
+  _ensureMuxControlDir() {
+    if (!this._mux || process.platform === 'win32') {
+      return
+    }
+
+    const controlDir = path.dirname(this.controlPath)
+
+    try {
+      fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
+    } catch {
+      void 0
+    }
+
+    const st = fs.lstatSync(controlDir)
+
+    if (st.isSymbolicLink()) {
+      throw new Error(`Unsafe SSH control dir: ${controlDir} is a symlink.`)
+    }
+
+    if (!st.isDirectory()) {
+      throw new Error(`Unsafe SSH control dir: ${controlDir} is not a directory.`)
+    }
+
+    if (st.uid !== process.getuid!()) {
+      throw new Error(`Unsafe SSH control dir: ${controlDir} is owned by uid ${st.uid}, not ${process.getuid!()}.`)
+    }
+
+    if ((st.mode & 0o777) !== 0o700) {
+      fs.chmodSync(controlDir, 0o700)
+    }
+  }
+
+  buildInteractiveArgs(remoteCwd, connectTimeoutMs?, remoteCommand?) {
+    this._ensureMuxControlDir()
+
+    return buildInteractiveSshArgs(this, remoteCwd, connectTimeoutMs, remoteCommand)
+  }
+
   // Open the connection. Mux: start the persistent ControlMaster (idempotent —
   // a live master is a no-op). No-mux: there is no master; validate auth +
   // reachability with a one-shot `ssh true` so failures classify identically.
   async open() {
+    this._ensureMuxControlDir()
+
     if (await this.isAlive()) {
       // -O check passing is not proof the master works: a ControlPersist master
       // can survive a failed teardown with wedged channels (observed on macOS
@@ -577,33 +617,7 @@ class SshConnection {
       return
     }
 
-    const controlDir = path.dirname(this.controlPath)
-
-    try {
-      fs.mkdirSync(controlDir, { recursive: true, mode: 0o700 })
-    } catch {
-      void 0
-    }
-
-    if (process.platform !== 'win32') {
-      const st = fs.lstatSync(controlDir)
-
-      if (st.isSymbolicLink()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is a symlink.`)
-      }
-
-      if (!st.isDirectory()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is not a directory.`)
-      }
-
-      if (st.uid !== process.getuid!()) {
-        throw new Error(`Unsafe SSH control dir: ${controlDir} is owned by uid ${st.uid}, not ${process.getuid!()}.`)
-      }
-
-      if ((st.mode & 0o777) !== 0o700) {
-        fs.chmodSync(controlDir, 0o700)
-      }
-    }
+    this._ensureMuxControlDir()
 
     const args = buildMasterArgs(this, this._connectTimeoutMs)
     this._logLine(`opening control master to ${target(this.user, this.host)}:${this.port}`)
@@ -630,6 +644,8 @@ class SshConnection {
       return false
     }
 
+    this._ensureMuxControlDir()
+
     const args = this._mux
       ? buildControlArgs(this, 'check', [], this._connectTimeoutMs)
       : buildExecArgs(this, 'exit 0', this._connectTimeoutMs)
@@ -646,6 +662,8 @@ class SshConnection {
   // A real exec through the master (`exit 0` works under POSIX shells and
   // cmd.exe); a wedged mux hangs to the timeout.
   async _verifyMuxChannel() {
+    this._ensureMuxControlDir()
+
     try {
       const result: any = await runSsh(buildExecArgs(this, 'exit 0', this._connectTimeoutMs), {
         timeoutMs: this._connectTimeoutMs,
@@ -663,6 +681,8 @@ class SshConnection {
   // ControlPersist; a wedged channel can pin it, but without its socket it is
   // inert.)
   async _evictStaleMaster() {
+    this._ensureMuxControlDir()
+
     try {
       await runSsh(buildControlArgs(this, 'exit', [], this._connectTimeoutMs), {
         timeoutMs: this._connectTimeoutMs,
@@ -671,6 +691,8 @@ class SshConnection {
     } catch {
       void 0
     }
+
+    this._ensureMuxControlDir()
 
     try {
       fs.unlinkSync(this.controlPath)
@@ -684,6 +706,8 @@ class SshConnection {
   // One-shot remote command over the control connection. Resolves stdout;
   // rejects with a classified error on non-zero exit or timeout.
   async exec(remoteCommand, { timeoutMs, stdinData }: any = {}) {
+    this._ensureMuxControlDir()
+
     const args = buildExecArgs(this, remoteCommand, this._connectTimeoutMs)
     let result
 
@@ -790,6 +814,8 @@ class SshConnection {
       return
     }
 
+    this._ensureMuxControlDir()
+
     const args = buildControlArgs(this, 'forward', ['-L', spec], this._connectTimeoutMs)
     let result
 
@@ -821,6 +847,8 @@ class SshConnection {
       return
     }
 
+    this._ensureMuxControlDir()
+
     const args = buildControlArgs(this, 'cancel', ['-L', spec], this._connectTimeoutMs)
 
     try {
@@ -832,7 +860,9 @@ class SshConnection {
   }
 
   // Tear down. Mux: exit the master (drops every forward with it). No-mux:
-  // kill the tunnel children. Best-effort; never throws.
+  // kill the tunnel children. Transport teardown is best-effort after the mux
+  // control directory passes the same fail-closed validation as every other
+  // ControlPath operation.
   async close() {
     if (!this._opened) {
       return
@@ -850,6 +880,8 @@ class SshConnection {
       return
     }
 
+    this._ensureMuxControlDir()
+
     const args = buildControlArgs(this, 'exit', [], this._connectTimeoutMs)
 
     try {
@@ -865,6 +897,8 @@ class SshConnection {
       // disown it. (Without its socket the orphan is inert; ControlPersist may
       // not reap it if a wedged channel never idles.)
       this._logLine(`close failed; removing control socket: ${error.message}`)
+
+      this._ensureMuxControlDir()
 
       try {
         fs.unlinkSync(this.controlPath)

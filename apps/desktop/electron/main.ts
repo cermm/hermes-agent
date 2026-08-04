@@ -178,13 +178,7 @@ import {
 import { ensureSpawnHelperExecutable } from './spawn-helper-perms'
 import { createBootstrapCoordinator, sshConfigFingerprint } from './ssh-bootstrap-coordinator'
 import { collectSshConfigHosts, parseSshGOutput } from './ssh-config'
-import {
-  buildInteractiveSshArgs,
-  createSshProbeConnection,
-  pickLocalPort,
-  redactSecrets,
-  SshConnection
-} from './ssh-connection'
+import { createSshProbeConnection, pickLocalPort, redactSecrets, SshConnection } from './ssh-connection'
 import { createStreamThrottle } from './stream-throttle'
 import { nativeOverlayWidth as computeNativeOverlayWidth, macTitleBarOverlayHeight } from './titlebar-overlay-width'
 import { resolveBehindCount, shouldCountCommits } from './update-count'
@@ -11319,7 +11313,7 @@ ipcMain.handle('hermes:terminal:start', async (event, payload = {}) => {
         process.platform === 'win32'
           ? path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'OpenSSH', 'ssh.exe')
           : 'ssh',
-        buildInteractiveSshArgs(sshTarget.ssh, String(payload?.cwd || '').trim(), undefined, remoteCommand),
+        sshTarget.ssh.buildInteractiveArgs(String(payload?.cwd || '').trim(), undefined, remoteCommand),
         { cols, cwd: app.getPath('home'), env: terminalShellEnv(), name: 'xterm-256color', rows }
       )
     : nodePty.spawn(command, args, { cols, cwd, env: terminalShellEnv(), name: 'xterm-256color', rows })
