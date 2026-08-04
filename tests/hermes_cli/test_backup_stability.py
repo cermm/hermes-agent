@@ -4,6 +4,7 @@ import json
 import os
 import stat
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -83,6 +84,91 @@ def test_atomic_output_removes_owned_staging_directory_when_staging_open_fails(
     assert injected
     assert final.read_bytes() == b"previous"
     assert {path.name for path in tmp_path.iterdir()} == entries_before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory-descriptor staging is POSIX-only")
+def test_atomic_output_removes_owned_staging_directory_when_first_identity_stat_fails(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import backup
+
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+    entries_before = {path.name for path in tmp_path.iterdir()}
+    real_stat = backup.os.stat
+    injected = False
+
+    def fail_first_staging_identity_stat(path, *args, **kwargs):
+        nonlocal injected
+        if (
+            not injected
+            and kwargs.get("dir_fd") is not None
+            and kwargs.get("follow_symlinks") is False
+            and str(path).endswith(".partial")
+        ):
+            injected = True
+            raise PermissionError("injected staging identity failure")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(backup.os, "stat", fail_first_staging_identity_stat)
+
+    with pytest.raises(PermissionError, match="injected staging identity failure"):
+        with _atomic_output_path(final):
+            raise AssertionError("staging setup unexpectedly completed")
+
+    assert injected
+    assert final.read_bytes() == b"previous"
+    assert {path.name for path in tmp_path.iterdir()} == entries_before
+
+
+@pytest.mark.skipif(os.name != "posix", reason="directory-descriptor staging is POSIX-only")
+def test_atomic_output_leaves_foreign_staging_replacement_after_ownership_rejection(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import backup
+
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+    real_stat = backup.os.stat
+    replacement = None
+    displaced = None
+
+    def replace_staging_before_identity_stat(path, *args, **kwargs):
+        nonlocal replacement, displaced
+        dir_fd = kwargs.get("dir_fd")
+        if (
+            replacement is None
+            and dir_fd is not None
+            and kwargs.get("follow_symlinks") is False
+            and str(path).endswith(".partial")
+        ):
+            displaced_name = f"{path}.displaced"
+            os.rename(path, displaced_name, src_dir_fd=dir_fd, dst_dir_fd=dir_fd)
+            os.mkdir(path, 0o700, dir_fd=dir_fd)
+            replacement = tmp_path / str(path)
+            displaced = tmp_path / str(displaced_name)
+
+        current = real_stat(path, *args, **kwargs)
+        if replacement is not None and dir_fd is not None and str(path) == replacement.name:
+            return SimpleNamespace(
+                st_dev=current.st_dev,
+                st_ino=current.st_ino,
+                st_mode=current.st_mode,
+                st_uid=os.geteuid() + 1,
+            )
+        return current
+
+    monkeypatch.setattr(backup.os, "stat", replace_staging_before_identity_stat)
+
+    with pytest.raises(RuntimeError, match="staging directory was replaced"):
+        with _atomic_output_path(final):
+            raise AssertionError("staging setup unexpectedly completed")
+
+    assert replacement is not None
+    assert replacement.is_dir()
+    assert displaced is not None
+    assert displaced.is_dir()
+    assert final.read_bytes() == b"previous"
 
 
 @pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")

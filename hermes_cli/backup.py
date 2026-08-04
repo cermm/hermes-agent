@@ -732,14 +732,30 @@ def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
             directory_flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
             parent_fd = os.open(final_path.parent, directory_flags)
             os.mkdir(staging_name, 0o700, dir_fd=parent_fd)
-            staging_identity = os.stat(
-                staging_name, dir_fd=parent_fd, follow_symlinks=False
-            )
+            try:
+                candidate_staging_identity = os.stat(
+                    staging_name, dir_fd=parent_fd, follow_symlinks=False
+                )
+            except BaseException:
+                # Preserve the setup error, but first try to pin the directory
+                # created by this operation so the exception path can remove it.
+                directory_flags |= getattr(os, "O_NOFOLLOW", 0)
+                try:
+                    staging_fd = os.open(staging_name, directory_flags, dir_fd=parent_fd)
+                    opened_after_stat_failure = os.fstat(staging_fd)
+                    if stat.S_ISDIR(
+                        opened_after_stat_failure.st_mode
+                    ) and opened_after_stat_failure.st_uid == os.geteuid():
+                        staging_identity = opened_after_stat_failure
+                except OSError:
+                    pass
+                raise
             if (
-                not stat.S_ISDIR(staging_identity.st_mode)
-                or staging_identity.st_uid != os.geteuid()
+                not stat.S_ISDIR(candidate_staging_identity.st_mode)
+                or candidate_staging_identity.st_uid != os.geteuid()
             ):
                 raise RuntimeError("backup staging directory was replaced during creation")
+            staging_identity = candidate_staging_identity
             directory_flags |= getattr(os, "O_NOFOLLOW", 0)
             staging_fd = os.open(staging_name, directory_flags, dir_fd=parent_fd)
             if hasattr(os, "fchmod"):
