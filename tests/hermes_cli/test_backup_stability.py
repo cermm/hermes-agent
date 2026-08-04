@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import json
+import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -29,8 +31,9 @@ def test_atomic_output_publishes_only_after_clean_close(tmp_path) -> None:
     final = tmp_path / "backup.zip"
     final.write_bytes(b"previous")
 
-    with _atomic_output_path(final) as partial:
-        partial.write_bytes(b"complete")
+    with _atomic_output_path(final) as (archive, partial):
+        archive.write(b"complete")
+        archive.flush()
         assert final.read_bytes() == b"previous"
 
     assert final.read_bytes() == b"complete"
@@ -40,14 +43,81 @@ def test_atomic_output_publishes_only_after_clean_close(tmp_path) -> None:
 def test_atomic_output_keeps_previous_file_after_failure(tmp_path) -> None:
     final = tmp_path / "backup.zip"
     final.write_bytes(b"previous")
+    partial = None
 
     with pytest.raises(RuntimeError):
-        with _atomic_output_path(final) as partial:
-            partial.write_bytes(b"incomplete")
+        with _atomic_output_path(final) as (archive, partial):
+            archive.write(b"incomplete")
             raise RuntimeError("compression failed")
 
     assert final.read_bytes() == b"previous"
+    assert partial is not None
     assert not partial.exists()
+
+
+@pytest.mark.skipif(os.name != "posix", reason="POSIX file permissions only")
+def test_atomic_output_descriptor_is_private_under_permissive_umask(tmp_path) -> None:
+    final = tmp_path / "backup.zip"
+    old_umask = os.umask(0o000)
+    try:
+        with _atomic_output_path(final) as (archive, _partial):
+            archive.write(b"credential-bearing backup")
+            archive.flush()
+            assert stat.S_IMODE(os.fstat(archive.fileno()).st_mode) == 0o600
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(final.stat().st_mode) == 0o600
+
+
+def test_atomic_output_rejects_preexisting_partial_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    from hermes_cli import backup
+
+    final = tmp_path / "backup.zip"
+    target = tmp_path / "attacker-controlled"
+    target.write_bytes(b"do not overwrite")
+    real_open = backup.os.open
+    planted_partial = None
+
+    def plant_symlink_then_open(path, flags, mode=0o777):
+        nonlocal planted_partial
+        partial = Path(path)
+        partial.symlink_to(target)
+        planted_partial = partial
+        return real_open(path, flags, mode)
+
+    monkeypatch.setattr(backup.os, "open", plant_symlink_then_open)
+
+    with pytest.raises(FileExistsError):
+        with _atomic_output_path(final) as (archive, _partial):
+            archive.write(b"credential-bearing backup")
+
+    assert target.read_bytes() == b"do not overwrite"
+    assert planted_partial is not None
+    assert planted_partial.is_symlink()
+    assert not final.exists()
+
+
+def test_atomic_output_refuses_to_publish_replaced_partial_inode(tmp_path) -> None:
+    final = tmp_path / "backup.zip"
+    final.write_bytes(b"previous")
+    attacker = tmp_path / "attacker-controlled"
+    attacker.write_bytes(b"attacker payload")
+    partial = None
+
+    with pytest.raises(RuntimeError, match="replaced"):
+        with _atomic_output_path(final) as (archive, partial):
+            archive.write(b"complete")
+            archive.flush()
+            partial.unlink()
+            partial.symlink_to(attacker)
+
+    assert final.read_bytes() == b"previous"
+    assert attacker.read_bytes() == b"attacker payload"
+    assert partial is not None
+    assert partial.is_symlink()
 
 
 def test_quick_snapshot_is_published_with_manifest(tmp_path, monkeypatch) -> None:

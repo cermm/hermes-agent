@@ -13,8 +13,10 @@ import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
 import sqlite3
+import stat
 import sys
 import tempfile
 import threading
@@ -24,7 +26,7 @@ import zipfile
 from contextlib import ExitStack, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, BinaryIO, Callable, Dict, Iterator, List, Optional
 
 from hermes_constants import get_default_hermes_root, get_hermes_home, display_hermes_home
 
@@ -667,17 +669,65 @@ def _backup_operation_lock(hermes_home: Path, timeout_seconds: float = 0.25):
 
 
 @contextmanager
-def _atomic_output_path(final_path: Path):
-    """Yield a hidden sibling path and publish it only after a clean close."""
+def _atomic_output_path(final_path: Path) -> Iterator[tuple[BinaryIO, Path]]:
+    """Yield a private sibling file and publish its exact inode after close."""
     partial_path = final_path.with_name(
-        f".{final_path.name}.{os.getpid()}-{threading.get_ident()}.partial"
+        f".{final_path.name}.{os.getpid()}-{threading.get_ident()}-"
+        f"{secrets.token_hex(12)}.partial"
     )
-    partial_path.unlink(missing_ok=True)
+    flags = os.O_RDWR | os.O_CREAT | os.O_EXCL
+    flags |= getattr(os, "O_BINARY", 0)
+    flags |= getattr(os, "O_NOFOLLOW", 0)
+
+    fd = -1
+    archive = None
+    opened = None
     try:
-        yield partial_path
+        fd = os.open(partial_path, flags, 0o600)
+        opened = os.fstat(fd)
+        if hasattr(os, "fchmod"):
+            os.fchmod(fd, 0o600)
+        archive = os.fdopen(fd, "w+b")
+        fd = -1
+
+        yield archive, partial_path
+
+        archive.flush()
+        os.fsync(archive.fileno())
+        current = os.stat(partial_path, follow_symlinks=False)
+        if not stat.S_ISREG(current.st_mode) or (
+            current.st_dev,
+            current.st_ino,
+        ) != (opened.st_dev, opened.st_ino):
+            raise RuntimeError("backup partial path was replaced during creation")
+
+        archive.close()
+        archive = None
         os.replace(partial_path, final_path)
     except BaseException:
-        partial_path.unlink(missing_ok=True)
+        if archive is not None:
+            try:
+                archive.close()
+            except (OSError, ValueError):
+                pass
+        if fd >= 0:
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+        try:
+            current = os.stat(partial_path, follow_symlinks=False)
+        except OSError:
+            pass
+        else:
+            if opened is not None and (
+                current.st_dev,
+                current.st_ino,
+            ) == (opened.st_dev, opened.st_ino):
+                try:
+                    partial_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
         raise
 
 
@@ -1188,9 +1238,10 @@ def _run_backup_locked(args, hermes_root: Path) -> None:
     errors = []
     t0 = time.monotonic()
 
-    with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-        archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
-    ) as zf:
+    with (
+        _atomic_output_path(out_path) as (archive_file, _partial_path),
+        zipfile.ZipFile(archive_file, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf,
+    ):
         if encrypted_auth is not None:
             encrypted, manifest = encrypted_auth
             zf.writestr(_AUTH_ENVELOPE, encrypted)
@@ -2374,9 +2425,12 @@ def _write_full_zip_backup_locked(out_path: Path, hermes_root: Path) -> Optional
 
     archive_started = time.monotonic()
     try:
-        with _atomic_output_path(out_path) as archive_path, zipfile.ZipFile(
-            archive_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6
-        ) as zf:
+        with (
+            _atomic_output_path(out_path) as (archive_file, _partial_path),
+            zipfile.ZipFile(
+                archive_file, "w", zipfile.ZIP_DEFLATED, compresslevel=6
+            ) as zf,
+        ):
             for index, (abs_path, rel_path) in enumerate(files_to_add, 1):
                 try:
                     if abs_path.suffix == ".db":
