@@ -7,6 +7,7 @@ import {
   fromCI,
   fromFallback,
   fromLocalGit,
+  installStampValidationError,
   isFallbackCommit,
   resolveStamp
 } from './write-build-stamp.mjs'
@@ -51,6 +52,36 @@ test('fromFallback uses the all-zero placeholder commit', () => {
   })
   assert.equal(isFallbackCommit(FALLBACK_COMMIT), true)
   assert.equal(isFallbackCommit('a'.repeat(40)), false)
+})
+
+test('install stamp validation accepts a detached real commit and rejects an invalid pin', () => {
+  assert.equal(
+    installStampValidationError({ commit: 'a'.repeat(40), branch: null }),
+    null,
+    'an immutable commit pin does not need a branch'
+  )
+  assert.match(
+    installStampValidationError({ commit: 'not-a-commit', branch: null }),
+    /usable commit/,
+    'a detached stamp still needs a valid commit pin'
+  )
+})
+
+test('install stamp validation requires a usable branch only for fallback commits', () => {
+  assert.equal(
+    installStampValidationError({ commit: FALLBACK_COMMIT, branch: FALLBACK_BRANCH }),
+    null
+  )
+  assert.match(
+    installStampValidationError({ commit: FALLBACK_COMMIT, branch: null }),
+    /usable branch/,
+    'an unpinned fallback must identify the branch bootstrap should follow'
+  )
+  assert.match(
+    installStampValidationError({ commit: FALLBACK_COMMIT, branch: '   ' }),
+    /usable branch/,
+    'blank fallback branches are not usable refs'
+  )
 })
 
 test('resolveStamp prefers CI over local git over fallback', () => {

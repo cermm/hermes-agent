@@ -6,6 +6,7 @@ import { fileURLToPath } from 'node:url'
 import { listPackage } from '@electron/asar'
 
 import PACKAGE_JSON from '../package.json' with { type: 'json' }
+import { installStampValidationError } from './write-build-stamp.mjs'
 
 const MODE = process.argv[2] || 'help'
 const ARCH = process.arch === 'arm64' ? 'arm64' : 'x64'
@@ -284,7 +285,8 @@ function launchFresh() {
 // Validate the packaged bundle matches the thin-installer architecture:
 //   - The Hermes Agent Python payload is NOT shipped (it's fetched at first
 //     launch via install.ps1's stage protocol).
-//   - install-stamp.json IS shipped in resources/ with a valid commit + branch.
+//   - install-stamp.json IS shipped in resources/ with either a valid commit
+//     pin or an unpinned fallback commit plus a usable branch.
 //   - node-pty IS shipped inside app.asar.unpacked/dist/node_modules/node-pty
 //     with package.json + lib/ + at least one .node binary (the renderer's
 //     integrated terminal needs this; see Phase 1F.6).
@@ -305,7 +307,8 @@ function validateBundle() {
     )
   }
 
-  // Positive assertion: install-stamp.json carries a sane commit + branch
+  // Positive assertion: install-stamp.json carries either an immutable commit
+  // pin (branch optional for detached builds) or a branch-backed fallback.
   const stampPath = path.join(APP.resourcesPath, 'install-stamp.json')
   if (!exists(stampPath)) {
     die(`Missing install-stamp.json (required for first-launch bootstrap pinning): ${stampPath}`)
@@ -316,11 +319,9 @@ function validateBundle() {
   } catch (err) {
     die(`install-stamp.json is not valid JSON: ${err.message}`)
   }
-  if (!stamp.commit || typeof stamp.commit !== 'string' || stamp.commit.length < 7) {
-    die(`install-stamp.json is missing a usable commit field: ${JSON.stringify(stamp)}`)
-  }
-  if (!stamp.branch || typeof stamp.branch !== 'string') {
-    die(`install-stamp.json is missing the branch field: ${JSON.stringify(stamp)}`)
+  const stampError = installStampValidationError(stamp)
+  if (stampError) {
+    die(`install-stamp.json ${stampError}: ${JSON.stringify(stamp)}`)
   }
 
   // Positive assertion: node-pty native deps shipped

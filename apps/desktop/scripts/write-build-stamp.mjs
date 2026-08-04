@@ -33,6 +33,7 @@ import { execSync } from "child_process"
 import { isMain } from "./utils.mjs"
 
 const STAMP_SCHEMA_VERSION = 1
+const STAMP_COMMIT_RE = /^[0-9a-f]{7,40}$/i
 
 /** All-zero placeholder used when no real commit can be resolved. */
 export const FALLBACK_COMMIT = "0000000000000000000000000000000000000000"
@@ -112,6 +113,21 @@ export function resolveStamp({
 
 export function isFallbackCommit(commit) {
   return typeof commit === "string" && /^0{7,40}$/.test(commit)
+}
+
+export function installStampValidationError(stamp) {
+  if (!stamp || typeof stamp.commit !== "string" || !STAMP_COMMIT_RE.test(stamp.commit)) {
+    return "is missing a usable commit field"
+  }
+
+  if (
+    isFallbackCommit(stamp.commit) &&
+    (typeof stamp.branch !== "string" || stamp.branch.trim().length === 0)
+  ) {
+    return "is missing a usable branch field for an unpinned fallback"
+  }
+
+  return null
 }
 
 function main() {
