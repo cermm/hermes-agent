@@ -157,6 +157,45 @@ def test_pid_alive_uses_safe_pid_exists_without_signalling(monkeypatch):
     assert checked == [12345]
 
 
+def test_pid_alive_legacy_start_time_uses_independent_clock_tick_boundary(monkeypatch):
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_time", lambda _pid: 1000.0)
+    monkeypatch.setattr(os, "sysconf", lambda name: 100)
+
+    assert active_sessions._pid_alive(12345, 1000.005) is True
+    assert active_sessions._pid_alive(12345, 1000.011) is False
+
+
+def test_pid_alive_prefers_stable_process_identity(monkeypatch):
+    monkeypatch.setattr("gateway.status._pid_exists", lambda _pid: True)
+    monkeypatch.setattr(active_sessions, "_process_start_time", lambda _pid: 1000.0)
+    monkeypatch.setattr(active_sessions, "_process_identity", lambda _pid: 4242)
+
+    assert active_sessions._pid_alive(12345, 9999.0, 4242) is True
+    assert active_sessions._pid_alive(12345, 1000.0, 4243) is False
+    assert active_sessions._pid_alive(12345, 1000.0, "not-an-int") is False
+
+
+def test_acquired_active_session_records_stable_process_identity(tmp_path, monkeypatch):
+    home = tmp_path / ".hermes"
+    monkeypatch.setenv("HERMES_HOME", str(home))
+    monkeypatch.setattr(active_sessions, "_process_identity", lambda _pid: 8675309)
+
+    lease, message = active_sessions.try_acquire_active_session(
+        session_id="session-with-identity",
+        surface="cli",
+        config={"max_concurrent_sessions": 1},
+    )
+
+    assert message is None
+    assert lease is not None
+    try:
+        snapshot = active_sessions.active_session_registry_snapshot()
+        assert snapshot[0]["process_identity"] == 8675309
+    finally:
+        lease.release()
+
+
 def test_active_session_hard_exit_is_reclaimed(tmp_path, monkeypatch):
     home = tmp_path / ".hermes"
     monkeypatch.setenv("HERMES_HOME", str(home))
