@@ -166,14 +166,37 @@ def _write_entries(path: Path, entries: list[dict[str, Any]]) -> None:
 
 
 def _process_start_time(pid: int) -> Optional[float]:
-    # Pair pid with process create_time when psutil can read it, so a recycled
-    # pid does not keep a stale lease alive indefinitely.
+    # Legacy fallback for registries written before stable host process
+    # fingerprints were recorded. Pair pid with process create_time when psutil
+    # can read it, so a recycled pid does not keep a stale lease alive
+    # indefinitely.
     try:
         import psutil  # type: ignore
 
         return float(psutil.Process(pid).create_time())
     except Exception:
         return None
+
+
+def _process_identity(pid: int) -> Optional[int]:
+    """Return the host's stable start-time fingerprint for ``pid``."""
+    try:
+        from gateway.status import get_process_start_time
+
+        return get_process_start_time(pid)
+    except Exception:
+        return None
+
+
+def _process_start_time_tolerance() -> float:
+    """Return one platform clock tick for legacy float start times."""
+    try:
+        ticks = int(os.sysconf("SC_CLK_TCK"))
+    except (AttributeError, OSError, TypeError, ValueError):
+        return 0.001
+    if ticks <= 0:
+        return 0.001
+    return max(0.001, 1.0 / ticks)
 
 
 def _optional_float(value: Any) -> Optional[float]:
@@ -185,7 +208,11 @@ def _optional_float(value: Any) -> Optional[float]:
         return None
 
 
-def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
+def _pid_alive(
+    pid: Any,
+    process_start_time: Any = None,
+    process_identity: Any = None,
+) -> bool:
     try:
         pid_int = int(pid)
     except (TypeError, ValueError):
@@ -200,20 +227,33 @@ def _pid_alive(pid: Any, process_start_time: Any = None) -> bool:
         return False
     if not exists:
         return False
+    if process_identity is not None and process_identity != "":
+        try:
+            expected_identity = int(process_identity)
+        except (TypeError, ValueError):
+            return False
+        current_identity = _process_identity(pid_int)
+        if current_identity is None:
+            return True
+        return current_identity == expected_identity
     expected_start = _optional_float(process_start_time)
     if expected_start is None:
         return True
     current_start = _process_start_time(pid_int)
     if current_start is None:
         return True
-    return abs(current_start - expected_start) < 0.001
+    return abs(current_start - expected_start) <= _process_start_time_tolerance()
 
 
 def _prune_dead(entries: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [
         entry
         for entry in entries
-        if _pid_alive(entry.get("pid"), entry.get("process_start_time"))
+        if _pid_alive(
+            entry.get("pid"),
+            entry.get("process_start_time"),
+            entry.get("process_identity"),
+        )
     ]
 
 
@@ -260,6 +300,7 @@ def try_acquire_active_session(
         "surface": str(surface),
         "pid": os.getpid(),
         "process_start_time": _process_start_time(os.getpid()),
+        "process_identity": _process_identity(os.getpid()),
         "started_at": now,
         "updated_at": now,
     }
