@@ -17,6 +17,15 @@ import yaml
 pytest.importorskip("mcp.server.fastmcp")
 
 
+def _drain_queue(items: queue.Queue[str]) -> str:
+    chunks: list[str] = []
+    while True:
+        try:
+            chunks.append(items.get_nowait())
+        except queue.Empty:
+            return "".join(chunks)
+
+
 def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
     profile_home = tmp_path / "profile-home"
     profile_home.mkdir()
@@ -60,8 +69,11 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
             env.pop(key)
     env["HERMES_HOME"] = str(profile_home)
     env["PYTHONPATH"] = str(Path(__file__).resolve().parents[2])
-    env["HERMES_SLASH_WATCHDOG_GRACE_S"] = "0"
-    env["HERMES_SLASH_WATCHDOG_POLL_S"] = "0.05"
+    # This test covers profile-local MCP discovery, not orphan reaping. Keep the
+    # watchdog from racing startup on loaded CI workers; watchdog behavior has
+    # dedicated unit coverage in tests/test_slash_worker_watchdog.py.
+    env["HERMES_SLASH_WATCHDOG_GRACE_S"] = "30"
+    env["HERMES_SLASH_WATCHDOG_POLL_S"] = "30"
     proc = subprocess.Popen(
         [
             sys.executable,
@@ -79,20 +91,30 @@ def test_profile_local_mcp_tool_is_visible_in_slash_worker(tmp_path):
         cwd=tmp_path,
     )
     output: queue.Queue[str] = queue.Queue()
+    stderr: queue.Queue[str] = queue.Queue()
     try:
         assert proc.stdin is not None
         assert proc.stdout is not None
+        assert proc.stderr is not None
         stdout = proc.stdout
+        err = proc.stderr
         threading.Thread(
             target=lambda: output.put(stdout.readline()),
+            daemon=True,
+        ).start()
+        threading.Thread(
+            target=lambda: stderr.put(err.read()),
             daemon=True,
         ).start()
         proc.stdin.write(json.dumps({"id": 1, "command": "/tools"}) + "\n")
         proc.stdin.flush()
         try:
-            line = output.get(timeout=10)
+            line = output.get(timeout=30)
         except queue.Empty:
-            pytest.fail("slash worker produced no /tools response within 10 seconds")
+            pytest.fail(
+                "slash worker produced no /tools response within 30 seconds; "
+                f"returncode={proc.poll()!r}; stderr={_drain_queue(stderr)!r}"
+            )
         response = json.loads(line)
         assert response["ok"] is True
         assert "mcp__profileprobe__hermes_61922_profile_probe" in response["output"]
