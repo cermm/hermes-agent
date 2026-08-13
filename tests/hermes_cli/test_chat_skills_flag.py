@@ -73,6 +73,30 @@ def test_chat_subcommand_accepts_image_flag(monkeypatch):
     }
 
 
+def test_chat_subcommand_accepts_reasoning_flag(monkeypatch):
+    import hermes_cli.main as main_mod
+
+    captured = {}
+
+    def fake_cmd_chat(args):
+        captured["query"] = args.query
+        captured["reasoning"] = args.reasoning
+
+    monkeypatch.setattr(main_mod, "cmd_chat", fake_cmd_chat)
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "chat", "-q", "hello", "--reasoning", "high"],
+    )
+
+    main_mod.main()
+
+    assert captured == {
+        "query": "hello",
+        "reasoning": "high",
+    }
+
+
 def test_continue_worktree_and_skills_flags_work_together(monkeypatch):
     import hermes_cli.main as main_mod
 
