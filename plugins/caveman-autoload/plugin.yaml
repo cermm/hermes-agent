@@ -1,0 +1,6 @@
+name: caveman-autoload
+version: "1.0.0"
+description: Worker-scoped Caveman-style output policy for coding and implementation sessions.
+kind: standalone
+provides_hooks:
+  - pre_llm_call
