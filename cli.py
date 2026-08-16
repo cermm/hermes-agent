@@ -3697,6 +3697,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         pass_session_id: bool = False,
         ignore_rules: bool = False,
         reasoning: str = None,
+        result_meta_fd=None,
     ):
         """
         Initialize the Hermes CLI.
@@ -3877,6 +3878,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
                 self.max_turns = 90
         else:
             self.max_turns = 90
+        self.result_meta_fd = result_meta_fd
         
         # Parse and validate toolsets
         self.enabled_toolsets = toolsets
@@ -4148,6 +4150,65 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         # Background task tracking: {task_id: threading.Thread}
         self._background_tasks: Dict[str, threading.Thread] = {}
         self._background_task_counter = 0
+
+    def _publish_result_metadata(self, result: Any) -> None:
+        """Publish requested query metadata or terminate on publication failure."""
+
+        owner = getattr(self, "result_meta_fd", None)
+        if owner is None:
+            return
+        from hermes_cli.result_metadata import (
+            PUBLIC_ERROR_MESSAGE,
+            ResultMetadataError,
+            build_result_metadata,
+            write_result_metadata_fd,
+        )
+
+        publication_failed = False
+        try:
+            metadata = build_result_metadata(result, max_iterations=self.max_turns)
+            write_result_metadata_fd(owner, metadata)
+        except ResultMetadataError:
+            publication_failed = True
+        try:
+            self._close_result_metadata_fd()
+        except ResultMetadataError:
+            publication_failed = True
+        if publication_failed:
+            print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(1) from None
+
+    def _publish_abnormal_result_metadata(self, *, interrupted: bool) -> None:
+        """Publish a closed failure frame without reflecting exception details."""
+
+        from hermes_cli.result_metadata import MAX_API_CALLS
+
+        api_calls = 0
+        try:
+            summary = self.agent.get_activity_summary()
+            candidate = summary.get("api_call_count")
+            upper_bound = min(self.max_turns + 1, MAX_API_CALLS)
+            if type(candidate) is int and 0 <= candidate <= upper_bound:
+                api_calls = candidate
+        except Exception:
+            pass
+        self._publish_result_metadata(
+            {
+                "completed": False,
+                "failed": not interrupted,
+                "partial": False,
+                "interrupted": interrupted,
+                "api_calls": api_calls,
+            }
+        )
+
+    def _close_result_metadata_fd(self) -> None:
+        """Release the owned result-metadata descriptor exactly once."""
+
+        owner = getattr(self, "result_meta_fd", None)
+        self.result_meta_fd = None
+        if owner is not None:
+            owner.close()
 
     def _claim_active_session(self, surface: str = "cli", *, stderr: bool = False) -> bool:
         """Claim a global active-session slot for this CLI process."""
@@ -12530,6 +12591,9 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             sys.stdout.flush()
             time.sleep(0.15)
 
+            if getattr(self, "result_meta_fd", None) is not None:
+                self._publish_result_metadata(result)
+
             # Update history with full conversation
             self.conversation_history = result.get("messages", self.conversation_history) if result else self.conversation_history
 
@@ -15764,10 +15828,11 @@ def _run_kanban_goal_loop_q(cli: "HermesCLI", first_response: str) -> None:
     )
 
 
-def main(
+def _main_impl(
     query: str = None,
     q: str = None,
     image: str = None,
+    result_meta_fd=None,
     toolsets: str = None,
     skills: str | list[str] | tuple[str, ...] = None,
     model: str = None,
@@ -15789,6 +15854,7 @@ def main(
     ignore_user_config: bool = False,
     ignore_rules: bool = False,
     reasoning: str = None,
+    _result_meta_fd_ownership=None,
 ):
     """
     Hermes Agent CLI - Interactive AI Assistant
@@ -15926,7 +15992,10 @@ def main(
         checkpoints=checkpoints,
         pass_session_id=pass_session_id,
         ignore_rules=ignore_rules,
+        result_meta_fd=result_meta_fd,
     )
+    if _result_meta_fd_ownership is not None:
+        _result_meta_fd_ownership.transfer_to(cli)
 
     if parsed_skills:
         skills_prompt, loaded_skills, missing_skills = build_preloaded_skills_prompt(
@@ -16178,8 +16247,18 @@ def main(
                             )
                         except KeyboardInterrupt:
                             _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
+                            if getattr(cli, "result_meta_fd", None) is not None:
+                                cli._publish_abnormal_result_metadata(interrupted=True)
+                                print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                                sys.exit(0)
                             print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
                             sys.exit(130)
+                        except Exception:
+                            if getattr(cli, "result_meta_fd", None) is None:
+                                raise
+                            cli._publish_abnormal_result_metadata(interrupted=False)
+                            print(f"\nsession_id: {cli.session_id}", file=sys.stderr)
+                            sys.exit(0)
                         # Sync session_id if mid-run compression created a
                         # continuation session. The exit line below reports
                         # session_id to stderr for automation wrappers; without
@@ -16189,6 +16268,8 @@ def main(
                             and cli.agent.session_id != cli.session_id
                         ):
                             cli.session_id = cli.agent.session_id
+                        if getattr(cli, "result_meta_fd", None) is not None:
+                            cli._publish_result_metadata(result)
                         response = result.get("final_response", "") if isinstance(result, dict) else str(result)
                         # Surface backend errors that produced no visible output
                         # (e.g. invalid model slug → provider 4xx). Mirrors the
@@ -16233,7 +16314,11 @@ def main(
                         # permanently block the card. Non-kanban runs keep the
                         # plain 0/1 contract automation wrappers expect.
                         _exit_code = 0
-                        if isinstance(result, dict) and result.get("failed"):
+                        if (
+                            result_meta_fd is None
+                            and isinstance(result, dict)
+                            and result.get("failed")
+                        ):
                             _exit_code = 1
                             if os.environ.get("HERMES_KANBAN_TASK") and result.get(
                                 "failure_reason"
@@ -16269,7 +16354,15 @@ def main(
                 # Surface security advisories before the agent runs — short
                 # banner, doesn't depend on the welcome banner being shown.
                 cli._show_security_advisories()
-                cli.chat(query, images=single_query_images or None)
+                try:
+                    cli.chat(query, images=single_query_images or None)
+                except KeyboardInterrupt:
+                    _emit_interrupted_session_end(cli, reason="keyboard_interrupt")
+                    if getattr(cli, "result_meta_fd", None) is not None:
+                        cli._publish_abnormal_result_metadata(interrupted=True)
+                        cli._print_exit_summary(clear_screen=False)
+                        sys.exit(0)
+                    raise
                 cli._print_exit_summary(clear_screen=False)
         finally:
             _finalize_single_query(cli)
@@ -16277,6 +16370,110 @@ def main(
     
     # Run interactive mode
     cli.run()
+
+
+class _ResultMetadataFDOwnershipGuard:
+    """Close a claimed result-metadata descriptor across every main() exit."""
+
+    __slots__ = ("_pending_owner", "_cli_owner")
+
+    def __init__(self, owner) -> None:
+        self._pending_owner = owner
+        self._cli_owner = None
+
+    def transfer_to(self, cli) -> None:
+        if self._pending_owner is None or self._cli_owner is not None:
+            raise RuntimeError("result metadata descriptor ownership already transferred")
+        if getattr(cli, "result_meta_fd", None) is not self._pending_owner:
+            raise RuntimeError("result metadata descriptor ownership transfer mismatch")
+        self._cli_owner = cli
+        self._pending_owner = None
+
+    def close(self) -> None:
+        cli = self._cli_owner
+        self._cli_owner = None
+        if cli is not None:
+            cli._close_result_metadata_fd()
+            return
+
+        owner = self._pending_owner
+        self._pending_owner = None
+        if owner is not None:
+            owner.close()
+
+
+def main(
+    query: str = None,
+    q: str = None,
+    image: str = None,
+    result_meta_fd=None,
+    toolsets: str = None,
+    skills: str | list[str] | tuple[str, ...] = None,
+    model: str = None,
+    provider: str = None,
+    api_key: str = None,
+    base_url: str = None,
+    max_turns: int = None,
+    verbose: Optional[bool] = None,
+    quiet: bool = False,
+    compact: bool = False,
+    list_tools: bool = False,
+    list_toolsets: bool = False,
+    gateway: bool = False,
+    resume: str = None,
+    worktree: bool = False,
+    w: bool = False,
+    checkpoints: bool = False,
+    pass_session_id: bool = False,
+    ignore_user_config: bool = False,
+    ignore_rules: bool = False,
+    reasoning: str = None,
+):
+    """Run Hermes while guarding direct-API result-metadata FD ownership."""
+
+    call_kwargs = locals().copy()
+    query = query or q
+    call_kwargs["query"] = query
+    call_kwargs["q"] = None
+    if result_meta_fd is None:
+        return _main_impl(**call_kwargs)
+
+    from hermes_cli.result_metadata import (
+        PUBLIC_ERROR_MESSAGE,
+        ResultMetadataError,
+        ResultMetadataFD,
+        claim_result_metadata_fd,
+    )
+
+    try:
+        owner = (
+            result_meta_fd
+            if isinstance(result_meta_fd, ResultMetadataFD)
+            else claim_result_metadata_fd(result_meta_fd)
+        )
+    except ResultMetadataError:
+        print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(2) from None
+
+    ownership = _ResultMetadataFDOwnershipGuard(owner)
+    call_kwargs["result_meta_fd"] = owner
+    try:
+        if not query:
+            print("Error: --result-meta-fd requires --query.", file=sys.stderr)
+            raise SystemExit(2)
+        return _main_impl(
+            **call_kwargs,
+            _result_meta_fd_ownership=ownership,
+        )
+    finally:
+        try:
+            ownership.close()
+        except ResultMetadataError:
+            print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(1) from None
+
+
+main.__doc__ = _main_impl.__doc__
 
 
 if __name__ == "__main__":
