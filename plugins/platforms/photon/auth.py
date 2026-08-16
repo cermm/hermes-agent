@@ -86,37 +86,79 @@ E164_RE = re.compile(r"^\+[1-9]\d{6,14}$")
 # auth.json helpers — share the file with the rest of hermes-agent.
 
 def _auth_json_path() -> Path:
-    """Resolve ``~/.hermes/auth.json`` honouring the active Hermes profile."""
+    """Resolve the active Hermes auth store through shared-auth authority."""
     try:
-        from hermes_constants import get_hermes_home
-        return Path(get_hermes_home()) / "auth.json"
-    except Exception:
-        return Path(os.path.expanduser("~/.hermes")) / "auth.json"
+        from hermes_cli.auth_authority import resolve_auth_authority
+    except (ImportError, ModuleNotFoundError):
+        try:
+            from hermes_constants import get_hermes_home
+
+            return Path(get_hermes_home()) / "auth.json"
+        except Exception:
+            return Path(os.path.expanduser("~/.hermes")) / "auth.json"
+
+    return resolve_auth_authority().auth_path
 
 
 def _load_auth() -> Dict[str, Any]:
-    path = _auth_json_path()
-    if not path.exists():
-        return {}
     try:
-        with path.open("r", encoding="utf-8") as fh:
-            return json.load(fh) or {}
-    except (OSError, json.JSONDecodeError) as e:
-        logger.warning("photon: could not read %s: %s", path, e)
-        return {}
+        from hermes_cli.auth import _auth_store_lock
+    except Exception:
+        _auth_store_lock = None  # type: ignore[assignment]
+
+    if _auth_store_lock is None:
+        path = _auth_json_path()
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh) or {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("photon: could not read %s: %s", path, e)
+            return {}
+
+    with _auth_store_lock():
+        path = _auth_json_path()
+        if not path.exists():
+            return {}
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                return json.load(fh) or {}
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning("photon: could not read %s: %s", path, e)
+            return {}
 
 
 def _save_auth(data: Dict[str, Any]) -> None:
-    path = _auth_json_path()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    tmp = path.with_suffix(".json.tmp")
-    with tmp.open("w", encoding="utf-8") as fh:
-        json.dump(data, fh, indent=2, sort_keys=True)
     try:
-        os.chmod(tmp, 0o600)
-    except OSError:
-        pass
-    tmp.replace(path)
+        from hermes_cli.auth import _auth_store_lock
+    except Exception:
+        _auth_store_lock = None  # type: ignore[assignment]
+
+    if _auth_store_lock is None:
+        path = _auth_json_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
+        return
+
+    with _auth_store_lock():
+        path = _auth_json_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(data, fh, indent=2, sort_keys=True)
+        try:
+            os.chmod(tmp, 0o600)
+        except OSError:
+            pass
+        tmp.replace(path)
 
 
 def load_photon_token() -> Optional[str]:

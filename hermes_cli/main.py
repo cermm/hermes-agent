@@ -867,19 +867,21 @@ def _has_any_provider_configured() -> bool:
         pass
 
     # Check for Nous Portal OAuth credentials
-    auth_file = get_hermes_home() / "auth.json"
-    if auth_file.exists():
-        try:
-            import json
+    try:
+        from hermes_cli.auth_authority import resolve_auth_authority
+        import json
 
+        auth_file = resolve_auth_authority().auth_path
+        if auth_file.exists():
             auth = json.loads(auth_file.read_text())
-            active = auth.get("active_provider")
+            providers = auth.get("providers", {})
+            active = auth.get("active_provider") or ("nous" if "nous" in providers else None)
             if active:
                 status = get_auth_status(active)
                 if status.get("logged_in"):
                     return True
-        except Exception:
-            pass
+    except Exception:
+        pass
 
     # Check config.yaml — if model is a dict with an explicit provider set,
     # the user has gone through setup (fresh installs have model as a plain

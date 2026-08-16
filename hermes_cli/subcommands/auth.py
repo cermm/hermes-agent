@@ -65,11 +65,43 @@ def build_auth_parser(subparsers, *, cmd_auth: Callable) -> None:
     auth_status = auth_subparsers.add_parser(
         "status", help="Show auth status for a provider"
     )
-    auth_status.add_argument("provider", help="Provider id")
+    auth_status.add_argument(
+        "provider",
+        nargs="?",
+        help="Optional provider id; omit to inspect auth-store authority",
+    )
+    auth_status.add_argument(
+        "--all-profiles",
+        action="store_true",
+        help="Show redacted auth authority for the default and all named profiles",
+    )
     auth_logout = auth_subparsers.add_parser(
         "logout", help="Log out a provider and clear stored auth state"
     )
     auth_logout.add_argument("provider", help="Provider id")
+    auth_migrate = auth_subparsers.add_parser(
+        "migrate-shared",
+        help="Plan or apply migration of legacy profile stores to shared auth",
+    )
+    selection = auth_migrate.add_mutually_exclusive_group()
+    selection.add_argument("--all-profiles", action="store_true")
+    selection.add_argument("--profile", help="Named profile to migrate")
+    mode = auth_migrate.add_mutually_exclusive_group(required=True)
+    mode.add_argument("--dry-run", action="store_true")
+    mode.add_argument("--apply", action="store_true")
+    mode.add_argument("--recover", action="store_true")
+    mode.add_argument("--rollback", action="store_true")
+    auth_migrate.add_argument("--plan-id")
+    auth_migrate.add_argument("--plan-digest")
+    auth_migrate.add_argument(
+        "--conflict-policy",
+        choices=["abort", "prefer-shared", "prefer-profile"],
+        default="abort",
+    )
+    auth_recover = auth_subparsers.add_parser(
+        "migrate-recover", help="Roll back an incomplete shared-auth migration"
+    )
+    auth_recover.add_argument("--plan-id", required=True)
     auth_spotify = auth_subparsers.add_parser(
         "spotify", help="Authenticate Hermes with Spotify via PKCE"
     )

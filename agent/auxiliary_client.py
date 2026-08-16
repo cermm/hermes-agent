@@ -659,7 +659,14 @@ _OPENROUTER_MODEL = "google/gemini-3-flash-preview"
 _NOUS_MODEL = "google/gemini-3-flash-preview"
 _NOUS_DEFAULT_BASE_URL = "https://inference-api.nousresearch.com/v1"
 _ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-_AUTH_JSON_PATH = get_hermes_home() / "auth.json"
+def _auth_json_path() -> Path:
+    """Resolve the active Hermes auth store through shared-auth authority."""
+    try:
+        from hermes_cli.auth_authority import resolve_auth_authority
+    except (ImportError, ModuleNotFoundError):
+        return get_hermes_home() / "auth.json"
+
+    return resolve_auth_authority().auth_path
 
 # Codex OAuth endpoint used when a caller explicitly requests
 # provider="openai-codex".  There is deliberately no hardcoded default
@@ -1603,12 +1610,13 @@ def _read_nous_auth() -> Optional[dict]:
         }
 
     try:
-        if not _AUTH_JSON_PATH.is_file():
+        auth_json_path = _auth_json_path()
+        if not auth_json_path.is_file():
             return None
-        data = json.loads(_AUTH_JSON_PATH.read_text())
-        if data.get("active_provider") != "nous":
-            return None
+        data = json.loads(auth_json_path.read_text())
         provider = data.get("providers", {}).get("nous", {})
+        if not provider or data.get("active_provider") not in (None, "nous"):
+            return None
         # Must have at least an access_token or agent_key
         if not provider.get("agent_key") and not provider.get("access_token"):
             return None

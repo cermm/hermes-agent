@@ -161,7 +161,7 @@ def test_missing_global_auth_file_is_safe(profile_env):
             "auth_type": "api_key",
             "priority": 0,
             "source": "manual",
-            "access_token": "sk-profile",
+            "access_token": "profile-test-token",
         }],
     }))
 
@@ -178,7 +178,7 @@ def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
             "auth_type": "api_key",
             "priority": 0,
             "source": "manual",
-            "access_token": "sk-profile",
+            "access_token": "profile-test-token",
         }],
     }))
 
@@ -413,11 +413,11 @@ def test_classic_mode_does_not_double_read_same_file(tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# Writes stay scoped to the profile
+# Writes use shared authority by default; explicit profile authority stays local
 # ---------------------------------------------------------------------------
 
 
-def test_write_credential_pool_targets_profile_not_global(profile_env):
+def test_write_credential_pool_targets_shared_by_default(profile_env):
     from hermes_cli.auth import read_credential_pool, write_credential_pool
 
     _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
@@ -427,7 +427,7 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
             "auth_type": "api_key",
             "priority": 0,
             "source": "manual",
-            "access_token": "sk-global",
+            "access_token": "global-test-token",
         }],
     }))
 
@@ -437,16 +437,85 @@ def test_write_credential_pool_targets_profile_not_global(profile_env):
         "auth_type": "api_key",
         "priority": 0,
         "source": "manual",
-        "access_token": "sk-profile-new",
+        "access_token": "profile-test-token",
     }])
 
-    # Global auth.json unchanged.
+    # Default profile-mode authority is the shared root, so the global store is updated.
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert [e["id"] for e in global_data["credential_pool"]["openrouter"]] == ["prof-new", "glob-1"]
+
+    # No profile-local auth.json is created unless the profile opts in.
+    assert not (profile_env["profile"] / "auth.json").exists()
+    assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new", "glob-1"]
+
+
+def test_write_credential_pool_targets_profile_when_authority_profile(profile_env):
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    (profile_env["profile"] / "config.yaml").write_text(
+        "auth:\n  authority: profile\n", encoding="utf-8"
+    )
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-1",
+            "label": "global",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "global-test-token",
+        }],
+    }))
+
+    write_credential_pool("openrouter", [{
+        "id": "prof-new",
+        "label": "profile-new",
+        "auth_type": "api_key",
+        "priority": 0,
+        "source": "manual",
+        "access_token": "profile-test-token",
+    }])
+
     global_data = json.loads((profile_env["global"] / "auth.json").read_text())
     assert global_data["credential_pool"]["openrouter"][0]["id"] == "glob-1"
 
-    # Profile auth.json holds the new entry.
     profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
     assert profile_data["credential_pool"]["openrouter"][0]["id"] == "prof-new"
-
-    # Subsequent read returns profile (shadows global).
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+def test_legacy_fallback_source_write_holds_root_lock(profile_env):
+    from hermes_cli import auth
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "global-nous-token", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    with auth._auth_store_lock():
+        auth_store = auth._load_auth_store()
+        state, source_path = auth._load_provider_state_with_source(auth_store, "nous")
+        assert source_path == profile_env["global"] / "auth.json"
+        assert source_path.resolve(strict=False) in auth._auth_transaction_target.locked_paths
+        state["access_token"] = "rotated-global-token"
+        auth._save_provider_state_to_source(auth_store, "nous", state, source_path)
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert global_data["providers"]["nous"]["access_token"] == "rotated-global-token"
+
+
+def test_fallback_source_write_without_source_lock_fails_closed(profile_env):
+    import pytest
+    from hermes_cli import auth
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "global-nous-token", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    auth_store = auth._load_auth_store()
+    state, source_path = auth._load_provider_state_with_source(auth_store, "nous")
+    assert source_path == profile_env["global"] / "auth.json"
+    state["access_token"] = "rotated-global-token"
+
+    with pytest.raises(RuntimeError, match="Refusing unlocked auth source write"):
+        auth._save_provider_state_to_source(auth_store, "nous", state, source_path)
