@@ -76,6 +76,21 @@ def _clear_approval_state():
     mod._pending.clear()
 
 
+@pytest.fixture(autouse=True)
+def _isolate_live_security_scans(monkeypatch):
+    """Keep approval-flow tests independent of live Tirith/provider config."""
+    import tools.approval as approval
+    import tools.tirith_security as tirith
+
+    monkeypatch.setattr(
+        tirith,
+        "check_command_security",
+        lambda _command: {"action": "allow", "findings": [], "summary": ""},
+    )
+    monkeypatch.setattr(approval, "_smart_approve", lambda *_args, **_kwargs: "escalate")
+    monkeypatch.setattr(approval, "_fire_approval_hook", lambda *args, **kwargs: None)
+
+
 # ------------------------------------------------------------------
 # Blocking gateway approval infrastructure (tools/approval.py)
 # ------------------------------------------------------------------

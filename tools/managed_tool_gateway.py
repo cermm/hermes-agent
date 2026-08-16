@@ -28,8 +28,13 @@ class ManagedToolGatewayConfig:
 
 
 def auth_json_path():
-    """Return the Hermes auth store path, respecting HERMES_HOME overrides."""
-    return get_hermes_home() / "auth.json"
+    """Return the Hermes auth store path through shared-auth authority."""
+    try:
+        from hermes_cli.auth_authority import resolve_auth_authority
+    except (ImportError, ModuleNotFoundError):
+        return get_hermes_home() / "auth.json"
+
+    return resolve_auth_authority().auth_path
 
 
 def _read_nous_provider_state() -> Optional[dict]:

@@ -89,8 +89,8 @@ def test_get_nous_auth_status_invalidates_on_auth_file_mtime(tmp_path, monkeypat
     auth_mod.invalidate_nous_auth_status_cache()
 
 
-def test_get_nous_auth_status_cache_is_scoped_by_auth_file_path(tmp_path, monkeypatch):
-    """Two profile homes with missing auth.json must not share cached status."""
+def test_get_nous_auth_status_cache_shares_default_profile_authority(tmp_path, monkeypatch):
+    """Default profile homes share the root auth authority/cache key."""
     profile_a = tmp_path / "profiles" / "a"
     profile_b = tmp_path / "profiles" / "b"
     profile_a.mkdir(parents=True)
@@ -114,13 +114,45 @@ def test_get_nous_auth_status_cache_is_scoped_by_auth_file_path(tmp_path, monkey
         monkeypatch.setenv("HERMES_HOME", str(profile_b))
         second = auth_mod.get_nous_auth_status()
 
+    assert call_count["n"] == 1
+    assert first["call"] == 1
+    assert second["call"] == 1
+    assert seen_auth_files == [tmp_path / "auth.json"]
+
+    auth_mod.invalidate_nous_auth_status_cache()
+
+
+def test_get_nous_auth_status_cache_scopes_explicit_profile_authority(tmp_path, monkeypatch):
+    """Explicit profile-local authority keeps cache keys isolated by profile."""
+    profile_a = tmp_path / "profiles" / "a"
+    profile_b = tmp_path / "profiles" / "b"
+    profile_a.mkdir(parents=True)
+    profile_b.mkdir(parents=True)
+    (profile_a / "config.yaml").write_text("auth:\n  authority: profile\n", encoding="utf-8")
+    (profile_b / "config.yaml").write_text("auth:\n  authority: profile\n", encoding="utf-8")
+
+    from hermes_cli import auth as auth_mod
+
+    auth_mod.invalidate_nous_auth_status_cache()
+
+    call_count = {"n": 0}
+    seen_auth_files = []
+
+    def fake_compute():
+        call_count["n"] += 1
+        seen_auth_files.append(auth_mod._auth_file_path())
+        return {"logged_in": False, "call": call_count["n"]}
+
+    with patch.object(auth_mod, "_compute_nous_auth_status", side_effect=fake_compute):
+        monkeypatch.setenv("HERMES_HOME", str(profile_a))
+        first = auth_mod.get_nous_auth_status()
+        monkeypatch.setenv("HERMES_HOME", str(profile_b))
+        second = auth_mod.get_nous_auth_status()
+
     assert call_count["n"] == 2
     assert first["call"] == 1
     assert second["call"] == 2
-    assert seen_auth_files == [
-        profile_a / "auth.json",
-        profile_b / "auth.json",
-    ]
+    assert seen_auth_files == [profile_a / "auth.json", profile_b / "auth.json"]
 
     auth_mod.invalidate_nous_auth_status_cache()
 
