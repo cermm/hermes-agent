@@ -4085,6 +4085,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     def _running_agent_count(self) -> int:
         return len(self._running_agents)
 
+    def _active_goal_run_count(self) -> int:
+        """Count generation-owned goal workers still evaluating or gating."""
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            return sum(
+                not control["done"].is_set()
+                for session_controls in controls.values()
+                for control in session_controls
+            )
+
     def _active_cron_job_count(self) -> int:
         """Count of cron jobs currently executing, from the cron scheduler's
         own in-flight tracking (``cron.scheduler._running_job_ids``).
@@ -5658,31 +5668,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
     async def _drain_active_agents(self, timeout: float) -> tuple[Dict[str, Any], bool]:
         snapshot = self._snapshot_running_agents()
         last_active_count = self._running_agent_count()
+        last_goal_count = self._active_goal_run_count()
         last_cron_count = self._active_cron_job_count()
         last_status_at = 0.0
 
         def _maybe_update_status(force: bool = False) -> None:
-            nonlocal last_active_count, last_cron_count, last_status_at
+            nonlocal last_active_count, last_goal_count, last_cron_count, last_status_at
             now = asyncio.get_running_loop().time()
             active_count = self._running_agent_count()
+            goal_count = self._active_goal_run_count()
             cron_count = self._active_cron_job_count()
             if (
                 force
                 or active_count != last_active_count
+                or goal_count != last_goal_count
                 or cron_count != last_cron_count
                 or (now - last_status_at) >= 1.0
             ):
                 self._update_runtime_status("draining")
                 last_active_count = active_count
+                last_goal_count = goal_count
                 last_cron_count = cron_count
                 last_status_at = now
 
-        # Cron jobs run on the scheduler's own thread pool, outside
-        # ``self._running_agents`` — fold their in-flight count into the
-        # same wait/timeout this method already applies to chat sessions,
-        # or a cron job's tool work gets killed with zero warning the
-        # instant it's the only active thing running (#60432).
-        if not self._running_agents and last_cron_count == 0:
+        # Cron jobs and /goal continuations run outside ``self._running_agents``;
+        # fold their in-flight counts into the same wait/timeout this method
+        # already applies to chat sessions.
+        if not self._running_agents and last_goal_count == 0 and last_cron_count == 0:
             _maybe_update_status(force=True)
             return snapshot, False
 
@@ -5692,16 +5704,25 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         deadline = asyncio.get_running_loop().time() + timeout
         while (
-            (self._running_agents or self._active_cron_job_count())
+            (
+                self._running_agents
+                or self._active_goal_run_count()
+                or self._active_cron_job_count()
+            )
             and asyncio.get_running_loop().time() < deadline
         ):
             _maybe_update_status()
             await asyncio.sleep(0.1)
-        timed_out = bool(self._running_agents) or bool(self._active_cron_job_count())
+        timed_out = (
+            bool(self._running_agents)
+            or bool(self._active_goal_run_count())
+            or bool(self._active_cron_job_count())
+        )
         _maybe_update_status(force=True)
         return snapshot, timed_out
 
     def _interrupt_running_agents(self, reason: str) -> None:
+        self._cancel_all_goal_runs()
         for session_key, agent in list(self._running_agents.items()):
             if agent is _AGENT_PENDING_SENTINEL:
                 continue
@@ -10303,6 +10324,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             session_entry=session_entry,
                             source=source,
                             final_response=_final_text,
+                            run_generation=_run_generation,
                         )
             except Exception as _goal_exc:
                 logger.debug("goal continuation hook failed: %s", _goal_exc)
@@ -10317,14 +10339,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Putting it in finally guarantees the revert on success, exception,
             # and interrupt alike.
             self._restore_moa_one_shot(event, _quick_key)
-            # Unconditional release covers every exit path. _release_running_agent_state
-            # is idempotent (pop-on-absent is harmless) and, called without a
-            # run_generation guard, always clears the slot regardless of which
-            # generation it holds. This evicts the zombie left when session_reset
-            # bumps the generation (N -> N+1) mid-flight: gen-N's guarded release
-            # inside _run_agent returns False, and the old sentinel-only check here
-            # missed the leftover real agent — locking the session out forever (#28686).
-            self._release_running_agent_state(_quick_key)
+            # A stopped goal worker may unwind after /new has already reused the
+            # same session key. Release only this turn's generation so stale
+            # cleanup cannot clear the replacement run's slot. Interrupt/reset
+            # paths perform their own unconditional release before reuse.
+            self._release_running_agent_state(
+                _quick_key, run_generation=_run_generation
+            )
 
     def _restore_moa_one_shot(self, event: "MessageEvent", quick_key: str) -> None:
         """Revert a ``/moa <prompt>`` one-shot model override after its turn.
@@ -12742,48 +12763,119 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(result, "error", "unknown error"),
             )
 
-    async def _defer_goal_status_notice_after_delivery(self, source: Any, message: str) -> None:
+    async def _defer_goal_status_notice_after_delivery(
+        self,
+        source: Any,
+        message: str,
+        *,
+        session_key: str = "",
+        run_generation: int | None = None,
+        control: dict | None = None,
+    ) -> bool:
         """Send a /goal status line after the main response is delivered.
 
         The gateway message handler returns the agent response to the platform
-        adapter, which sends it after this method's caller has returned.  For a
+        adapter, which sends it after this method's caller has returned. For a
         natural Discord/Telegram reading order, goal status belongs after that
-        send.  Platform adapters provide a one-shot post-delivery callback for
+        send. Platform adapters provide a one-shot post-delivery callback for
         exactly this boundary; when unavailable, fall back to direct awaited
         delivery rather than silently dropping the notice.
+
+        When ``control`` is supplied, a deferred callback owns goal-run shutdown
+        accounting until the callback fires or cancellation removes that exact
+        owner token.
         """
         adapter = self._adapter_for_source(source)
         if not adapter:
             logger.debug("goal continuation: no adapter for %s", getattr(source, "platform", None))
-            return
+            return False
+
+        deferred_owner = False
+        effective_generation = run_generation
+        if effective_generation is None and control is not None:
+            effective_generation = int(control["generation"])
 
         async def _deliver() -> None:
             try:
+                if control is not None and (
+                    control["cancel"].is_set()
+                    or not self._is_session_run_current(
+                        session_key,
+                        effective_generation or 0,
+                    )
+                ):
+                    return
                 await self._send_goal_status_notice(source, message)
             except Exception as exc:
                 logger.warning("goal continuation: status send failed: %s", exc, exc_info=True)
+            finally:
+                if control is not None and deferred_owner:
+                    self._finish_goal_run_control(session_key, control)
 
-        try:
-            session_key = self._session_key_for_source(source)
-        except Exception:
-            session_key = None
+        if not session_key:
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = ""
 
         if session_key and hasattr(adapter, "register_post_delivery_callback"):
             try:
-                generation = None
-                active = getattr(adapter, "_active_sessions", {}).get(session_key)
-                if active is not None:
-                    generation = getattr(active, "_hermes_run_generation", None)
-                adapter.register_post_delivery_callback(
-                    session_key,
-                    _deliver,
-                    generation=generation,
-                )
-                return
+                generation = effective_generation
+                if generation is None:
+                    active = getattr(adapter, "_active_sessions", {}).get(session_key)
+                    if active is not None:
+                        generation = getattr(active, "_hermes_run_generation", None)
+
+                lock, controls = self._goal_run_control_state()
+                with lock:
+                    if control is not None and (
+                        control not in controls.get(session_key, ())
+                        or control["cancel"].is_set()
+                    ):
+                        return False
+                    owner_token = object() if control is not None else None
+                    try:
+                        adapter.register_post_delivery_callback(
+                            session_key,
+                            _deliver,
+                            generation=generation,
+                            owner_token=owner_token,
+                        )
+                    except TypeError:
+                        owner_token = None
+                        adapter.register_post_delivery_callback(
+                            session_key,
+                            _deliver,
+                            generation=generation,
+                        )
+
+                    callbacks = getattr(adapter, "_post_delivery_callbacks", None)
+                    entry = callbacks.get(session_key) if isinstance(callbacks, dict) else None
+                    accepted = callbacks is None or entry is not None
+                    if accepted and generation is not None and isinstance(entry, tuple):
+                        accepted = int(entry[0]) == int(generation)
+                    elif accepted and generation is not None and isinstance(entry, list):
+                        accepted = any(
+                            isinstance(item, dict)
+                            and item.get("callback") is _deliver
+                            and item.get("generation") is not None
+                            and int(item.get("generation")) == int(generation)
+                            and item.get("owner_token") is owner_token
+                            for item in entry
+                        )
+                    if not accepted:
+                        return False
+                    if control is not None:
+                        control["post_delivery_adapter"] = adapter
+                        control["post_delivery_generation"] = generation
+                        control["post_delivery_owner_token"] = owner_token
+                        deferred_owner = True
+                return True
             except Exception as exc:
                 logger.debug("goal continuation: post-delivery callback registration failed: %s", exc)
 
         await _deliver()
+        return False
 
     async def _post_turn_goal_continuation(
         self,
@@ -12791,78 +12883,199 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         session_entry: Any,
         source: Any,
         final_response: str,
+        run_generation: int | None = None,
     ) -> None:
         """Run the goal judge after a gateway turn and, if still active,
         enqueue a continuation prompt for the same session.
 
-        Called from ``_handle_message_with_agent`` at turn boundary, AFTER
-        the response has been delivered. Safe when no goal is set.
-
-        We use the adapter's pending-message / FIFO machinery so any real
-        user message that arrives simultaneously is handled by the same
-        queue and takes priority naturally.
+        Goal evaluation and gate execution are blocking-capable, so they run in
+        the gateway executor under session context. The async side owns a
+        generation-scoped control record until every status/continuation side
+        effect is complete or cancellation removes the exact owner.
         """
-        try:
-            from hermes_cli.goals import GoalManager
-        except Exception as exc:
-            logger.debug("goal continuation: goals module unavailable: %s", exc)
-            return
-
         sid = getattr(session_entry, "session_id", None) or ""
         if not sid:
             return
 
         max_turns = self._goal_max_turns_from_config()
 
-        mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
-        if not mgr.is_active():
-            return
+        session_key = getattr(session_entry, "session_key", None) or ""
+        if not session_key:
+            try:
+                session_key = self._session_key_for_source(source)
+            except Exception:
+                session_key = ""
+        if run_generation is None:
+            run_generation = int(
+                (self.__dict__.get("_session_run_generation") or {}).get(session_key, 0)
+            )
+        control = self._begin_goal_run_control(session_key, run_generation)
+        cancelled_result = object()
 
-        try:
-            from hermes_cli.goals import gather_background_processes as _gather_bg
-            _bg_procs = _gather_bg()
-        except Exception:
-            _bg_procs = None
+        def _goal_run_is_current() -> bool:
+            return bool(
+                not control["cancel"].is_set()
+                and self._is_session_run_current(session_key, run_generation)
+            )
 
-        decision = mgr.evaluate_after_turn(
-            final_response or "",
-            user_initiated=True,
-            background_processes=_bg_procs,
+        from tools.approval import (
+            register_gateway_notify,
+            reset_current_session_key,
+            set_current_session_key,
+            unregister_gateway_notify,
         )
-        msg = decision.get("message") or ""
 
-        # Defer the status line until after the adapter has delivered the
-        # agent's visible final response. The judge runs after the response is
-        # produced but before BasePlatformAdapter sends it, so sending here
-        # would show "✓ Goal achieved" before the answer itself. Registering
-        # an awaited post-delivery callback preserves delivery reliability
-        # without reversing the user-visible ordering.
-        if msg and source is not None:
-            await self._defer_goal_status_notice_after_delivery(source, msg)
-
-        if not decision.get("should_continue"):
-            return
-
-        prompt = decision.get("continuation_prompt") or ""
-        if not prompt or source is None:
-            return
-
-        # Enqueue via the adapter's FIFO so a user message already in
-        # flight preempts the continuation naturally.
+        adapter = self._adapter_for_source(source) if source is not None else None
         try:
-            adapter = self._adapter_for_source(source)
-            _quick_key = self._session_key_for_source(source)
-            if adapter and _quick_key:
-                cont_event = MessageEvent(
-                    text=prompt,
-                    message_type=MessageType.TEXT,
-                    source=source,
-                    message_id=None,
-                    channel_prompt=None,
+            metadata = self._thread_metadata_for_source(source) if source is not None else None
+        except Exception:
+            metadata = None
+        loop = asyncio.get_running_loop()
+
+        def _approval_notify_for_goal(approval_data: dict) -> None:
+            if adapter is None:
+                return
+            try:
+                if hasattr(adapter, "pause_typing_for_chat"):
+                    adapter.pause_typing_for_chat(source.chat_id)
+                cmd = _redact_approval_command(approval_data.get("command", ""))
+                desc = approval_data.get("description", "dangerous command")
+                command_prefix = getattr(adapter, "typed_command_prefix", "/")
+                cmd_preview = cmd[:200] + "..." if len(cmd) > 200 else cmd
+                choices = [
+                    f"Reply `{command_prefix}approve` to execute this one operation"
+                ]
+                if approval_data.get("allow_session", True):
+                    choices.append(
+                        f"`{command_prefix}approve session` to approve this pattern for the session"
+                    )
+                if approval_data.get("allow_permanent", True):
+                    choices.append(
+                        f"`{command_prefix}approve always` to approve permanently"
+                    )
+                choices.append(f"`{command_prefix}deny` to cancel")
+                msg = (
+                    "⚠️ **Dangerous command requires approval:**\n"
+                    f"```\n{cmd_preview}\n```\n"
+                    f"Reason: {desc}\n\n"
+                    + ", ".join(choices[:-1])
+                    + f", or {choices[-1]}."
                 )
-                self._enqueue_fifo(_quick_key, cont_event, adapter)
-        except Exception as exc:
-            logger.debug("goal continuation: enqueue failed: %s", exc)
+                fut = safe_schedule_threadsafe(
+                    adapter.send(source.chat_id, msg, metadata=metadata),
+                    loop,
+                    logger=logger,
+                    log_message="Goal approval text-send scheduling error",
+                )
+                if fut is not None:
+                    fut.result(timeout=15)
+            except Exception as exc:
+                logger.error("Failed to send goal approval request: %s", exc)
+
+        def _evaluate_goal_sync_inner():
+            from hermes_cli.goals import GoalManager, gather_background_processes
+
+            mgr = GoalManager(session_id=sid, default_max_turns=max_turns)
+            if not mgr.is_active():
+                return None
+            try:
+                background_processes = gather_background_processes()
+            except Exception:
+                background_processes = None
+            return mgr.evaluate_after_turn(
+                final_response or "",
+                user_initiated=True,
+                background_processes=background_processes,
+            )
+
+        def _evaluate_goal_sync():
+            self._set_goal_run_thread(session_key, control)
+            try:
+                if control["cancel"].is_set():
+                    return cancelled_result
+                decision = _evaluate_goal_sync_inner()
+                if control["cancel"].is_set():
+                    return cancelled_result
+                return decision
+            finally:
+                self._finish_goal_run_executor(session_key, control)
+
+        session_context = SessionContext(
+            source=source,
+            connected_platforms=[],
+            home_channels={},
+            session_key=session_key,
+            session_id=sid,
+            created_at=getattr(session_entry, "created_at", None),
+            updated_at=getattr(session_entry, "updated_at", None),
+        )
+        session_tokens = self._set_session_env(session_context)
+        approval_token = set_current_session_key(session_key)
+        notify_registered = bool(adapter is not None and session_key)
+        notify_owner_token = None
+        if notify_registered:
+            notify_owner_token = register_gateway_notify(
+                session_key, _approval_notify_for_goal
+            )
+            self._set_goal_run_notify_token(
+                session_key, control, notify_owner_token
+            )
+        try:
+            decision = await self._run_in_executor_with_context(_evaluate_goal_sync)
+        except BaseException:
+            control["async_abandoned"].set()
+            if control["executor_done"].is_set():
+                self._finish_goal_run_control(session_key, control)
+            raise
+        finally:
+            if notify_registered:
+                unregister_gateway_notify(session_key, notify_owner_token)
+            reset_current_session_key(approval_token)
+            self._clear_session_env(session_tokens)
+
+        notice_deferred = False
+        try:
+            if (
+                decision is cancelled_result
+                or decision is None
+                or not _goal_run_is_current()
+            ):
+                return
+            msg = decision.get("message") or ""
+
+            if msg and source is not None and _goal_run_is_current():
+                notice_deferred = await self._defer_goal_status_notice_after_delivery(
+                    source,
+                    msg,
+                    session_key=session_key,
+                    run_generation=run_generation,
+                    control=control,
+                )
+
+            if not _goal_run_is_current() or not decision.get("should_continue"):
+                return
+
+            prompt = decision.get("continuation_prompt") or ""
+            if not prompt or source is None:
+                return
+
+            try:
+                adapter = self._adapter_for_source(source)
+                _quick_key = self._session_key_for_source(source)
+                if adapter and _quick_key and _goal_run_is_current():
+                    cont_event = MessageEvent(
+                        text=prompt,
+                        message_type=MessageType.TEXT,
+                        source=source,
+                        message_id=None,
+                        channel_prompt=None,
+                    )
+                    self._enqueue_fifo(_quick_key, cont_event, adapter)
+            except Exception as exc:
+                logger.debug("goal continuation: enqueue failed: %s", exc)
+        finally:
+            if not notice_deferred:
+                self._finish_goal_run_control(session_key, control)
 
 
 
@@ -16131,6 +16344,192 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         generations = self.__dict__.get("_session_run_generation") or {}
         return int(generations.get(session_key, 0)) == int(generation)
 
+    def _goal_run_control_state(self):
+        """Return lazily-created generation-owned goal worker state."""
+        lock = getattr(self, "_goal_run_controls_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._goal_run_controls_lock = lock
+        controls = getattr(self, "_goal_run_controls", None)
+        if controls is None:
+            controls = {}
+            self._goal_run_controls = controls
+        return lock, controls
+
+    def _begin_goal_run_control(self, session_key: str, generation: int) -> dict:
+        """Install a cancellation fence for one goal-evaluation generation."""
+        control = {
+            "generation": int(generation),
+            "cancel": threading.Event(),
+            "done": threading.Event(),
+            "executor_done": threading.Event(),
+            "async_abandoned": threading.Event(),
+            "thread_id": None,
+            "notify_token": None,
+            "post_delivery_adapter": None,
+            "post_delivery_generation": None,
+            "post_delivery_owner_token": None,
+        }
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            prior_controls = [
+                prior
+                for prior in controls.get(session_key, ())
+                if not prior["done"].is_set()
+            ]
+            for prior in prior_controls:
+                prior["cancel"].set()
+            controls.setdefault(session_key, []).append(control)
+        self._signal_goal_run_cancellation(session_key, prior_controls)
+        return control
+
+    def _set_goal_run_thread(self, session_key: str, control: dict) -> None:
+        """Bind the worker thread and honor cancellation that raced startup."""
+        thread_id = threading.get_ident()
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            if control not in controls.get(session_key, ()):
+                return
+            control["thread_id"] = thread_id
+            cancelled = control["cancel"].is_set()
+            if cancelled:
+                from tools.interrupt import set_interrupt
+
+                set_interrupt(True, thread_id=thread_id)
+
+    def _finish_goal_run_executor(self, session_key: str, control: dict) -> None:
+        """Atomically release a control's reusable executor-thread ownership."""
+        from tools.interrupt import clear_current_thread_interrupt
+
+        lock, _controls = self._goal_run_control_state()
+        with lock:
+            clear_current_thread_interrupt()
+            control["thread_id"] = None
+            control["executor_done"].set()
+            async_abandoned = control["async_abandoned"].is_set()
+        if async_abandoned:
+            self._finish_goal_run_control(session_key, control)
+
+    def _set_goal_run_notify_token(
+        self, session_key: str, control: dict, notify_token: object
+    ) -> None:
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            if control in controls.get(session_key, ()):
+                control["notify_token"] = notify_token
+
+    def _signal_goal_run_cancellation(
+        self, session_key: str, controls: list[dict]
+    ) -> None:
+        """Release approval waits and interrupt workers already marked cancelled."""
+        notify_tokens = []
+        retired_callbacks = []
+        lock, active_controls = self._goal_run_control_state()
+        with lock:
+            for control in controls:
+                if (
+                    control not in active_controls.get(session_key, ())
+                    or control["done"].is_set()
+                ):
+                    continue
+                notify_token = control.get("notify_token")
+                if notify_token is not None:
+                    notify_tokens.append(notify_token)
+
+                callback_adapter = control.get("post_delivery_adapter")
+                callback_generation = control.get("post_delivery_generation")
+                callback_owner_token = control.get("post_delivery_owner_token")
+                if callback_adapter is not None and hasattr(
+                    callback_adapter, "pop_post_delivery_callback"
+                ):
+                    try:
+                        callback = callback_adapter.pop_post_delivery_callback(
+                            session_key,
+                            generation=callback_generation,
+                            owner_token=callback_owner_token,
+                        )
+                    except TypeError:
+                        callback = callback_adapter.pop_post_delivery_callback(
+                            session_key,
+                            generation=callback_generation,
+                        )
+                    if callback is not None:
+                        control["post_delivery_adapter"] = None
+                        control["post_delivery_generation"] = None
+                        control["post_delivery_owner_token"] = None
+                        retired_callbacks.append(control)
+
+                thread_id = control.get("thread_id")
+                if thread_id is not None and not control["executor_done"].is_set():
+                    from tools.interrupt import set_interrupt
+
+                    set_interrupt(True, thread_id=thread_id)
+
+        for notify_token in notify_tokens:
+            from tools.approval import unregister_gateway_notify
+
+            unregister_gateway_notify(session_key, notify_token)
+        for control in retired_callbacks:
+            self._finish_goal_run_control(session_key, control)
+
+    def _cancel_goal_run(self, session_key: str) -> bool:
+        """Cancel every unfinished goal generation for one session."""
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            session_controls = [
+                control
+                for control in controls.get(session_key, ())
+                if not control["done"].is_set()
+            ]
+            if not session_controls:
+                return False
+            for control in session_controls:
+                control["cancel"].set()
+
+        self._signal_goal_run_cancellation(session_key, session_controls)
+        return True
+
+    def _cancel_all_goal_runs(self) -> None:
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            active_by_session = {
+                session_key: [
+                    control
+                    for control in session_controls
+                    if not control["done"].is_set()
+                ]
+                for session_key, session_controls in controls.items()
+            }
+            active_by_session = {
+                session_key: session_controls
+                for session_key, session_controls in active_by_session.items()
+                if session_controls
+            }
+            for session_controls in active_by_session.values():
+                for control in session_controls:
+                    control["cancel"].set()
+        for session_key, session_controls in active_by_session.items():
+            self._signal_goal_run_cancellation(session_key, session_controls)
+
+    def _finish_goal_run_control(self, session_key: str, control: dict) -> None:
+        """Retire only the control owned by the finishing worker generation."""
+        control["done"].set()
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            session_controls = controls.get(session_key, [])
+            if control in session_controls:
+                session_controls.remove(control)
+            if not session_controls:
+                controls.pop(session_key, None)
+
+    def _has_active_goal_run(self, session_key: str) -> bool:
+        lock, controls = self._goal_run_control_state()
+        with lock:
+            return any(
+                not control["done"].is_set()
+                for control in controls.get(session_key, ())
+            )
+
     def _bind_adapter_run_generation(
         self,
         adapter: Any,
@@ -16159,6 +16558,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         """Interrupt the current run and clear queued session state consistently."""
         if not session_key:
             return
+        # Goal evaluation runs after the main AIAgent has released its slot,
+        # but can still be blocked in approval or a gate subprocess. Cancel
+        # that exact generation before releasing routing state.
+        self._cancel_goal_run(session_key)
         running_agent = self._running_agents.get(session_key)
         if running_agent and running_agent is not _AGENT_PENDING_SENTINEL:
             running_agent.interrupt(interrupt_reason)
@@ -18858,7 +19261,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _approval_session_key = session_key or ""
             _approval_session_token = set_current_session_key(_approval_session_key)
-            register_gateway_notify(_approval_session_key, _approval_notify_sync)
+            _approval_notify_token = register_gateway_notify(
+                _approval_session_key, _approval_notify_sync
+            )
             try:
                 # If _prepare_inbound_message_text buffered image paths for native
                 # attachment, wrap the user turn as an OpenAI-style multimodal
@@ -18909,7 +19314,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
             finally:
-                unregister_gateway_notify(_approval_session_key)
+                unregister_gateway_notify(
+                    _approval_session_key, _approval_notify_token
+                )
                 # Cancel any pending clarify entries so blocked agent
                 # threads don't hang past the end of the run (interrupt,
                 # completion, gateway shutdown).  Idempotent.

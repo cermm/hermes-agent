@@ -236,6 +236,45 @@ class TestAlwaysVisibility:
 
 
 # ---------------------------------------------------------------------------
+# Deferred command gates require explicit session authorization
+# ---------------------------------------------------------------------------
+
+class TestDeferredCommandAuthorization:
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_once_choice_does_not_authorize_deferred_gate(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="once")
+
+        result = check_all_command_guards(
+            "rm -rf /tmp/test",
+            "local",
+            approval_callback=cb,
+            require_explicit_authorization=True,
+        )
+
+        assert result["approved"] is False
+        assert result["outcome"] == "session_authorization_required"
+        assert result["user_consent"] is False
+        cb.assert_called_once()
+
+    @patch(_TIRITH_PATCH, return_value=_tirith_result("allow"))
+    def test_session_choice_authorizes_deferred_gate(self, mock_tirith):
+        os.environ["HERMES_INTERACTIVE"] = "1"
+        cb = MagicMock(return_value="session")
+
+        result = check_all_command_guards(
+            "rm -rf /tmp/test",
+            "local",
+            approval_callback=cb,
+            require_explicit_authorization=True,
+        )
+
+        assert result["approved"] is True
+        assert result["user_approved"] is True
+        cb.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
 # Manual command_allowlist glob entries
 # ---------------------------------------------------------------------------
 
