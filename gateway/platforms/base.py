@@ -1691,6 +1691,70 @@ def cache_media_bytes(
     return CachedMedia(to_agent_visible_cache_path(path), out_mime, "document", display or fallback_name)
 
 
+def _normalize_post_delivery_callbacks(entry: Any) -> list[dict]:
+    """Return post-delivery callback records for legacy and current storage."""
+    if entry is None:
+        return []
+    if isinstance(entry, list):
+        return [item for item in entry if isinstance(item, dict)]
+    if isinstance(entry, tuple) and len(entry) == 2:
+        generation, callback = entry
+        return [{"generation": generation, "callback": callback, "owner_token": None}]
+    return [{"generation": None, "callback": entry, "owner_token": None}]
+
+
+def _compose_post_delivery_callbacks(entries: list[dict]) -> Callable | None:
+    """Compose callback records into the historical single-callable API.
+
+    Multiple selected records must be owner-isolated: one stuck callback cannot
+    prevent a later generation/owner callback from entering its own ``finally``
+    cleanup path (for example the goal-run finalizer).  Run selected callbacks
+    concurrently and cancel only the unfinished records after the bounded drain.
+    """
+    callbacks = [entry.get("callback") for entry in entries if callable(entry.get("callback"))]
+    if not callbacks:
+        return None
+    if len(callbacks) == 1:
+        return callbacks[0]
+
+    async def _run_callback(callback: Callable) -> None:
+        try:
+            result = callback()
+            if inspect.isawaitable(result):
+                await result
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("Post-delivery callback failed", exc_info=True)
+
+    def _consume_task_exception(task: asyncio.Task) -> None:
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+    async def _chained() -> None:
+        tasks = [asyncio.create_task(_run_callback(callback)) for callback in callbacks]
+        for task in tasks:
+            task.add_done_callback(_consume_task_exception)
+        try:
+            done, pending = await asyncio.wait(
+                tasks,
+                timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS,
+            )
+            for task in done:
+                _consume_task_exception(task)
+            for task in pending:
+                task.cancel()
+        except asyncio.CancelledError:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            raise
+
+    return _chained
+
+
 class MessageType(Enum):
     """Types of incoming messages."""
     TEXT = "text"
@@ -3922,91 +3986,85 @@ class BasePlatformAdapter(ABC):
         callback: Callable,
         *,
         generation: int | None = None,
-    ) -> None:
+        owner_token: object | None = None,
+    ) -> object | None:
         """Register a deferred callback to fire after the main response.
 
         ``generation`` lets callers tie the callback to a specific gateway run
         generation so stale runs cannot clear callbacks owned by a fresher run.
 
-        If a callback for the same ``session_key`` (and generation, when set)
-        is already registered, the new callback is chained — both fire, in
-        registration order, with per-callback exception isolation. This lets
-        independent features (background-review release + temporary-bubble
-        cleanup) coexist without clobbering each other. Stale-generation
-        callers never overwrite a fresher generation's slot.
+        ``owner_token`` lets a caller later remove only its own callback while
+        preserving unrelated same-session/same-generation callbacks. Without
+        an owner token, ``pop_post_delivery_callback(..., generation=N)`` keeps
+        the historical behavior of popping every callback for that generation.
         """
         if not session_key or not callable(callback):
-            return
+            return None
 
-        existing = self._post_delivery_callbacks.get(session_key)
-        if existing is not None:
-            if isinstance(existing, tuple) and len(existing) == 2:
-                existing_gen, existing_cb = existing
-            else:
-                existing_gen, existing_cb = None, existing
-            # Stale-generation registrations never overwrite a fresher slot.
-            if (
-                existing_gen is not None
-                and generation is not None
-                and int(generation) < int(existing_gen)
-            ):
-                return
-            # Same-or-newer generation: chain with the existing callback so
-            # both fire in registration order.
-            if callable(existing_cb) and (
-                existing_gen is None
-                or generation is None
-                or int(existing_gen) == int(generation)
-            ):
-                _prev = existing_cb
-                _new = callback
+        normalized_generation = int(generation) if generation is not None else None
+        entries = _normalize_post_delivery_callbacks(
+            self._post_delivery_callbacks.get(session_key)
+        )
+        generation_entries = [
+            entry for entry in entries if entry.get("generation") is not None
+        ]
+        if normalized_generation is not None and generation_entries:
+            max_generation = max(int(entry["generation"]) for entry in generation_entries)
+            if normalized_generation < max_generation:
+                return None
+            if normalized_generation > max_generation:
+                entries = [
+                    entry
+                    for entry in entries
+                    if entry.get("generation") is None
+                    or int(entry["generation"]) == normalized_generation
+                ]
 
-                async def _chained() -> None:
-                    # Both _prev and _new may be sync or async. The chained
-                    # wrapper itself must be async because the outer invoker
-                    # (``_handle_message`` etc.) awaits awaitable callbacks; a
-                    # sync wrapper here would call ``_prev()`` / ``_new()`` and
-                    # silently drop any returned coroutine, breaking chained
-                    # async post-delivery hooks (e.g. ``/goal`` continuations).
-                    for _cb in (_prev, _new):
-                        try:
-                            _result = _cb()
-                            if inspect.isawaitable(_result):
-                                await _result
-                        except Exception:
-                            logger.debug(
-                                "Post-delivery callback failed", exc_info=True
-                            )
-
-                callback = _chained
-
-        if generation is None:
-            self._post_delivery_callbacks[session_key] = callback
-        else:
-            self._post_delivery_callbacks[session_key] = (int(generation), callback)
+        entries.append(
+            {
+                "generation": normalized_generation,
+                "callback": callback,
+                "owner_token": owner_token,
+            }
+        )
+        self._post_delivery_callbacks[session_key] = entries
+        return owner_token
 
     def pop_post_delivery_callback(
         self,
         session_key: str,
         *,
         generation: int | None = None,
+        owner_token: object | None = None,
     ) -> Callable | None:
-        """Pop a deferred callback, optionally requiring generation ownership."""
+        """Pop deferred callback(s), optionally requiring generation/owner ownership."""
         if not session_key:
             return None
-        entry = self._post_delivery_callbacks.get(session_key)
-        if entry is None:
+        entries = _normalize_post_delivery_callbacks(
+            self._post_delivery_callbacks.get(session_key)
+        )
+        if not entries:
             return None
-        if isinstance(entry, tuple) and len(entry) == 2:
-            entry_generation, callback = entry
-            if generation is not None and int(entry_generation) != int(generation):
-                return None
+        normalized_generation = int(generation) if generation is not None else None
+
+        def _matches(entry: dict) -> bool:
+            entry_generation = entry.get("generation")
+            if normalized_generation is not None:
+                if entry_generation is None or int(entry_generation) != normalized_generation:
+                    return False
+            if owner_token is not None:
+                return entry.get("owner_token") is owner_token
+            return True
+
+        selected = [entry for entry in entries if _matches(entry)]
+        if not selected:
+            return None
+        remaining = [entry for entry in entries if not _matches(entry)]
+        if remaining:
+            self._post_delivery_callbacks[session_key] = remaining
+        else:
             self._post_delivery_callbacks.pop(session_key, None)
-            return callback if callable(callback) else None
-        if generation is not None:
-            return None
-        self._post_delivery_callbacks.pop(session_key, None)
-        return entry if callable(entry) else None
+        return _compose_post_delivery_callbacks(selected)
 
     # ── Processing lifecycle hooks ──────────────────────────────────────────
     # Subclasses override these to react to message processing events

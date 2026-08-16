@@ -71,6 +71,7 @@ def _clear_approval_state():
     from tools import approval as mod
     mod._gateway_queues.clear()
     mod._gateway_notify_cbs.clear()
+    mod._gateway_notify_tokens.clear()
     mod._session_approved.clear()
     mod._permanent_approved.clear()
     mod._pending.clear()
@@ -468,19 +469,23 @@ class TestBlockingApprovalE2E:
                 os.environ.pop("HERMES_SESSION_KEY", None)
                 reset_current_session_key(token)
 
-        t = threading.Thread(target=agent_thread)
-        t.start()
+        with patch(
+            "tools.tirith_security.check_command_security",
+            return_value={"action": "allow", "findings": [], "summary": ""},
+        ):
+            t = threading.Thread(target=agent_thread)
+            t.start()
 
-        for _ in range(50):
-            if notified:
-                break
-            time.sleep(0.05)
+            for _ in range(200):
+                if notified:
+                    break
+                time.sleep(0.05)
 
-        assert len(notified) == 1
-        assert "rm -rf /important" in notified[0]["command"]
+            assert len(notified) == 1
+            assert "rm -rf /important" in notified[0]["command"]
 
-        resolve_gateway_approval(session_key, "once")
-        t.join(timeout=5)
+            resolve_gateway_approval(session_key, "once")
+            t.join(timeout=5)
 
         assert result_holder[0] is not None
         assert result_holder[0]["approved"] is True
@@ -746,6 +751,9 @@ class TestCrossSessionApprovalIsolation:
         os.environ.pop("HERMES_SESSION_KEY", None)
 
     def teardown_method(self):
+        from gateway.session_context import reset_session_vars
+
+        reset_session_vars()
         os.environ.pop("HERMES_SESSION_KEY", None)
 
     def test_contextvar_wins_over_clobbered_environ(self):

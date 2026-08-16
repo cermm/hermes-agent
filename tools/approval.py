@@ -50,6 +50,12 @@ _approval_tool_call_id: contextvars.ContextVar[str] = contextvars.ContextVar(
     "approval_tool_call_id",
     default="",
 )
+_deferred_command_session_authorization_required: contextvars.ContextVar[bool] = (
+    contextvars.ContextVar(
+        "deferred_command_session_authorization_required",
+        default=False,
+    )
+)
 
 # Interactive-CLI flag. Concurrent ACP sessions run on a shared
 # ThreadPoolExecutor (acp_adapter/server.py), so mutating the process-global
@@ -150,6 +156,36 @@ def reset_current_observability_context(
     turn_token, tool_token = tokens
     _approval_tool_call_id.reset(tool_token)
     _approval_turn_id.reset(turn_token)
+
+
+def set_deferred_command_session_authorization_required(
+    required: bool,
+) -> contextvars.Token[bool]:
+    """Require session-scoped approval for deferred command execution.
+
+    Goal continuations run after the original user turn. A one-operation or
+    permanent approval must not authorize that automatic deferred gate; the
+    user must choose the current session explicitly.
+    """
+    return _deferred_command_session_authorization_required.set(bool(required))
+
+
+def reset_deferred_command_session_authorization_required(
+    token: contextvars.Token[bool],
+) -> None:
+    """Restore deferred-command approval scope enforcement."""
+    _deferred_command_session_authorization_required.reset(token)
+
+
+def deferred_command_session_authorization_required() -> bool:
+    """Return whether this context requires session-scoped command approval."""
+    return bool(_deferred_command_session_authorization_required.get())
+
+
+def _deferred_command_session_key(command: str) -> str:
+    """Session-only approval key for an exact deferred terminal command."""
+    digest = hashlib.sha256(command.encode("utf-8", errors="surrogatepass")).hexdigest()
+    return f"deferred-terminal-command:{digest}"
 
 
 def get_current_session_key(default: str = "default") -> str:
@@ -1444,9 +1480,9 @@ _permanent_approved: set = set()
 
 class _ApprovalEntry:
     """One pending dangerous-command approval inside a gateway session."""
-    __slots__ = ("event", "data", "result", "reason")
+    __slots__ = ("event", "data", "result", "reason", "owner_token")
 
-    def __init__(self, data: dict):
+    def __init__(self, data: dict, *, owner_token=None):
         self.event = threading.Event()
         self.data = data          # command, description, pattern_keys, …
         self.result: Optional[str] = None  # "once"|"session"|"always"|"deny"
@@ -1454,13 +1490,18 @@ class _ApprovalEntry:
         # (``/deny <reason>``) so the agent can adapt instead of only
         # hearing "denied". Ported from qwibitai/nanoclaw#2832.
         self.reason: Optional[str] = None
+        # Opaque notifier registration that owns this wait. Replacement
+        # generations sharing a session key must not be signalled by stale
+        # cleanup from the prior generation.
+        self.owner_token = owner_token
 
 
 _gateway_queues: dict[str, list] = {}        # session_key → [_ApprovalEntry, …]
 _gateway_notify_cbs: dict[str, object] = {}  # session_key → callable(approval_data)
+_gateway_notify_tokens: dict[str, object] = {}  # session_key → opaque owner token
 
 
-def register_gateway_notify(session_key: str, cb) -> None:
+def register_gateway_notify(session_key: str, cb):
     """Register a per-session callback for sending approval requests to the user.
 
     The callback signature is ``cb(approval_data: dict) -> None`` where
@@ -1468,19 +1509,38 @@ def register_gateway_notify(session_key: str, cb) -> None:
     ``pattern_keys``.  The callback bridges sync→async (runs in the agent
     thread, must schedule the actual send on the event loop).
     """
+    owner_token = object()
     with _lock:
         _gateway_notify_cbs[session_key] = cb
+        _gateway_notify_tokens[session_key] = owner_token
+    return owner_token
 
 
-def unregister_gateway_notify(session_key: str) -> None:
+def unregister_gateway_notify(session_key: str, owner_token=None) -> None:
     """Unregister the per-session gateway approval callback.
 
-    Signals ALL blocked threads for this session so they don't hang forever
-    (e.g. when the agent run finishes or is interrupted).
+    When ``owner_token`` is provided, remove only the callback and queue entries
+    created by that exact registration. This prevents an old run's ``finally``
+    block from unregistering a replacement generation under the same session
+    key. Legacy callers that omit the token retain the historical unconditional
+    teardown behavior.
     """
     with _lock:
-        _gateway_notify_cbs.pop(session_key, None)
-        entries = _gateway_queues.pop(session_key, [])
+        if owner_token is None:
+            _gateway_notify_cbs.pop(session_key, None)
+            _gateway_notify_tokens.pop(session_key, None)
+            entries = _gateway_queues.pop(session_key, [])
+        else:
+            if _gateway_notify_tokens.get(session_key) is owner_token:
+                _gateway_notify_cbs.pop(session_key, None)
+                _gateway_notify_tokens.pop(session_key, None)
+            queue = _gateway_queues.get(session_key, [])
+            entries = [entry for entry in queue if entry.owner_token is owner_token]
+            remaining = [entry for entry in queue if entry.owner_token is not owner_token]
+            if remaining:
+                _gateway_queues[session_key] = remaining
+            else:
+                _gateway_queues.pop(session_key, None)
     for entry in entries:
         entry.event.set()
 
@@ -1594,6 +1654,14 @@ def is_approved(session_key: str, pattern_key: str) -> bool:
     with _lock:
         if any(alias in _permanent_approved for alias in aliases):
             return True
+        session_approvals = _session_approved.get(session_key, set())
+        return any(alias in session_approvals for alias in aliases)
+
+
+def _is_session_approved(session_key: str, pattern_key: str) -> bool:
+    """Check only session-scoped approval, ignoring permanent allowlists."""
+    aliases = _approval_key_aliases(pattern_key)
+    with _lock:
         session_approvals = _session_approved.get(session_key, set())
         return any(alias in session_approvals for alias in aliases)
 
@@ -2138,8 +2206,10 @@ def _run_approval_gate(
         # "approval_required" on this path — it gets a definitive
         # approved/BLOCKED outcome.
         notify_cb = None
+        notify_token = None
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_token = _gateway_notify_tokens.get(session_key)
 
         if notify_cb is not None:
             from agent.redact import redact_sensitive_text
@@ -2151,7 +2221,11 @@ def _run_approval_gate(
                 "allow_permanent": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key,
+                notify_cb,
+                approval_data,
+                surface="gateway",
+                owner_token=notify_token,
             )
             if decision.get("notify_failed"):
                 return {
@@ -2442,7 +2516,7 @@ def _format_tirith_description(tirith_result: dict) -> str:
 
 
 def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
-                            *, surface: str = "gateway") -> dict:
+                            *, surface: str = "gateway", owner_token=None) -> dict:
     """Enqueue *approval_data*, notify the user, and block the calling agent
     thread until the request is resolved or the gateway approval timeout
     elapses — firing pre/post approval hooks and cleaning up the queue entry.
@@ -2461,8 +2535,23 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
     primary_key = approval_data.get("pattern_key", "")
     all_keys = approval_data.get("pattern_keys", [primary_key])
 
-    entry = _ApprovalEntry(approval_data)
+    entry = _ApprovalEntry(approval_data, owner_token=owner_token)
     with _lock:
+        if owner_token is not None and (
+            _gateway_notify_tokens.get(session_key) is not owner_token
+            or _gateway_notify_cbs.get(session_key) is not notify_cb
+        ):
+            logger.info(
+                "Gateway approval owner changed before queue insertion for %s; "
+                "failing the stale request closed",
+                session_key,
+            )
+            return {
+                "resolved": False,
+                "choice": None,
+                "notify_failed": True,
+                "stale_owner": True,
+            }
         _gateway_queues.setdefault(session_key, []).append(entry)
 
     def _drop_entry() -> None:
@@ -2484,6 +2573,28 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
         session_key=session_key,
         surface=surface,
     )
+
+    if owner_token is not None:
+        with _lock:
+            queue = _gateway_queues.get(session_key, [])
+            stale_owner = (
+                _gateway_notify_tokens.get(session_key) is not owner_token
+                or _gateway_notify_cbs.get(session_key) is not notify_cb
+                or entry not in queue
+            )
+        if stale_owner:
+            logger.info(
+                "Gateway approval owner changed before notification for %s; "
+                "failing the stale request closed",
+                session_key,
+            )
+            _drop_entry()
+            return {
+                "resolved": False,
+                "choice": None,
+                "notify_failed": True,
+                "stale_owner": True,
+            }
 
     # Notify the user (bridges sync agent thread → async gateway)
     try:
@@ -2561,7 +2672,8 @@ def _await_gateway_decision(session_key: str, notify_cb, approval_data: dict,
 
 def check_all_command_guards(command: str, env_type: str,
                              approval_callback=None,
-                             has_host_access: bool = False) -> dict:
+                             has_host_access: bool = False,
+                             require_explicit_authorization: bool | None = None) -> dict:
     """Run all pre-exec security checks and return a single approval decision.
 
     Gathers findings from tirith and dangerous-command detection, then
@@ -2573,9 +2685,19 @@ def check_all_command_guards(command: str, env_type: str,
     such a session is no longer isolated, so it goes through the normal flow
     instead of the container fast-path.
     """
+    if require_explicit_authorization is None:
+        require_explicit_authorization = (
+            deferred_command_session_authorization_required()
+        )
+
     # Skip isolated container backends for both checks. Docker stops skipping
-    # once host paths are bind-mounted into the sandbox.
-    if _should_skip_container_guards(env_type, has_host_access=has_host_access):
+    # once host paths are bind-mounted into the sandbox. Deferred goal-command
+    # execution is different: the sandbox may reduce command risk, but it must
+    # not bypass the user's explicit session authorization for automatic work.
+    if (
+        not require_explicit_authorization
+        and _should_skip_container_guards(env_type, has_host_access=has_host_access)
+    ):
         return {"approved": True, "message": None}
 
     # Hardline floor: unconditional block for catastrophic commands
@@ -2610,10 +2732,20 @@ def check_all_command_guards(command: str, env_type: str,
     # --yolo or approvals.mode=off: bypass all approval prompts.
     # Gateway /yolo is session-scoped; CLI --yolo remains process-scoped.
     approval_mode = _get_approval_mode()
-    if _YOLO_MODE_FROZEN or is_current_session_yolo_enabled() or approval_mode == "off":
+    if (
+        not require_explicit_authorization
+        and (
+            _YOLO_MODE_FROZEN
+            or is_current_session_yolo_enabled()
+            or approval_mode == "off"
+        )
+    ):
         return {"approved": True, "message": None}
 
-    if _command_matches_permanent_allowlist(command):
+    if (
+        not require_explicit_authorization
+        and _command_matches_permanent_allowlist(command)
+    ):
         return {"approved": True, "message": None}
 
     is_cli = _is_interactive_cli()
@@ -2622,7 +2754,7 @@ def check_all_command_guards(command: str, env_type: str,
 
     # Preserve the existing non-interactive behavior: outside CLI/gateway/ask
     # flows, we do not block on approvals and we skip external guard work.
-    if not is_cli and not is_gateway and not is_ask:
+    if not is_cli and not is_gateway and not is_ask and not require_explicit_authorization:
         # Cron sessions: respect cron_mode config
         if env_var_enabled("HERMES_CRON_SESSION"):
             if _get_cron_approval_mode() == "deny":
@@ -2741,6 +2873,20 @@ def check_all_command_guards(command: str, env_type: str,
     warnings = []  # list of (pattern_key, description, is_tirith)
 
     session_key = get_current_session_key()
+    deferred_session_key = _deferred_command_session_key(command)
+    session_authorization_matched = False
+
+    def _already_authorized(pattern_key_to_check: str) -> bool:
+        nonlocal session_authorization_matched
+        if require_explicit_authorization:
+            # Deferred autonomous goal execution requires an exact-command
+            # session grant.  A broad dangerous-pattern or Tirith rule session
+            # approval must not authorize a different future terminal command.
+            approved = _is_session_approved(session_key, deferred_session_key)
+            if approved:
+                session_authorization_matched = True
+            return approved
+        return is_approved(session_key, pattern_key_to_check)
 
     # Tirith block/warn → approvable warning with rich findings.
     # Previously, tirith "block" was a hard block with no approval prompt.
@@ -2748,15 +2894,36 @@ def check_all_command_guards(command: str, env_type: str,
     # inspect the explanation and approve if they understand the risk.
     if tirith_result["action"] in {"block", "warn"}:
         findings = tirith_result.get("findings") or []
-        rule_id = findings[0].get("rule_id", "unknown") if findings else "unknown"
-        tirith_key = f"tirith:{rule_id}"
-        tirith_desc = _format_tirith_description(tirith_result)
-        if not is_approved(session_key, tirith_key):
-            warnings.append((tirith_key, tirith_desc, True))
+        seen_tirith_keys = set()
+        for finding in findings or [{}]:
+            raw_rule_id = finding.get("rule_id") if isinstance(finding, dict) else None
+            rule_id = str(raw_rule_id).strip() if raw_rule_id is not None else ""
+            tirith_key = f"tirith:{rule_id or 'unknown'}"
+            if tirith_key in seen_tirith_keys:
+                continue
+            seen_tirith_keys.add(tirith_key)
+            if _already_authorized(tirith_key):
+                continue
+            finding_result = dict(tirith_result)
+            finding_result["findings"] = [finding] if findings else []
+            warnings.append(
+                (tirith_key, _format_tirith_description(finding_result), True)
+            )
 
     if is_dangerous:
-        if not is_approved(session_key, pattern_key):
+        if not _already_authorized(pattern_key):
             warnings.append((pattern_key, description, False))
+
+    if require_explicit_authorization and not warnings and not session_authorization_matched:
+        if not _is_session_approved(session_key, deferred_session_key):
+            warnings.append(
+                (
+                    deferred_session_key,
+                    "deferred goal terminal command execution requires "
+                    "session-scoped approval for this exact command",
+                    False,
+                )
+            )
 
     # Nothing to warn about
     if not warnings:
@@ -2766,7 +2933,7 @@ def check_all_command_guards(command: str, env_type: str,
     # When approvals.mode=smart, ask the aux LLM before prompting the user.
     # Inspired by OpenAI Codex's Smart Approvals guardian subagent
     # (openai/codex#13860).
-    if approval_mode == "smart":
+    if approval_mode == "smart" and not require_explicit_authorization:
         combined_desc_for_llm = "; ".join(desc for _, desc, _ in warnings)
         verdict = _smart_approve(command, combined_desc_for_llm)
         if verdict == "approve":
@@ -2802,8 +2969,10 @@ def check_all_command_guards(command: str, env_type: str,
     # gets the command output (approved) or a definitive "BLOCKED" message.
     if is_gateway or is_ask:
         notify_cb = None
+        notify_token = None
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_token = _gateway_notify_tokens.get(session_key)
 
         if notify_cb is not None:
             # --- Blocking gateway approval (queue-based) ---
@@ -2825,10 +2994,15 @@ def check_all_command_guards(command: str, env_type: str,
                 "description": redact_sensitive_text(combined_desc),
                 # Mirror the CLI's allow_permanent gate: a tirith warning downgrades
                 # "always" to session scope below, so the UI must not offer it.
-                "allow_permanent": not has_tirith,
+                "allow_permanent": not has_tirith and not require_explicit_authorization,
+                "allow_session": True,
             }
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface="gateway"
+                session_key,
+                notify_cb,
+                approval_data,
+                surface="gateway",
+                owner_token=notify_token,
             )
             if decision.get("notify_failed"):
                 return {
@@ -2879,7 +3053,26 @@ def check_all_command_guards(command: str, env_type: str,
                     "deny_reason": deny_reason,
                 }
 
+            if require_explicit_authorization and choice != "session":
+                return {
+                    "approved": False,
+                    "message": (
+                        "BLOCKED: Deferred command execution requires an explicit "
+                        "session-scoped approval. A one-operation or permanent "
+                        "choice does not authorize an automatic goal gate."
+                    ),
+                    "pattern_key": primary_key,
+                    "description": combined_desc,
+                    "outcome": "session_authorization_required",
+                    "user_consent": False,
+                }
+
             # User approved — persist based on scope (same logic as CLI)
+            if require_explicit_authorization:
+                approve_session(session_key, deferred_session_key)
+                return {"approved": True, "message": None,
+                        "user_approved": True, "description": combined_desc}
+
             for key, _, is_tirith in warnings:
                 if choice == "session" or (choice == "always" and is_tirith):
                     approve_session(session_key, key)
@@ -2930,7 +3123,7 @@ def check_all_command_guards(command: str, env_type: str,
         surface="cli",
     )
     choice = prompt_dangerous_approval(command, combined_desc,
-                                       allow_permanent=not has_tirith,
+                                       allow_permanent=(not has_tirith and not require_explicit_authorization),
                                        approval_callback=approval_callback)
     _fire_approval_hook(
         "post_approval_response",
@@ -2960,7 +3153,26 @@ def check_all_command_guards(command: str, env_type: str,
             "user_consent": False,
         }
 
+    if require_explicit_authorization and choice != "session":
+        return {
+            "approved": False,
+            "message": (
+                "BLOCKED: Deferred command execution requires an explicit "
+                "session-scoped approval. A one-operation or permanent choice "
+                "does not authorize an automatic goal gate."
+            ),
+            "pattern_key": primary_key,
+            "description": combined_desc,
+            "outcome": "session_authorization_required",
+            "user_consent": False,
+        }
+
     # Persist approval for each warning individually
+    if require_explicit_authorization:
+        approve_session(session_key, deferred_session_key)
+        return {"approved": True, "message": None,
+                "user_approved": True, "description": combined_desc}
+
     for key, _, is_tirith in warnings:
         if choice == "session" or (choice == "always" and is_tirith):
             # tirith: session only (no permanent broad allowlisting)
@@ -3093,8 +3305,10 @@ def check_execute_code_guard(code: str, env_type: str,
         # verdict == "escalate" → fall through to manual approval
 
     notify_cb = None
+    notify_token = None
     with _lock:
         notify_cb = _gateway_notify_cbs.get(session_key)
+        notify_token = _gateway_notify_tokens.get(session_key)
 
     if notify_cb is None:
         # No gateway callback registered (e.g. ask-mode without a notifier):
@@ -3125,7 +3339,11 @@ def check_execute_code_guard(code: str, env_type: str,
         "description": display_description,
     }
     decision = _await_gateway_decision(
-        session_key, notify_cb, approval_data, surface="gateway"
+        session_key,
+        notify_cb,
+        approval_data,
+        surface="gateway",
+        owner_token=notify_token,
     )
     if decision.get("notify_failed"):
         return {
@@ -3210,6 +3428,7 @@ def request_elicitation_consent(
     if _is_gateway_approval_context():
         with _lock:
             notify_cb = _gateway_notify_cbs.get(session_key)
+            notify_token = _gateway_notify_tokens.get(session_key)
         if notify_cb is None:
             logger.warning(
                 "Elicitation requested in gateway session %s but no "
@@ -3226,7 +3445,11 @@ def request_elicitation_consent(
         }
         try:
             decision = _await_gateway_decision(
-                session_key, notify_cb, approval_data, surface=surface,
+                session_key,
+                notify_cb,
+                approval_data,
+                surface=surface,
+                owner_token=notify_token,
             )
         except Exception as exc:
             logger.error(

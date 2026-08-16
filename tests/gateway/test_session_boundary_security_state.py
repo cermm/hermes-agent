@@ -24,6 +24,7 @@ from tools.approval import (
 def _clear_approval_state():
     approval_mod._gateway_queues.clear()
     approval_mod._gateway_notify_cbs.clear()
+    approval_mod._gateway_notify_tokens.clear()
     approval_mod._session_approved.clear()
     approval_mod._session_yolo.clear()
     approval_mod._permanent_approved.clear()
@@ -32,6 +33,7 @@ def _clear_approval_state():
     yield
     approval_mod._gateway_queues.clear()
     approval_mod._gateway_notify_cbs.clear()
+    approval_mod._gateway_notify_tokens.clear()
     approval_mod._session_approved.clear()
     approval_mod._session_yolo.clear()
     approval_mod._permanent_approved.clear()
