@@ -365,6 +365,30 @@ class TestSessionKeyContext:
         assert "set_current_session_key" in called_names
         assert "reset_current_session_key" in called_names
 
+    def test_gateway_goal_continuation_enforces_deferred_session_authorization(self):
+        run_py = Path(__file__).resolve().parents[2] / "gateway" / "run.py"
+        module = ast.parse(run_py.read_text(encoding="utf-8"))
+
+        functions = {}
+        for node in ast.walk(module):
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef)) and node.name in {
+                "_post_turn_goal_continuation",
+                "_run_agent",
+            }:
+                functions[node.name] = node
+
+        assert "_post_turn_goal_continuation" in functions
+        assert "_run_agent" in functions
+
+        for function_name in ("_post_turn_goal_continuation", "_run_agent"):
+            called_names = set()
+            for node in ast.walk(functions[function_name]):
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+                    called_names.add(node.func.id)
+
+            assert "set_deferred_command_session_authorization_required" in called_names
+            assert "reset_deferred_command_session_authorization_required" in called_names
+
 
 
 
@@ -2146,6 +2170,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_notify_tokens.clear()
         mod._session_approved.clear()
         mod._permanent_approved.clear()
         mod._pending.clear()
@@ -2169,6 +2194,7 @@ class TestApprovalTimeoutIsNotConsent:
         from tools import approval as mod
         mod._gateway_queues.clear()
         mod._gateway_notify_cbs.clear()
+        mod._gateway_notify_tokens.clear()
         for k, v in self._saved_env.items():
             if v is None:
                 os.environ.pop(k, None)
