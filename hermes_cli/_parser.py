@@ -12,6 +12,19 @@ because its dispatch is tightly coupled to module-level ``cmd_*`` functions.
 
 import argparse
 
+from hermes_cli.result_metadata import parse_result_metadata_fd
+
+
+class _StoreUnique(argparse.Action):
+    """Store one option value and reject ambiguous repeated ownership flags."""
+
+    def __call__(self, parser, namespace, values, option_string=None):
+        if getattr(namespace, self.dest, None) is not None:
+            raise argparse.ArgumentError(
+                self, f"{option_string or self.dest} may only be specified once"
+            )
+        setattr(namespace, self.dest, values)
+
 
 # `--profile` / `-p` is consumed by ``main._apply_profile_override`` before
 # argparse runs (it sets ``HERMES_HOME`` and strips itself from ``sys.argv``),
@@ -273,6 +286,17 @@ def build_top_level_parser():
     )
     chat_parser.add_argument(
         "-q", "--query", help="Single query (non-interactive mode)"
+    )
+    chat_parser.add_argument(
+        "--result-meta-fd",
+        action=_StoreUnique,
+        type=parse_result_metadata_fd,
+        metavar="FD",
+        default=None,
+        help=(
+            "Write JSON metadata as one frame to a pre-opened blocking anonymous "
+            "pipe write descriptor after --query (classic CLI, POSIX/WSL only)"
+        ),
     )
     chat_parser.add_argument(
         "--image", help="Optional local image path to attach to a single query"

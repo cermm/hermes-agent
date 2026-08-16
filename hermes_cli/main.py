@@ -2248,9 +2248,94 @@ def _resolve_use_tui(args) -> bool:
         return False
 
 
+def _claim_result_metadata_args(args):
+    """Claim chat result-metadata descriptor before startup side effects."""
+
+    from hermes_cli import result_metadata
+
+    owner = None
+    raw_fd = getattr(args, "result_meta_fd", None)
+    if raw_fd is None:
+        return None
+    if isinstance(raw_fd, result_metadata.ResultMetadataFD):
+        return raw_fd
+    try:
+        owner = result_metadata.claim_result_metadata_fd(raw_fd)
+    except result_metadata.ResultMetadataError:
+        print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(2) from None
+    args.result_meta_fd = owner
+    return owner
+
+
+def _early_claim_result_metadata_argv(argv: list[str]):
+    """Claim --result-meta-fd from raw argv before config/container startup."""
+
+    marker = "--result-meta-fd"
+    raw_values = []
+    for index, token in enumerate(argv):
+        if token == marker:
+            raw_values.append(argv[index + 1] if index + 1 < len(argv) else None)
+        elif token.startswith(f"{marker}="):
+            raw_values.append(token.split("=", 1)[1])
+
+    if not raw_values:
+        return None
+
+    from hermes_cli import result_metadata
+
+    if len(raw_values) > 1:
+        print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(2)
+
+    raw_value = raw_values[0]
+    if raw_value is None:
+        return None
+
+    from argparse import ArgumentTypeError
+
+    from hermes_cli._parser import parse_result_metadata_fd
+
+    try:
+        return result_metadata.claim_result_metadata_fd(
+            parse_result_metadata_fd(raw_value)
+        )
+    except (ValueError, ArgumentTypeError, result_metadata.ResultMetadataError):
+        print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(2) from None
+
+
 def cmd_chat(args):
-    """Run interactive chat CLI."""
+    """Claim result-metadata descriptors before config or agent startup."""
+
+    from hermes_cli import result_metadata
+
+    owner = _claim_result_metadata_args(args)
+    try:
+        return _cmd_chat(args)
+    finally:
+        if owner is not None:
+            try:
+                owner.close()
+            except result_metadata.ResultMetadataError:
+                print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+                raise SystemExit(1) from None
+
+
+def _cmd_chat(args):
+    """Run interactive chat CLI after descriptor ownership is established."""
+    result_meta_fd = getattr(args, "result_meta_fd", None)
+    if result_meta_fd is not None and not getattr(args, "query", None):
+        print("Error: --result-meta-fd requires --query.", file=sys.stderr)
+        raise SystemExit(2)
+
     use_tui = _resolve_use_tui(args)
+    if result_meta_fd is not None and use_tui:
+        print(
+            "Error: --result-meta-fd is available only in the classic CLI.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
 
     _apply_safe_mode(args)
 
@@ -2441,6 +2526,7 @@ def cmd_chat(args):
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
+        "result_meta_fd": result_meta_fd,
         "image": getattr(args, "image", None),
         "resume": getattr(args, "resume", None),
         "worktree": getattr(args, "worktree", False),
@@ -12604,7 +12690,18 @@ def _try_termux_fast_cli_launch() -> bool:
             if getattr(args, "accept_hooks", False):
                 os.environ["HERMES_ACCEPT_HOOKS"] = "1"
         else:
-            _prepare_agent_startup(args)
+            preclaimed_result_meta_owner = None
+            if getattr(args, "result_meta_fd", None) is not None:
+                preclaimed_result_meta_owner = _claim_result_metadata_args(args)
+            try:
+                _prepare_agent_startup(args)
+            except BaseException:
+                if preclaimed_result_meta_owner is not None:
+                    try:
+                        preclaimed_result_meta_owner.close()
+                    except Exception:
+                        pass
+                raise
         cmd_chat(args)
         return True
 
@@ -12819,6 +12916,9 @@ def main():
     except Exception:
         pass
 
+    _early_processed_argv = _coalesce_session_name_args(sys.argv[1:])
+    early_result_meta_owner = _early_claim_result_metadata_argv(_early_processed_argv)
+
     # Sweep stale ``hermes.exe.old.*`` quarantine files left by previous
     # ``hermes update`` runs on Windows. Silent no-op on non-Windows or when
     # there's nothing to clean. See ``_quarantine_running_hermes_exe``.
@@ -12843,9 +12943,9 @@ def main():
     except Exception:
         pass
 
-    if _try_termux_fast_tui_launch():
+    if early_result_meta_owner is None and _try_termux_fast_tui_launch():
         return
-    if _try_termux_fast_cli_launch():
+    if early_result_meta_owner is None and _try_termux_fast_cli_launch():
         return
 
     from hermes_cli._parser import build_top_level_parser
@@ -14658,16 +14758,25 @@ def main():
     # the managed container.  This MUST run before parse_args() so that
     # --help, unrecognised flags, and every subcommand are forwarded
     # transparently instead of being intercepted by argparse on the host.
+    _processed_argv = _early_processed_argv
+
     from hermes_cli.config import get_container_exec_info
 
     container_info = get_container_exec_info()
     if container_info:
+        if early_result_meta_owner is not None:
+            try:
+                early_result_meta_owner.close()
+            except Exception:
+                pass
+            from hermes_cli import result_metadata
+
+            print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(2) from None
         _exec_in_container(container_info, sys.argv[1:])
         # Unreachable: os.execvp never returns on success (process is replaced)
         # and raises OSError on failure (which propagates as a traceback).
         sys.exit(1)
-
-    _processed_argv = _coalesce_session_name_args(sys.argv[1:])
 
     # ── Defensive subparser routing (bpo-9338 workaround) ───────────
     # On some Python versions (notably <3.11), argparse fails to route
@@ -14688,27 +14797,38 @@ def main():
         t in _known_cmds for t in _processed_argv if not t.startswith("-")
     )
 
-    if _has_cmd_token:
-        subparsers.required = True
-        _saved_stderr = sys.stderr
-        try:
-            sys.stderr = _io.StringIO()
-            args = parser.parse_args(_processed_argv)
-            sys.stderr = _saved_stderr
-        except SystemExit as exc:
-            sys.stderr = _saved_stderr
-            # Help/version flags (exit code 0) already printed output —
-            # re-raise immediately to avoid a second parse_args printing
-            # the same help text again (#10230).
-            if exc.code == 0:
-                raise
-            # Subcommand name was consumed as a flag value (e.g. -c model).
-            # Fall back to optional subparsers so argparse handles it normally.
+    try:
+        if _has_cmd_token:
+            subparsers.required = True
+            _saved_stderr = sys.stderr
+            try:
+                sys.stderr = _io.StringIO()
+                args = parser.parse_args(_processed_argv)
+                sys.stderr = _saved_stderr
+            except SystemExit as exc:
+                sys.stderr = _saved_stderr
+                # Help/version flags (exit code 0) already printed output —
+                # re-raise immediately to avoid a second parse_args printing
+                # the same help text again (#10230).
+                if exc.code == 0:
+                    raise
+                # Subcommand name was consumed as a flag value (e.g. -c model).
+                # Fall back to optional subparsers so argparse handles it normally.
+                subparsers.required = False
+                args = parser.parse_args(_processed_argv)
+        else:
             subparsers.required = False
             args = parser.parse_args(_processed_argv)
-    else:
-        subparsers.required = False
-        args = parser.parse_args(_processed_argv)
+    except BaseException:
+        if early_result_meta_owner is not None:
+            try:
+                early_result_meta_owner.close()
+            except Exception:
+                pass
+        raise
+
+    if early_result_meta_owner is not None:
+        args.result_meta_fd = early_result_meta_owner
 
     # Handle --version flag
     if args.version:
@@ -14724,12 +14844,26 @@ def main():
     if getattr(args, "yolo", False):
         os.environ["HERMES_YOLO_MODE"] = "1"
 
+    preclaimed_result_meta_owner = None
+    if getattr(args, "result_meta_fd", None) is not None and (
+        getattr(args, "command", None) in {None, "chat"}
+    ):
+        preclaimed_result_meta_owner = _claim_result_metadata_args(args)
+
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated
     # so introspection/management commands (hermes hooks list, cron
     # list, gateway status, mcp add, ...) don't pay discovery cost or
     # trigger consent prompts for hooks the user is still inspecting.
-    _prepare_agent_startup(args)
+    try:
+        _prepare_agent_startup(args)
+    except BaseException:
+        if preclaimed_result_meta_owner is not None:
+            try:
+                preclaimed_result_meta_owner.close()
+            except Exception:
+                pass
+        raise
 
     # Handle top-level --oneshot / -z: single-shot mode, stdout = final
     # response only, nothing else. Bypasses cli.py entirely.

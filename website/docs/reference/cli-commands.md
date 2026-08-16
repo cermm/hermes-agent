@@ -109,6 +109,7 @@ Common options:
 | `-s`, `--skills <name>` | Preload one or more skills for the session (can be repeated or comma-separated). |
 | `-v`, `--verbose` | Verbose output. |
 | `-Q`, `--quiet` | Programmatic mode: suppress banner/spinner/tool previews. |
+| `--result-meta-fd <fd>` | Write closed-world JSON status as one bounded frame to a pre-opened POSIX/WSL anonymous-pipe write descriptor; single `--query`, classic CLI only. |
 | `--image <path>` | Attach a local image to a single query. |
 | `--resume <session>` / `--continue [name]` | Resume a session directly from `chat`. |
 | `--worktree` | Create an isolated git worktree for this run. |
@@ -133,6 +134,43 @@ hermes chat --worktree -q "Review this repo and open a PR"
 hermes chat --ignore-user-config --ignore-rules -q "Repro without my personal setup"
 hermes chat --safe-mode -q "Is this bug mine or Hermes'?"
 ```
+
+### Structured query-result metadata
+
+Automation that needs a machine-readable turn outcome without inspecting the
+model response can create an anonymous pipe, retain its read endpoint, pass only
+the blocking write endpoint to Hermes, and select it with
+`--result-meta-fd <fd>`. The option requires a single `--query`, is available
+only in the classic CLI on POSIX systems (including WSL), and has no effect when
+absent.
+
+Hermes accepts only a canonical integer descriptor numbered 3 or higher that is
+an open blocking anonymous-pipe write endpoint with `PC_PIPE_BUF >= 1024`. It marks the
+descriptor non-inheritable, writes exactly one JSON frame of at most 1024 bytes,
+requires a full write, and closes the owned endpoint on success or failure.
+Invalid descriptors fail before config, model, or agent construction. `EPIPE`,
+`EAGAIN`, short writes, and close faults fail closed without retry or fallback,
+emit only `Error: failed to publish result metadata.`, and exit nonzero.
+Once a valid frame is published, the process exits zero even when the frame
+reports a failed or interrupted turn; callers must use `failure_class` and the
+status fields as the turn outcome. Without `--result-meta-fd`, legacy process
+statuses remain unchanged (including exit 1 for failed turns and 130 for
+`KeyboardInterrupt`).
+
+The versioned `hermes-agent-result-meta-v1` object contains only:
+`schema_version`, `completed`, `failed`, `partial`, `interrupted`, `api_calls`,
+and `failure_class`. Failure classes are `none`, `interrupted`,
+`content_policy_blocked`, `provider_api_terminal`,
+`max_turns_or_incomplete`, and `unknown_failure`. The projection never includes
+response/error text, prompts, messages, tool output, provider/model names,
+session IDs, paths, hashes, or exceptions. Unknown, malformed, or contradictory
+internal results become `unknown_failure`.
+`KeyboardInterrupt` and unexpected query exceptions publish `interrupted` and
+`unknown_failure` frames respectively. Their API-call count comes only from the
+agent's bounded activity counter; invalid or unavailable counters become zero.
+
+The security boundary is producer-bound against ordinary filesystem
+substitution, not root or arbitrary same-principal ptrace/proc-fd compromise.
 
 ### `hermes -z <prompt>` — scripted one-shot
 
