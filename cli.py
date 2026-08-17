@@ -16389,6 +16389,34 @@ class _ResultMetadataFDOwnershipGuard:
         self._cli_owner = cli
         self._pending_owner = None
 
+    def publish_fallback(self) -> bool:
+        """Publish one safe terminal frame when a valid query stops early."""
+
+        cli = self._cli_owner
+        if cli is not None:
+            owner = getattr(cli, "result_meta_fd", None)
+            if owner is None or owner.closed:
+                return False
+            cli._publish_abnormal_result_metadata(interrupted=False)
+            return True
+
+        owner = self._pending_owner
+        if owner is None or owner.closed:
+            return False
+        from hermes_cli.result_metadata import (
+            PUBLIC_ERROR_MESSAGE,
+            ResultMetadataError,
+            publish_unknown_failure_result_metadata_fd,
+        )
+
+        try:
+            publish_unknown_failure_result_metadata_fd(owner)
+        except ResultMetadataError:
+            print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(1) from None
+        self._pending_owner = None
+        return True
+
     def close(self) -> None:
         cli = self._cli_owner
         self._cli_owner = None
@@ -16461,10 +16489,18 @@ def main(
         if not query:
             print("Error: --result-meta-fd requires --query.", file=sys.stderr)
             raise SystemExit(2)
-        return _main_impl(
-            **call_kwargs,
-            _result_meta_fd_ownership=ownership,
-        )
+        try:
+            result = _main_impl(
+                **call_kwargs,
+                _result_meta_fd_ownership=ownership,
+            )
+        except BaseException:
+            if ownership.publish_fallback():
+                raise SystemExit(0) from None
+            raise
+        else:
+            ownership.publish_fallback()
+            return result
     finally:
         try:
             ownership.close()

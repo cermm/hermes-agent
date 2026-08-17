@@ -2268,16 +2268,138 @@ def _claim_result_metadata_args(args):
     return owner
 
 
+def _resolve_argv_option_action(token: str, actions: dict):
+    """Resolve one raw argv option like argparse, including unique long abbrevs."""
+
+    option = token.split("=", 1)[0]
+    action = actions.get(option)
+    attached = "=" in token
+    attached_value = token.split("=", 1)[1] if attached else None
+    ambiguous = False
+    if action is None and option.startswith("--"):
+        matches = []
+        for candidate, candidate_action in actions.items():
+            if candidate.startswith(option) and not any(
+                match is candidate_action for match in matches
+            ):
+                matches.append(candidate_action)
+        if len(matches) == 1:
+            action = matches[0]
+        elif len(matches) > 1:
+            ambiguous = True
+    if action is None and option.startswith("-") and not option.startswith("--"):
+        action = actions.get(option[:2])
+        attached = action is not None and len(option) > 2
+        attached_value = option[2:] if attached else None
+    if (
+        action is not None
+        and option.startswith("-")
+        and not option.startswith("--")
+        and len(option) > 2
+        and action.nargs == 0
+    ):
+        for position in range(2, len(option)):
+            clustered_action = actions.get(f"-{option[position]}")
+            if clustered_action is None:
+                return None, False, None, ambiguous
+            if clustered_action.nargs != 0:
+                action = clustered_action
+                attached_value = option[position + 1 :]
+                if not attached_value and "=" in token:
+                    attached_value = token.split("=", 1)[1]
+                    attached = True
+                else:
+                    attached = bool(attached_value)
+                break
+    return action, attached, attached_value, ambiguous
+
+
 def _early_claim_result_metadata_argv(argv: list[str]):
     """Claim --result-meta-fd from raw argv before config/container startup."""
 
-    marker = "--result-meta-fd"
+    from hermes_cli._parser import build_top_level_parser
+
+    parser, _subparsers, chat_parser = build_top_level_parser()
+    top_actions = parser._option_string_actions
+    chat_actions = chat_parser._option_string_actions
+    command_index = None
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return None
+        if token == "chat":
+            command_index = index
+            break
+        if not token.startswith("-"):
+            return None
+        action, attached, _attached_value, ambiguous = _resolve_argv_option_action(
+            token, top_actions
+        )
+        if action is None or ambiguous:
+            return None
+        if attached or action.nargs == 0:
+            index += 1
+            continue
+        if action.nargs == "?":
+            index += (
+                2
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-")
+                else 1
+            )
+            continue
+        if action.nargs not in {None, 1} or index + 1 >= len(argv):
+            return None
+        if argv[index + 1].startswith("-"):
+            return None
+        index += 2
+
+    if command_index is None:
+        return None
+
     raw_values = []
-    for index, token in enumerate(argv):
-        if token == marker:
+    index = command_index + 1
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            break
+        action, attached, attached_value, ambiguous = _resolve_argv_option_action(
+            token, chat_actions
+        )
+        if ambiguous and any(
+            candidate.startswith(token.split("=", 1)[0])
+            and candidate_action.dest == "result_meta_fd"
+            for candidate, candidate_action in chat_actions.items()
+        ):
+            from hermes_cli import result_metadata
+
+            print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+            raise SystemExit(2)
+        if action is None:
+            index += 1
+            continue
+        if action.dest == "result_meta_fd":
+            if attached:
+                raw_values.append(attached_value)
+                index += 1
+                continue
             raw_values.append(argv[index + 1] if index + 1 < len(argv) else None)
-        elif token.startswith(f"{marker}="):
-            raw_values.append(token.split("=", 1)[1])
+            index += 2
+            continue
+        if attached or action.nargs == 0:
+            index += 1
+            continue
+        if action.nargs == "?":
+            index += (
+                2
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-")
+                else 1
+            )
+            continue
+        if action.nargs in {None, 1} and index + 1 < len(argv):
+            index += 2
+            continue
+        index += 1
 
     if not raw_values:
         return None
@@ -2290,7 +2412,8 @@ def _early_claim_result_metadata_argv(argv: list[str]):
 
     raw_value = raw_values[0]
     if raw_value is None:
-        return None
+        print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(2)
 
     from argparse import ArgumentTypeError
 
@@ -2305,25 +2428,128 @@ def _early_claim_result_metadata_argv(argv: list[str]):
         raise SystemExit(2) from None
 
 
-def cmd_chat(args):
-    """Claim result-metadata descriptors before config or agent startup."""
+def _eligible_result_metadata_parse_failure_argv(
+    argv: list[str], parser, chat_parser
+) -> bool:
+    """Recognize an unambiguous classic-CLI query after full parsing failed."""
+    cli_requested = False
+    tui_requested = False
+    command_index = None
+    top_actions = parser._option_string_actions
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return False
+        if token == "chat":
+            command_index = index
+            break
+        if not token.startswith("-"):
+            return False
+        action, attached, _attached_value, ambiguous = _resolve_argv_option_action(
+            token, top_actions
+        )
+        if action is None or ambiguous:
+            return False
+        if action.dest == "cli":
+            cli_requested = True
+        elif action.dest == "tui":
+            tui_requested = True
+        if attached or action.nargs == 0:
+            index += 1
+            continue
+        if action.nargs == "?":
+            index += (
+                2
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-")
+                else 1
+            )
+            continue
+        if action.nargs not in {None, 1} or index + 1 >= len(argv):
+            return False
+        if argv[index + 1].startswith("-"):
+            return False
+        index += 2
 
+    if command_index is None:
+        return False
+
+    query_values = []
+    chat_actions = chat_parser._option_string_actions
+    index = command_index + 1
+    while index < len(argv):
+        token = argv[index]
+        action, attached, attached_value, ambiguous = _resolve_argv_option_action(
+            token, chat_actions
+        )
+        if action is None or ambiguous:
+            if token.startswith("-") and not query_values:
+                return False
+            index += 1
+            continue
+        if action.dest == "cli":
+            cli_requested = True
+        elif action.dest == "tui":
+            tui_requested = True
+        if action.dest == "query":
+            if attached:
+                if not attached_value:
+                    return False
+                query_values.append(attached_value)
+                index += 1
+                continue
+            if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+                return False
+            query_values.append(argv[index + 1])
+            index += 2
+            continue
+        if attached or action.nargs == 0:
+            index += 1
+            continue
+        if action.nargs == "?":
+            index += (
+                2
+                if index + 1 < len(argv) and not argv[index + 1].startswith("-")
+                else 1
+            )
+            continue
+        if action.nargs not in {None, 1}:
+            return False
+        if index + 1 >= len(argv) or argv[index + 1].startswith("-"):
+            if not query_values:
+                return False
+            index += 1
+            continue
+        index += 2
+
+    if len(query_values) != 1:
+        return False
+
+    from types import SimpleNamespace
+
+    return not _resolve_use_tui(
+        SimpleNamespace(cli=cli_requested, tui=tui_requested)
+    )
+
+
+def _publish_unknown_result_metadata(owner) -> bool:
+    """Publish a terminal failure frame for a valid query that stopped early."""
+
+    if owner is None or owner.closed:
+        return False
     from hermes_cli import result_metadata
 
-    owner = _claim_result_metadata_args(args)
     try:
-        return _cmd_chat(args)
-    finally:
-        if owner is not None:
-            try:
-                owner.close()
-            except result_metadata.ResultMetadataError:
-                print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
-                raise SystemExit(1) from None
+        result_metadata.publish_unknown_failure_result_metadata_fd(owner)
+    except result_metadata.ResultMetadataError:
+        print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+        raise SystemExit(1) from None
+    return True
 
 
-def _cmd_chat(args):
-    """Run interactive chat CLI after descriptor ownership is established."""
+def _validate_result_metadata_args(args) -> bool:
+    """Validate query/classic-CLI eligibility before startup side effects."""
+
     result_meta_fd = getattr(args, "result_meta_fd", None)
     if result_meta_fd is not None and not getattr(args, "query", None):
         print("Error: --result-meta-fd requires --query.", file=sys.stderr)
@@ -2336,6 +2562,43 @@ def _cmd_chat(args):
             file=sys.stderr,
         )
         raise SystemExit(2)
+
+    if result_meta_fd is not None:
+        args._result_meta_query_validated = True
+    return use_tui
+
+
+def cmd_chat(args):
+    """Claim result-metadata descriptors before config or agent startup."""
+
+    from hermes_cli import result_metadata
+
+    owner = _claim_result_metadata_args(args)
+    try:
+        result = _cmd_chat(args)
+    except BaseException:
+        if getattr(args, "_result_meta_query_validated", False) and (
+            _publish_unknown_result_metadata(owner)
+        ):
+            raise SystemExit(0) from None
+        raise
+    else:
+        if getattr(args, "_result_meta_query_validated", False):
+            _publish_unknown_result_metadata(owner)
+        return result
+    finally:
+        if owner is not None and not owner.closed:
+            try:
+                owner.close()
+            except result_metadata.ResultMetadataError:
+                print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+                raise SystemExit(1) from None
+
+
+def _cmd_chat(args):
+    """Run interactive chat CLI after descriptor ownership is established."""
+    result_meta_fd = getattr(args, "result_meta_fd", None)
+    use_tui = _validate_result_metadata_args(args)
 
     _apply_safe_mode(args)
 
@@ -14819,8 +15082,17 @@ def main():
         else:
             subparsers.required = False
             args = parser.parse_args(_processed_argv)
-    except BaseException:
+    except BaseException as exc:
         if early_result_meta_owner is not None:
+            if (
+                isinstance(exc, SystemExit)
+                and exc.code not in {None, 0}
+                and _eligible_result_metadata_parse_failure_argv(
+                    _processed_argv, parser, chat_parser
+                )
+                and _publish_unknown_result_metadata(early_result_meta_owner)
+            ):
+                raise SystemExit(0) from None
             try:
                 early_result_meta_owner.close()
             except Exception:
@@ -14849,6 +15121,18 @@ def main():
         getattr(args, "command", None) in {None, "chat"}
     ):
         preclaimed_result_meta_owner = _claim_result_metadata_args(args)
+        try:
+            _validate_result_metadata_args(args)
+        except BaseException:
+            if not preclaimed_result_meta_owner.closed:
+                try:
+                    preclaimed_result_meta_owner.close()
+                except Exception:
+                    from hermes_cli import result_metadata
+
+                    print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
+                    raise SystemExit(1) from None
+            raise
 
     # Discover Python plugins and register shell hooks once, before any
     # command that can fire lifecycle hooks.  Both are idempotent; gated
@@ -14859,6 +15143,10 @@ def main():
         _prepare_agent_startup(args)
     except BaseException:
         if preclaimed_result_meta_owner is not None:
+            if getattr(args, "_result_meta_query_validated", False) and (
+                _publish_unknown_result_metadata(preclaimed_result_meta_owner)
+            ):
+                raise SystemExit(0) from None
             try:
                 preclaimed_result_meta_owner.close()
             except Exception:
