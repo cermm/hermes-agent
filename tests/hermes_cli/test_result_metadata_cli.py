@@ -346,6 +346,440 @@ def test_main_startup_error_publishes_abnormal_metadata(
     os.close(read_fd)
 
 
+@pytest.mark.parametrize(
+    ("startup_hook", "raised_error", "interrupted"),
+    [
+        ("_cleanup_quarantined_exes", RuntimeError("cleanup failed"), False),
+        ("_cleanup_quarantined_exes", KeyboardInterrupt(), True),
+        ("_recover_from_interrupted_install", RuntimeError("recovery failed"), False),
+        ("_recover_from_interrupted_install", KeyboardInterrupt(), True),
+        ("build_model_parser", RuntimeError("subparser failed"), False),
+        ("build_model_parser", KeyboardInterrupt(), True),
+        ("build_gateway_parser", RuntimeError("gateway subparser failed"), False),
+        ("build_gateway_parser", KeyboardInterrupt(), True),
+    ],
+)
+def test_main_pre_parser_result_metadata_owner_publishes_abnormal_metadata(
+    monkeypatch, startup_hook, raised_error, interrupted
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    from hermes_cli import result_metadata
+
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
+    if startup_hook != "_cleanup_quarantined_exes":
+        monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    if startup_hook != "_recover_from_interrupted_install":
+        monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+
+    def fail(*_args, **_kwargs):
+        raise raised_error
+
+    monkeypatch.setattr(main_mod, startup_hook, fail)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            "--query",
+            "hello",
+            "--result-meta-fd",
+            str(write_fd),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
+
+    assert raised.value.code == 0
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
+    )
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    "terminator_tail",
+    [
+        ["--"],
+        ["--", "unexpected-positional"],
+    ],
+)
+def test_main_pre_parser_result_metadata_owner_rejects_option_terminator(
+    monkeypatch, terminator_tail
+):
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(
+        main_mod,
+        "_cleanup_quarantined_exes",
+        lambda: (_ for _ in ()).throw(RuntimeError("cleanup failed")),
+    )
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            "--query",
+            "hello",
+            "--result-meta-fd",
+            str(write_fd),
+            *terminator_tail,
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    os.set_blocking(read_fd, False)
+    try:
+        payload = os.read(read_fd, 1)
+    except BlockingIOError:
+        payload = b""
+
+    assert raised.value.code == 2
+    assert payload == b""
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "interrupted"),
+    [
+        (RuntimeError("top-level parser rebuild failed"), False),
+        (KeyboardInterrupt(), True),
+    ],
+)
+@pytest.mark.parametrize(
+    "query_args",
+    [
+        ["--query", "hello"],
+        ["--query", "hello", "--accept-hooks"],
+        ["--query", "hello", "--checkpoints"],
+        ["--query", "hello", "--cli"],
+        ["--query", "hello", "--continue"],
+        ["--query", "hello", "--continue", "session title"],
+        ["--query", "hello", "--dev"],
+        ["--query", "hello", "--ignore-rules"],
+        ["--query", "hello", "--ignore-user-config"],
+        ["--query", "hello", "--image", "image.png"],
+        ["--query", "hello", "--max-turns", "3"],
+        ["--query", "hello", "--model", "model-name"],
+        ["--query", "hello", "--no-restore-cwd"],
+        ["--query", "hello", "--pass-session-id"],
+        ["--query", "hello", "--provider", "provider-name"],
+        ["--query", "hello", "--quiet"],
+        ["--query", "hello", "--reasoning", "low"],
+        ["--query", "hello", "--resume", "session-id"],
+        ["--query", "hello", "--skills", "python"],
+        ["--query", "hello", "--source", "tool"],
+        ["--query", "hello", "--toolsets", "safe"],
+        ["--query", "hello", "--verbose"],
+        ["--query", "hello", "--worktree"],
+        ["--query", "hello", "--yolo"],
+        ["--query", "hello", "--safe-mode"],
+        ["-Qqhello"],
+        ["-m", "model-name", "-qhello"],
+        ["-qhello", "-r", "session-id"],
+        ["-qhello", "-s", "python"],
+        ["-qhello", "-t", "safe"],
+        ["-qhello", "-v"],
+        ["-qhello", "-w"],
+    ],
+)
+def test_main_second_top_level_parser_failure_publishes_abnormal_metadata(
+    monkeypatch, raised_error, interrupted, query_args
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    from hermes_cli import _parser as parser_mod
+    from hermes_cli import result_metadata
+
+    real_build_top_level_parser = parser_mod.build_top_level_parser
+    calls = 0
+
+    def build_top_level_parser_once_then_fail():
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            return real_build_top_level_parser()
+        raise raised_error
+
+    monkeypatch.setattr(
+        parser_mod, "build_top_level_parser", build_top_level_parser_once_then_fail
+    )
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            *query_args,
+            "--result-meta-fd",
+            str(write_fd),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
+
+    assert raised.value.code == 0
+    assert calls == 2
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
+    )
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    ("container_error", "interrupted"),
+    [
+        (RuntimeError("container lookup failed"), False),
+        (KeyboardInterrupt(), True),
+    ],
+)
+def test_main_container_lookup_failure_publishes_abnormal_metadata(
+    monkeypatch, container_error, interrupted
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    from hermes_cli import result_metadata
+
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+
+    def fail_container_lookup():
+        raise container_error
+
+    monkeypatch.setattr(config_mod, "get_container_exec_info", fail_container_lookup)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            "--query",
+            "hello",
+            "--result-meta-fd",
+            str(write_fd),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
+
+    assert raised.value.code == 0
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
+    )
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize("builder_hook", ["second_top_level_parser", "build_gateway_parser"])
+@pytest.mark.parametrize(
+    "query_args",
+    [
+        ["--query", ""],
+        ["--query"],
+        ["-q", ""],
+        ["-q"],
+    ],
+)
+def test_main_empty_query_builder_failure_closes_without_frame(
+    monkeypatch, builder_hook, query_args
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    from hermes_cli import _parser as parser_mod
+
+    if builder_hook == "second_top_level_parser":
+        real_build_top_level_parser = parser_mod.build_top_level_parser
+        calls = 0
+
+        def build_top_level_parser_once_then_fail():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_build_top_level_parser()
+            raise RuntimeError("top-level parser rebuild failed")
+
+        monkeypatch.setattr(
+            parser_mod, "build_top_level_parser", build_top_level_parser_once_then_fail
+        )
+    else:
+        monkeypatch.setattr(
+            main_mod,
+            "build_gateway_parser",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("gateway subparser failed")
+            ),
+        )
+
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            *query_args,
+            "--result-meta-fd",
+            str(write_fd),
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    os.set_blocking(read_fd, False)
+    try:
+        payload = os.read(read_fd, 1)
+    except BlockingIOError:
+        payload = b""
+
+    assert raised.value.code == 2
+    assert payload == b""
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    "failure_hook",
+    [
+        "second_top_level_parser",
+        "build_gateway_parser",
+        "container_lookup",
+        "routing_prep",
+    ],
+)
+@pytest.mark.parametrize(
+    "invalid_args",
+    [
+        ["--definitely-unknown-option", "--query", "hello"],
+        ["--query", "hello", "--definitely-unknown-option"],
+        ["--query", "hello", "--image"],
+        ["--model", "--query", "hello"],
+        ["--query", "hello", "--model"],
+        ["--query", "hello", "--skills"],
+        ["--query", "hello", "unexpected-positional"],
+    ],
+)
+def test_main_invalid_query_builder_failure_closes_without_frame(
+    monkeypatch, failure_hook, invalid_args
+):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+    from hermes_cli import _parser as parser_mod
+
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+
+    if failure_hook == "second_top_level_parser":
+        real_build_top_level_parser = parser_mod.build_top_level_parser
+        calls = 0
+
+        def build_top_level_parser_once_then_fail():
+            nonlocal calls
+            calls += 1
+            if calls == 1:
+                return real_build_top_level_parser()
+            raise RuntimeError("top-level parser rebuild failed")
+
+        monkeypatch.setattr(
+            parser_mod, "build_top_level_parser", build_top_level_parser_once_then_fail
+        )
+        monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    elif failure_hook == "build_gateway_parser":
+        monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+        monkeypatch.setattr(
+            main_mod,
+            "build_gateway_parser",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("gateway subparser failed")
+            ),
+        )
+    elif failure_hook == "container_lookup":
+        monkeypatch.setattr(
+            config_mod,
+            "get_container_exec_info",
+            lambda: (_ for _ in ()).throw(RuntimeError("container lookup failed")),
+        )
+    else:
+        monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+
+        class ExplodingChoices:
+            def keys(self):
+                raise RuntimeError("routing prep failed")
+
+        class ExplodingSubparsers:
+            choices = ExplodingChoices()
+
+        real_build_top_level_parser = parser_mod.build_top_level_parser
+
+        def build_top_level_parser_with_exploding_subparsers():
+            parser, _subparsers, chat_parser = real_build_top_level_parser()
+            return parser, ExplodingSubparsers(), chat_parser
+
+        monkeypatch.setattr(
+            parser_mod,
+            "build_top_level_parser",
+            build_top_level_parser_with_exploding_subparsers,
+        )
+
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        ["hermes", "chat", *invalid_args, "--result-meta-fd", str(write_fd)],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    os.set_blocking(read_fd, False)
+    try:
+        payload = os.read(read_fd, 1)
+    except BlockingIOError:
+        payload = b""
+
+    assert raised.value.code == 2
+    assert payload == b""
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
 def test_main_tui_result_metadata_rejects_before_startup_without_frame(
     monkeypatch, capsys
 ):
@@ -403,7 +837,6 @@ def test_main_tui_result_metadata_rejects_before_startup_without_frame(
     "invalid_args",
     [
         ["--max-turns", "not-an-int"],
-        ["--definitely-unknown-option"],
     ],
 )
 def test_main_eligible_parse_error_publishes_one_unknown_failure_frame(
@@ -542,6 +975,54 @@ def test_main_chat_option_terminator_excludes_result_meta_fd(
     assert payload == b""
     os.fstat(write_fd)
     os.close(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    "query_args",
+    [
+        ["--query", ""],
+        ["--query="],
+        ["-q", ""],
+        ["-q"],
+    ],
+)
+def test_main_empty_query_parse_error_closes_without_frame(monkeypatch, query_args):
+    import hermes_cli.config as config_mod
+    import hermes_cli.main as main_mod
+
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(config_mod, "get_container_exec_info", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    read_fd, write_fd = os.pipe()
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "hermes",
+            "chat",
+            *query_args,
+            "--result-meta-fd",
+            str(write_fd),
+            "--max-turns",
+            "not-an-int",
+        ],
+    )
+
+    with pytest.raises(SystemExit) as raised:
+        main_mod.main()
+    os.set_blocking(read_fd, False)
+    try:
+        payload = os.read(read_fd, 1)
+    except BlockingIOError:
+        payload = b""
+
+    assert raised.value.code == 2
+    assert payload == b""
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
     os.close(read_fd)
 
 
