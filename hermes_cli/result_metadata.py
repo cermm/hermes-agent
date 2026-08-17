@@ -371,3 +371,43 @@ def write_result_metadata_fd(
             "could not write result metadata descriptor"
         ) from exc
     return dict(metadata)
+
+
+def publish_abnormal_result_metadata_fd(
+    owner: ResultMetadataFD, *, interrupted: bool
+) -> dict[str, Any]:
+    """Publish and close a safe terminal frame for a pre-turn stop."""
+
+    publication_error: ResultMetadataError | None = None
+    metadata = build_result_metadata(
+        {
+            "completed": False,
+            "failed": not interrupted,
+            "partial": False,
+            "interrupted": interrupted,
+            "api_calls": 0,
+        },
+        max_iterations=0,
+    )
+    try:
+        write_result_metadata_fd(owner, metadata)
+    except ResultMetadataError as exc:
+        publication_error = exc
+    try:
+        owner.close()
+    except ResultMetadataError as exc:
+        if publication_error is None:
+            publication_error = exc
+    if publication_error is not None:
+        raise ResultMetadataError(
+            "failed to publish terminal result metadata"
+        ) from publication_error
+    return metadata
+
+
+def publish_unknown_failure_result_metadata_fd(
+    owner: ResultMetadataFD,
+) -> dict[str, Any]:
+    """Publish and close a safe terminal frame for a pre-turn failure."""
+
+    return publish_abnormal_result_metadata_fd(owner, interrupted=False)
