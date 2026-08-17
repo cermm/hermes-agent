@@ -2532,15 +2532,17 @@ def _eligible_result_metadata_parse_failure_argv(
     )
 
 
-def _publish_unknown_result_metadata(owner) -> bool:
-    """Publish a terminal failure frame for a valid query that stopped early."""
+def _publish_unknown_result_metadata(owner, *, interrupted: bool = False) -> bool:
+    """Publish a terminal frame for a valid query that stopped early."""
 
     if owner is None or owner.closed:
         return False
     from hermes_cli import result_metadata
 
     try:
-        result_metadata.publish_unknown_failure_result_metadata_fd(owner)
+        result_metadata.publish_abnormal_result_metadata_fd(
+            owner, interrupted=interrupted
+        )
     except result_metadata.ResultMetadataError:
         print(result_metadata.PUBLIC_ERROR_MESSAGE, file=sys.stderr)
         raise SystemExit(1) from None
@@ -2576,9 +2578,11 @@ def cmd_chat(args):
     owner = _claim_result_metadata_args(args)
     try:
         result = _cmd_chat(args)
-    except BaseException:
+    except BaseException as exc:
         if getattr(args, "_result_meta_query_validated", False) and (
-            _publish_unknown_result_metadata(owner)
+            _publish_unknown_result_metadata(
+                owner, interrupted=isinstance(exc, KeyboardInterrupt)
+            )
         ):
             raise SystemExit(0) from None
         raise
@@ -15141,10 +15145,13 @@ def main():
     # trigger consent prompts for hooks the user is still inspecting.
     try:
         _prepare_agent_startup(args)
-    except BaseException:
+    except BaseException as exc:
         if preclaimed_result_meta_owner is not None:
             if getattr(args, "_result_meta_query_validated", False) and (
-                _publish_unknown_result_metadata(preclaimed_result_meta_owner)
+                _publish_unknown_result_metadata(
+                    preclaimed_result_meta_owner,
+                    interrupted=isinstance(exc, KeyboardInterrupt),
+                )
             ):
                 raise SystemExit(0) from None
             try:

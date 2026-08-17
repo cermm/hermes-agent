@@ -373,18 +373,18 @@ def write_result_metadata_fd(
     return dict(metadata)
 
 
-def publish_unknown_failure_result_metadata_fd(
-    owner: ResultMetadataFD,
+def publish_abnormal_result_metadata_fd(
+    owner: ResultMetadataFD, *, interrupted: bool
 ) -> dict[str, Any]:
-    """Publish and close a safe terminal frame for a pre-turn failure."""
+    """Publish and close a safe terminal frame for a pre-turn stop."""
 
     publication_error: ResultMetadataError | None = None
     metadata = build_result_metadata(
         {
             "completed": False,
-            "failed": True,
+            "failed": not interrupted,
             "partial": False,
-            "interrupted": False,
+            "interrupted": interrupted,
             "api_calls": 0,
         },
         max_iterations=0,
@@ -403,3 +403,11 @@ def publish_unknown_failure_result_metadata_fd(
             "failed to publish terminal result metadata"
         ) from publication_error
     return metadata
+
+
+def publish_unknown_failure_result_metadata_fd(
+    owner: ResultMetadataFD,
+) -> dict[str, Any]:
+    """Publish and close a safe terminal frame for a pre-turn failure."""
+
+    return publish_abnormal_result_metadata_fd(owner, interrupted=False)

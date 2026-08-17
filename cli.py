@@ -16389,7 +16389,7 @@ class _ResultMetadataFDOwnershipGuard:
         self._cli_owner = cli
         self._pending_owner = None
 
-    def publish_fallback(self) -> bool:
+    def publish_fallback(self, *, interrupted: bool = False) -> bool:
         """Publish one safe terminal frame when a valid query stops early."""
 
         cli = self._cli_owner
@@ -16397,7 +16397,7 @@ class _ResultMetadataFDOwnershipGuard:
             owner = getattr(cli, "result_meta_fd", None)
             if owner is None or owner.closed:
                 return False
-            cli._publish_abnormal_result_metadata(interrupted=False)
+            cli._publish_abnormal_result_metadata(interrupted=interrupted)
             return True
 
         owner = self._pending_owner
@@ -16406,11 +16406,11 @@ class _ResultMetadataFDOwnershipGuard:
         from hermes_cli.result_metadata import (
             PUBLIC_ERROR_MESSAGE,
             ResultMetadataError,
-            publish_unknown_failure_result_metadata_fd,
+            publish_abnormal_result_metadata_fd,
         )
 
         try:
-            publish_unknown_failure_result_metadata_fd(owner)
+            publish_abnormal_result_metadata_fd(owner, interrupted=interrupted)
         except ResultMetadataError:
             print(PUBLIC_ERROR_MESSAGE, file=sys.stderr)
             raise SystemExit(1) from None
@@ -16494,8 +16494,10 @@ def main(
                 **call_kwargs,
                 _result_meta_fd_ownership=ownership,
             )
-        except BaseException:
-            if ownership.publish_fallback():
+        except BaseException as exc:
+            if ownership.publish_fallback(
+                interrupted=isinstance(exc, KeyboardInterrupt)
+            ):
                 raise SystemExit(0) from None
             raise
         else:

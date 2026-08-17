@@ -38,6 +38,21 @@ def _install_direct_api_fake_cli(monkeypatch):
     return cli_mod
 
 
+def _expected_abnormal_metadata(result_metadata, *, interrupted: bool, api_calls: int = 0):
+    return result_metadata.serialize_result_metadata(
+        result_metadata.build_result_metadata(
+            {
+                "completed": False,
+                "failed": not interrupted,
+                "partial": False,
+                "interrupted": interrupted,
+                "api_calls": api_calls,
+            },
+            max_iterations=90,
+        )
+    )
+
+
 def test_parser_result_meta_fd_is_opt_in_and_canonical():
     from hermes_cli._parser import build_top_level_parser
 
@@ -280,7 +295,16 @@ def test_main_invalid_result_meta_fd_fails_before_startup(monkeypatch, capsys, r
     assert captured.err == result_metadata.PUBLIC_ERROR_MESSAGE + "\n"
 
 
-def test_main_startup_error_publishes_unknown_failure_metadata(monkeypatch):
+@pytest.mark.parametrize(
+    ("startup_error", "interrupted"),
+    [
+        (RuntimeError("pre-turn startup failed"), False),
+        (KeyboardInterrupt(), True),
+    ],
+)
+def test_main_startup_error_publishes_abnormal_metadata(
+    monkeypatch, startup_error, interrupted
+):
     import hermes_cli.config as config_mod
     import hermes_cli.main as main_mod
     from hermes_cli import result_metadata
@@ -293,7 +317,7 @@ def test_main_startup_error_publishes_unknown_failure_metadata(monkeypatch):
     monkeypatch.setattr(
         main_mod,
         "_prepare_agent_startup",
-        lambda _args: (_ for _ in ()).throw(RuntimeError("pre-turn startup failed")),
+        lambda _args: (_ for _ in ()).throw(startup_error),
     )
     read_fd, write_fd = os.pipe()
     monkeypatch.setattr(
@@ -314,17 +338,8 @@ def test_main_startup_error_publishes_unknown_failure_metadata(monkeypatch):
     payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
 
     assert raised.value.code == 0
-    assert payload == result_metadata.serialize_result_metadata(
-        result_metadata.build_result_metadata(
-            {
-                "completed": False,
-                "failed": True,
-                "partial": False,
-                "interrupted": False,
-                "api_calls": 0,
-            },
-            max_iterations=0,
-        )
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
     )
     with pytest.raises(OSError):
         os.fstat(write_fd)
@@ -982,10 +997,24 @@ def test_publish_result_metadata_fd_write_failure_is_fixed_and_secret_free(
     os.close(read_fd)
 
 
-def test_direct_api_publishes_metadata_on_post_construction_error(monkeypatch):
+@pytest.mark.parametrize(
+    ("raised_error", "interrupted"),
+    [
+        (RuntimeError("secret exception detail /private/path"), False),
+        (KeyboardInterrupt(), True),
+    ],
+)
+def test_direct_api_publishes_metadata_on_pre_transfer_construction_error(
+    monkeypatch, raised_error, interrupted
+):
+    import cli as cli_mod
     from hermes_cli import result_metadata
 
-    cli_mod = _install_direct_api_fake_cli(monkeypatch)
+    class FakeCLI:
+        def __init__(self, **_kwargs):
+            raise raised_error
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
     read_fd, write_fd = os.pipe()
 
     with pytest.raises(SystemExit) as raised:
@@ -993,23 +1022,82 @@ def test_direct_api_publishes_metadata_on_post_construction_error(monkeypatch):
             query="x",
             quiet=True,
             toolsets="safe",
-            skills="__missing_skill__",
             result_meta_fd=write_fd,
         )
 
     payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
     assert raised.value.code == 0
-    assert payload == result_metadata.serialize_result_metadata(
-        result_metadata.build_result_metadata(
-            {
-                "completed": False,
-                "failed": True,
-                "partial": False,
-                "interrupted": False,
-                "api_calls": 0,
-            },
-            max_iterations=90,
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
+    )
+    with pytest.raises(OSError):
+        os.fstat(write_fd)
+    os.close(read_fd)
+
+
+@pytest.mark.parametrize(
+    ("raised_error", "interrupted"),
+    [
+        (RuntimeError("secret exception detail /private/path"), False),
+        (KeyboardInterrupt(), True),
+    ],
+)
+def test_direct_api_publishes_metadata_on_post_transfer_init_error(
+    monkeypatch, raised_error, interrupted
+):
+    import signal
+
+    import cli as cli_mod
+    from hermes_cli import result_metadata
+
+    real_cli = cli_mod.HermesCLI
+
+    class FakeCLI(real_cli):
+        def __init__(self, **kwargs):
+            self.result_meta_fd = kwargs.get("result_meta_fd")
+            self.max_turns = kwargs.get("max_turns") or 90
+            self.agent = None
+            self.session_id = "session"
+            self.conversation_history = []
+            self._active_agent_route_signature = "same"
+
+        def _claim_active_session(self, *_args, **_kwargs):
+            return True
+
+        def _release_active_session(self):
+            pass
+
+        def _ensure_runtime_credentials(self):
+            return True
+
+        def _resolve_turn_agent_config(self, _query):
+            return {
+                "signature": "same",
+                "model": None,
+                "runtime": None,
+                "request_overrides": None,
+            }
+
+        def _init_agent(self, **_kwargs):
+            raise raised_error
+
+    monkeypatch.setattr(cli_mod, "HermesCLI", FakeCLI)
+    monkeypatch.setattr(cli_mod, "_finalize_single_query", lambda _cli: None)
+    monkeypatch.setattr(signal, "signal", lambda *_args: None)
+    read_fd, write_fd = os.pipe()
+
+    with pytest.raises(SystemExit) as raised:
+        cli_mod.main(
+            query="hello",
+            quiet=True,
+            toolsets="safe",
+            result_meta_fd=write_fd,
         )
+    payload = os.read(read_fd, result_metadata.MAX_METADATA_BYTES)
+
+    assert raised.value.code == 0
+    assert payload == _expected_abnormal_metadata(
+        result_metadata, interrupted=interrupted
     )
     with pytest.raises(OSError):
         os.fstat(write_fd)
