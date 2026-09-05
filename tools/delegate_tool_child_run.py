@@ -390,6 +390,21 @@ class _SchemaOutcome:
     errors: List[str]
     retries: int
 
+def _merge_schema_retry_result(result: Dict[str, Any], retry: Dict[str, Any], *, history_supplied: bool) -> None:
+    """Accumulate work while terminal evidence describes the last actual turn."""
+    result["final_response"] = retry.get("final_response") or ""
+    try:
+        result["api_calls"] = int(result.get("api_calls", 0) or 0) + int(retry.get("api_calls", 0) or 0)
+    except (TypeError, ValueError):
+        pass
+    messages = retry.get("messages")
+    if isinstance(messages, list):
+        result["messages"] = messages if history_supplied else (result.get("messages") or []) + messages
+    for key in ("completed", "interrupted", "failed", "error", "failure_reason"):
+        result.pop(key, None)
+        if key in retry:
+            result[key] = retry[key]
+
 def _validate_child_output_schema(
     child: Any, result: Dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any,
     *, check_active: Any = None,
@@ -429,28 +444,21 @@ def _validate_child_output_schema(
             )
         except Exception as _retry_exc:
             logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
+            result.update(completed=False, failed=True, error=f"Schema retry failed: {_retry_exc}",
+                          failure_reason=getattr(_retry_exc, "failure_reason", None) or "schema_retry_error")
             break
         finally:
             child._delegate_validation_retry_active = previous_hold
         if check_active is not None:
             check_active()
         if not isinstance(_retry_result, dict):
+            result.update(completed=False, failed=True, error="Schema retry returned an invalid child result.",
+                          failure_reason="invalid_child_result")
             break
         _retry_text = _retry_result.get("final_response") or ""
-        if _retry_text.strip():
-            result["final_response"] = _retry_text
-        try:
-            result["api_calls"] = int(result.get("api_calls", 0) or 0) + int(_retry_result.get("api_calls", 0) or 0)
-        except (TypeError, ValueError):
-            pass
-        _retry_messages = _retry_result.get("messages")
-        if isinstance(_retry_messages, list):
-            result["messages"] = _retry_messages if escalate else (result.get("messages") or []) + _retry_messages
+        _merge_schema_retry_result(result, _retry_result, history_supplied=escalate)
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
         if _retry_result.get("interrupted") or _retry_result.get("failed") or _retry_result.get("error"):
-            for key in ("interrupted", "failed", "error", "completed"):
-                if key in _retry_result:
-                    result[key] = _retry_result[key]
             break
         if _schema_valid:
             break
@@ -541,10 +549,13 @@ def _build_result_entry(
     entry["cost_usd"] = round(entry["_child_cost_usd"], 6)
     entry["cost_status"] = _cost_status if isinstance(_cost_status, str) and _cost_status else "unknown"
     if status == "failed":
-        if schema.valid is False and usable_summary:
+        if result.get("failed") or result.get("error"):
+            entry["error"] = result.get("error") or "Subagent failed."
+        elif schema.valid is False and usable_summary:
             # The child DID respond; name the contract violation instead of the generic "no response" error.
             entry["error"] = (
-                "Final answer does not satisfy the declared output_schema" + (" (after 1 retry)." if schema.retries else ".")
+                "Final answer does not satisfy the declared output_schema"
+                + (f" (after {schema.retries} {'retry' if schema.retries == 1 else 'retries'})." if schema.retries else ".")
             )
         else:
             entry["error"] = result.get("error", "Subagent did not produce a response.")
