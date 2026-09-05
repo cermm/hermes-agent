@@ -2114,6 +2114,26 @@ class TestSubagentApprovalCallback(unittest.TestCase):
 class TestFallbackModelInheritance(unittest.TestCase):
     """Subagents must inherit the parent's fallback provider chain."""
 
+    def test_explicit_child_chain_works_with_pinned_provider(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "unrelated"}]
+        chain = [{"provider": "openai-codex", "model": "gpt-6-astra"}]
+        with patch("tools.delegate_tool._load_config", return_value={"fallback_providers": chain}), \
+                patch("run_agent.AIAgent") as mock_agent:
+            _build_child_agent(task_index=0, goal="test", context=None, toolsets=None,
+                               model="gpt-5.6-luna", max_iterations=10, parent_agent=parent,
+                               task_count=1, override_provider="openai-codex")
+        self.assertEqual(mock_agent.call_args.kwargs["fallback_model"], chain)
+
+    def test_explicit_empty_child_chain_disables_inheritance(self):
+        parent = _make_mock_parent(depth=0)
+        parent._fallback_chain = [{"provider": "openrouter", "model": "unrelated"}]
+        with patch("tools.delegate_tool._load_config", return_value={"fallback_providers": []}), \
+                patch("run_agent.AIAgent") as mock_agent:
+            _build_child_agent(task_index=0, goal="test", context=None, toolsets=None,
+                               model=None, max_iterations=10, parent_agent=parent, task_count=1)
+        self.assertIsNone(mock_agent.call_args.kwargs["fallback_model"])
+
     def test_child_inherits_fallback_chain(self):
         """_build_child_agent passes parent._fallback_chain as fallback_model."""
         parent = _make_mock_parent(depth=0)

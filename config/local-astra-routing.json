@@ -1,0 +1,318 @@
+{
+  "version": 1,
+  "routing_prompt": "Use Astra for orchestration and final decisions. Route routine work to the lowest capable worker: builder-mini=Luna, builder-low=Terra, builder-medium=Sol, builder-high=Astra. The generic builder starts on Luna. Require explicit acceptance criteria and independently checked test/artifact evidence. For delegate_task, attach an output_schema whenever the result can be machine-validated; its configured ladder escalates model errors and failed output validation. For a failed test or reviewer RETURN in the Kanban loop, carry forward the concrete failure and existing work, then assign rework to the next higher builder profile. Never retry completed side effects blindly or change a failed verdict merely to satisfy a schema. Preserve review, dependency, permission, and approval gates; missing credentials, required user input, and denied approval are blockers, not reasons to escalate. Allow at most one validation-repair attempt per higher tier, stop after Astra fails, and report the remaining blocker. Honor explicit task model/profile pins unless the user authorizes changing them. Record the actual model, validation evidence, and escalation reason.",
+  "entries": [
+    {
+      "profile": "default",
+      "updates": {
+        "model": {
+          "default": "gpt-6-astra"
+        },
+        "delegation": {
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ],
+          "escalate_on_validation_failure": true
+        }
+      }
+    },
+    {
+      "profile": "builder-mini",
+      "updates": {
+        "model": {
+          "default": "gpt-5.6-luna",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "low"
+        },
+        "fallback_providers": [
+          {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-terra"
+          },
+          {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol"
+          },
+          {
+            "provider": "openai-codex",
+            "model": "gpt-6-astra"
+          }
+        ],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "builder",
+      "updates": {
+        "model": {
+          "default": "gpt-5.6-luna",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "medium"
+        },
+        "fallback_providers": [
+          {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-terra"
+          },
+          {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol"
+          },
+          {
+            "provider": "openai-codex",
+            "model": "gpt-6-astra"
+          }
+        ],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "builder-low",
+      "updates": {
+        "model": {
+          "default": "gpt-5.6-terra",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "low"
+        },
+        "fallback_providers": [
+          {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol"
+          },
+          {
+            "provider": "openai-codex",
+            "model": "gpt-6-astra"
+          }
+        ],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-terra",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "builder-medium",
+      "updates": {
+        "model": {
+          "default": "gpt-5.6-sol",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "medium"
+        },
+        "fallback_providers": [
+          {
+            "provider": "openai-codex",
+            "model": "gpt-6-astra"
+          }
+        ],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-sol",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "builder-high",
+      "updates": {
+        "model": {
+          "default": "gpt-6-astra",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "high"
+        },
+        "fallback_providers": [],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-6-astra",
+          "provider": "openai-codex",
+          "reasoning_effort": "high",
+          "fallback_providers": []
+        }
+      }
+    },
+    {
+      "profile": "planner",
+      "updates": {
+        "model": {
+          "default": "gpt-6-astra",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "high"
+        },
+        "fallback_providers": [],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "reviewer",
+      "updates": {
+        "model": {
+          "default": "gpt-6-astra",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "high"
+        },
+        "fallback_providers": [],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "profile": "reviewersol",
+      "updates": {
+        "model": {
+          "default": "gpt-5.6-sol",
+          "provider": "openai-codex"
+        },
+        "agent": {
+          "reasoning_effort": "high"
+        },
+        "fallback_providers": [
+          {
+            "provider": "openai-codex",
+            "model": "gpt-6-astra"
+          }
+        ],
+        "delegation": {
+          "escalate_on_validation_failure": true,
+          "model": "gpt-5.6-luna",
+          "provider": "openai-codex",
+          "reasoning_effort": "medium",
+          "fallback_providers": [
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-terra"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-5.6-sol"
+            },
+            {
+              "provider": "openai-codex",
+              "model": "gpt-6-astra"
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

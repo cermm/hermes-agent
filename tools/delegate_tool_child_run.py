@@ -393,27 +393,42 @@ class _SchemaOutcome:
 def _validate_child_output_schema(
     child: Any, result: Dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
 ) -> _SchemaOutcome:
-    """Validate the final answer against the attached output_schema with ONE bounded retry. Schema-less children (no
-    dict on ``child._delegate_output_schema``) take no branch here so their result entry stays byte-identical."""
+    """Validate with one legacy retry, or opt-in retries through the remaining model ladder."""
     _output_schema = getattr(child, "_delegate_output_schema", None)
     if not isinstance(_output_schema, dict):
         return _SchemaOutcome(_output_schema, None, [], 0)
     from tools.delegation_output_schema import build_retry_message, validate_output
     _first_text = result.get("final_response") or ""
     _schema_valid, _schema_errors = validate_output(_first_text, _output_schema)
-    if _schema_valid or not _first_text.strip() or result.get("interrupted", False):
+    escalate = getattr(child, "_delegate_escalate_on_validation_failure", False) is True
+    if (_schema_valid or result.get("interrupted", False) or result.get("failed") or result.get("error")
+            or (not _first_text.strip() and not escalate)):
         return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 0)
 
-    # Exactly one retry turn, carrying the validation errors verbatim (no
-    # schema re-paste — the child already holds the contract in its context).
-    _retry_result = None
-    try:
-        _retry_result = child.run_conversation(
-            user_message=build_retry_message(_schema_errors), task_id=child_task_id, stream_callback=relay_child_text,
-        )
-    except Exception as _retry_exc:
-        logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
-    if isinstance(_retry_result, dict):
+    limit = min(3, len(getattr(child, "_fallback_chain", []) or [])) if escalate else 1
+    retries = 0
+    for _ in range(limit):
+        if escalate and not child._try_activate_fallback():
+            break
+        retries += 1
+        previous_hold = getattr(child, "_delegate_validation_retry_active", False)
+        child._delegate_validation_retry_active = escalate
+        try:
+            retry_kwargs = {}
+            if escalate:
+                retry_kwargs["conversation_history"] = result.get("messages") or None
+                logger.info("Subagent %d validation failed; escalating to %s", task_index, child.model)
+            _retry_result = child.run_conversation(
+                user_message=build_retry_message(_schema_errors), task_id=child_task_id,
+                stream_callback=relay_child_text, **retry_kwargs,
+            )
+        except Exception as _retry_exc:
+            logger.warning("Subagent %d schema-retry turn failed: %s", task_index, _retry_exc)
+            break
+        finally:
+            child._delegate_validation_retry_active = previous_hold
+        if not isinstance(_retry_result, dict):
+            break
         _retry_text = _retry_result.get("final_response") or ""
         if _retry_text.strip():
             result["final_response"] = _retry_text
@@ -422,10 +437,17 @@ def _validate_child_output_schema(
         except (TypeError, ValueError):
             pass
         _retry_messages = _retry_result.get("messages")
-        if isinstance(_retry_messages, list) and isinstance(result.get("messages"), list):
-            result["messages"] = result["messages"] + _retry_messages
+        if isinstance(_retry_messages, list):
+            result["messages"] = _retry_messages if escalate else (result.get("messages") or []) + _retry_messages
         _schema_valid, _schema_errors = validate_output(_retry_text, _output_schema)
-    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, 1)
+        if _retry_result.get("interrupted") or _retry_result.get("failed") or _retry_result.get("error"):
+            for key in ("interrupted", "failed", "error", "completed"):
+                if key in _retry_result:
+                    result[key] = _retry_result[key]
+            break
+        if _schema_valid:
+            break
+    return _SchemaOutcome(_output_schema, _schema_valid, _schema_errors, retries)
 
 def _build_tool_trace(messages: Any) -> list[Dict[str, Any]]:
     """Tool trace from the child's conversation messages, pairing parallel

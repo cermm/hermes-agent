@@ -492,6 +492,10 @@ def _resolve_child_runtime(
         # Routing filters reset to their defaults under a pinned provider (see _ROUTING_FILTER_DEFAULTS).
         **{a: d if override_provider else getattr(parent_agent, a, d) for a, d in _ROUTING_FILTER_DEFAULTS},
     }
+    # Explicit child fallbacks are independent of the parent's provider pin.
+    if "fallback_providers" in delegation_cfg:
+        from hermes_cli.fallback_config import get_fallback_chain
+        kwargs["fallback_model"] = get_fallback_chain(delegation_cfg) or None
     if not override_provider:
         kwargs["provider_data_collection"] = kwargs["provider_data_collection"] or ""
     child_max_tokens = override_max_tokens if override_max_tokens is not None else getattr(parent_agent, "max_tokens", None)

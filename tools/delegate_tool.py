@@ -195,6 +195,9 @@ def _build_child_agent(
                     release_or_close(child_session_db)
             raise
     child._print_fn = getattr(parent_agent, "_print_fn", None)
+    child._delegate_escalate_on_validation_failure = (
+        delegation_cfg.get("escalate_on_validation_failure") is True
+    )
     if child_session_db is not None:
         child._owns_session_db = True  # released by the child's close(), never by the parent
     # Ownership transfer for the dedicated handle: the child's close() must release it (nothing else holds a

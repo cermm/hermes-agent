@@ -198,6 +198,60 @@ def _run(child):
 
 
 class TestRunSingleChildSchemaValidation:
+    def escalating_child(self, responses):
+        child = _StubChild(responses)
+        child._delegate_output_schema = ADDRESS_SCHEMA
+        child._delegate_escalate_on_validation_failure = True
+        child._fallback_chain = ["terra", "sol", "astra"]
+        child.switched = []
+
+        def activate():
+            if len(child.switched) == len(child._fallback_chain):
+                return False
+            child.model = child._fallback_chain[len(child.switched)]
+            child.switched.append(child.model)
+            return True
+
+        child._try_activate_fallback = activate
+        original = child.run_conversation
+
+        def run(*args, **kwargs):
+            if child.calls:
+                from agent.agent_runtime_helpers import restore_primary_runtime
+                assert child._delegate_validation_retry_active is True
+                assert restore_primary_runtime(child) is False
+            return original(*args, **kwargs)
+
+        child.run_conversation = run
+        return child
+
+    def test_validation_escalates_until_valid(self):
+        child = self.escalating_child(["bad", "bad", '{"city":"Oslo"}'])
+        entry = _run(child)
+        assert entry["status"] == "completed"
+        assert child.switched == ["terra", "sol"]
+        assert entry["schema_retries"] == 2
+        assert child._delegate_validation_retry_active is False
+
+    def test_validation_stops_after_highest_tier(self):
+        child = self.escalating_child(["bad"] * 4)
+        entry = _run(child)
+        assert entry["status"] == "failed"
+        assert child.switched == ["terra", "sol", "astra"]
+        assert len(child.calls) == 4
+        assert entry["schema_retries"] == 3
+
+    def test_validation_does_not_escalate_valid_result(self):
+        child = self.escalating_child(['{"city":"Oslo"}'])
+        assert _run(child)["status"] == "completed"
+        assert child.switched == []
+
+    def test_validation_does_not_escalate_interruption(self):
+        child = self.escalating_child([])
+        child.run_conversation = lambda **kwargs: {"interrupted": True, "final_response": "bad"}
+        assert _run(child)["status"] == "interrupted"
+        assert child.switched == []
+
     def test_valid_first_try_no_retry(self):
         child = _StubChild(['{"city": "Berlin"}'])
         child._delegate_output_schema = ADDRESS_SCHEMA

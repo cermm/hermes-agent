@@ -164,20 +164,30 @@ def detect_unclean_exit(home: Optional[Path] = None) -> Optional[Dict[str, Any]]
     return evidence
 
 
-def check_state_db_integrity(home: Optional[Path] = None) -> str:
-    """``"ok"``, ``"absent"``, or the first ``quick_check`` complaint.  Never raises.
+def check_state_db_integrity(home: Optional[Path] = None, *, timeout_seconds: float = 10.0) -> str:
+    """Return a quick_check verdict, or ``check-incomplete`` when its budget expires.
 
     Only after an unclean death — SIGKILL mid-WAL-checkpoint can leave half-written
     b-tree pages.  ``quick_check(1)`` stops at the first problem (~2s on a healthy
     500MB store): cheap once per unclean boot, too costly every boot.  Opened
     normally: a WAL store needs its -shm sidecar for read-only, and the PRAGMA writes nothing.
+    Large stores must not trap startup in a scan/watchdog/restart loop.
     """
     path = _home_path(home, "state.db")
     if not path.exists():
         return "absent"
     try:
-        with closing(sqlite3.connect(str(path))) as conn:
-            row = conn.execute("PRAGMA quick_check(1)").fetchone()
+        deadline = time.monotonic() + max(0.0, timeout_seconds)
+        with closing(sqlite3.connect(str(path), timeout=min(2.0, max(0.0, timeout_seconds)))) as conn:
+            conn.set_progress_handler(lambda: int(time.monotonic() >= deadline), 1000)
+            try:
+                row = conn.execute("PRAGMA quick_check(1)").fetchone()
+            except sqlite3.OperationalError as exc:
+                if getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_INTERRUPT:
+                    return "check-incomplete: startup time budget exceeded"
+                raise
+            finally:
+                conn.set_progress_handler(None, 0)
     except Exception as exc:
         return f"check-failed: {exc}"
     return "check-failed: no result" if not row or row[0] is None else str(row[0])
@@ -187,7 +197,9 @@ def _report_unclean_exit(evidence: Dict[str, Any], home: Optional[Path]) -> None
     """Integrity-check the store, persist the exit-diag record, log at WARNING."""
     # The death may have torn the store; this is the only moment we know to look.
     verdict = evidence["state_db_integrity"] = check_state_db_integrity(home=home)
-    if verdict not in ("ok", "absent"):
+    if verdict.startswith(("check-incomplete:", "check-failed:")):
+        logger.warning("state.db integrity check did not complete: %s. Run an offline integrity check.", verdict)
+    elif verdict not in ("ok", "absent"):
         logger.error(
             "state.db FAILED integrity check after an unclean gateway exit: %s — sessions may read as "
             "missing until it is repaired. Run `hermes doctor`.",

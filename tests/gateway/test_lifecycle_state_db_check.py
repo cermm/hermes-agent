@@ -83,6 +83,24 @@ def test_checker_tolerates_a_missing_store(tmp_path: Path) -> None:
     assert check_state_db_integrity(home=tmp_path) == "absent"
 
 
+def test_checker_stops_when_startup_budget_expires(tmp_path: Path) -> None:
+    _make_state_db(tmp_path, corrupt=False)
+    verdict = check_state_db_integrity(home=tmp_path, timeout_seconds=0.0)
+    assert verdict.startswith("check-incomplete:")
+    assert check_state_db_integrity(home=tmp_path) == "ok"
+
+
+def test_incomplete_check_is_not_reported_as_corruption(tmp_path: Path, monkeypatch, caplog) -> None:
+    import gateway.lifecycle_ledger as ledger
+
+    _write_sentinel(tmp_path)
+    monkeypatch.setattr(ledger, "check_state_db_integrity", lambda **kw: "check-incomplete: startup time budget exceeded")
+    evidence = record_startup(home=tmp_path)
+    assert evidence["state_db_integrity"].startswith("check-incomplete:")
+    assert "did not complete" in caplog.text
+    assert "FAILED integrity check" not in caplog.text
+
+
 # ── wiring into the unclean-exit path ───────────────────────────────────────
 
 
