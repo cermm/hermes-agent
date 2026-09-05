@@ -14,6 +14,7 @@ ONLY, zero code/prompt text copied (proprietary).
 
 import json
 import threading
+import pytest
 from unittest.mock import MagicMock, patch
 
 from tools.delegate_tool import (
@@ -198,6 +199,79 @@ def _run(child):
 
 
 class TestRunSingleChildSchemaValidation:
+    @pytest.mark.parametrize("escalate", [False, True])
+    def test_every_schema_attempt_retains_child_authority(self, escalate):
+        from agent.delegation_context import (
+            delegated_child_subprocess_env,
+            is_delegated_child_context,
+            is_dispatcher_owned_worker_context,
+        )
+        from tools.terminal_tool import _get_approval_callback
+
+        child = self.escalating_child(["bad", '{"city":"Prague"}'])
+        child._delegate_escalate_on_validation_failure = escalate
+        original = _StubChild.run_conversation
+        seen = []
+
+        def capture(**kwargs):
+            callback = _get_approval_callback()
+            seen.append((
+                is_delegated_child_context(),
+                is_dispatcher_owned_worker_context(),
+                delegated_child_subprocess_env({"HERMES_KANBAN_TASK": "parent", "PATH": "/bin"}),
+                callback("fixture command", "fixture approval") if callback else None,
+            ))
+            return original(child, **kwargs)
+
+        child.run_conversation = capture
+        with patch("tools.delegate_tool._load_config", return_value={}):
+            entry = _run(child)
+        assert entry["status"] == "completed"
+        assert len(seen) == 2
+        for delegated, dispatcher, environment, approval in seen:
+            assert delegated and not dispatcher
+            assert "HERMES_KANBAN_TASK" not in environment
+            assert environment["PATH"] == "/bin"
+            assert approval == "deny"
+        assert not is_delegated_child_context()
+
+    def test_schema_retry_is_inside_total_timeout_and_deferred_close(self):
+        child = self.escalating_child(["bad", '{"city":"Prague"}'])
+        retry_started = threading.Event()
+        release = threading.Event()
+        closed = threading.Event()
+        original = child.run_conversation
+
+        def blocked(**kwargs):
+            if child.calls:
+                retry_started.set()
+                assert release.wait(10)
+            return original(**kwargs)
+
+        child.run_conversation = blocked
+        child.close = closed.set
+        parent_result = []
+        done = threading.Event()
+
+        def run_parent():
+            try:
+                parent_result.append(_run(child))
+            finally:
+                done.set()
+
+        with patch("tools.delegate_tool._get_child_timeout", return_value=2):
+            parent = threading.Thread(target=run_parent, daemon=True)
+            parent.start()
+            try:
+                assert retry_started.wait(5)
+                assert done.wait(5), "the blocked retry escaped the configured timeout"
+                assert parent_result[0]["status"] == "timeout"
+                assert not closed.is_set(), "resources closed while retry still owns the child"
+            finally:
+                release.set()
+                parent.join(10)
+        assert closed.wait(5)
+
     def escalating_child(self, responses):
         child = _StubChild(responses)
         child._delegate_output_schema = ADDRESS_SCHEMA
