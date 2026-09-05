@@ -391,7 +391,8 @@ class _SchemaOutcome:
     retries: int
 
 def _validate_child_output_schema(
-    child: Any, result: Dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any
+    child: Any, result: Dict[str, Any], task_index: int, child_task_id: str, relay_child_text: Any,
+    *, check_active: Any = None,
 ) -> _SchemaOutcome:
     """Validate with one legacy retry, or opt-in retries through the remaining model ladder."""
     _output_schema = getattr(child, "_delegate_output_schema", None)
@@ -408,8 +409,12 @@ def _validate_child_output_schema(
     limit = min(3, len(getattr(child, "_fallback_chain", []) or [])) if escalate else 1
     retries = 0
     for _ in range(limit):
+        if check_active is not None:
+            check_active()
         if escalate and not child._try_activate_fallback():
             break
+        if check_active is not None:
+            check_active()
         retries += 1
         previous_hold = getattr(child, "_delegate_validation_retry_active", False)
         child._delegate_validation_retry_active = escalate
@@ -427,6 +432,8 @@ def _validate_child_output_schema(
             break
         finally:
             child._delegate_validation_retry_active = previous_hold
+        if check_active is not None:
+            check_active()
         if not isinstance(_retry_result, dict):
             break
         _retry_text = _retry_result.get("final_response") or ""
@@ -585,6 +592,14 @@ class _ChildRun:
     wall_start: float = 0.0
     parent_reads_snapshot: list = field(default_factory=list)
     schema_outcome: _SchemaOutcome = field(default_factory=lambda: _SchemaOutcome(None, None, [], 0))
+    abandoned: threading.Event = field(default_factory=threading.Event)
+    deadline: Optional[float] = None
+
+    def check_active(self) -> None:
+        # Turn finalization clears the child's interrupt flags. This run-wide
+        # fence must survive that reset so abandoned workers cannot begin repairs.
+        if self.abandoned.is_set() or (self.deadline is not None and time.monotonic() >= self.deadline):
+            raise FuturesTimeoutError("Delegated child execution was abandoned")
 
     def elapsed(self) -> float:
         return round(time.monotonic() - self.child_start, 2)
@@ -669,6 +684,7 @@ class _ChildRun:
         from tools.daemon_pool import DaemonThreadPoolExecutor
         child, task_index = self.child, self.task_index
         child_timeout = _get_child_timeout()
+        self.deadline = time.monotonic() + child_timeout if child_timeout is not None else None
         executor = DaemonThreadPoolExecutor(
             max_workers=1, initializer=_set_subagent_approval_cb, initargs=(_get_subagent_approval_callback(),),
         )
@@ -679,12 +695,14 @@ class _ChildRun:
             worker_thread_holder["t"] = threading.current_thread()
             from agent.delegation_context import delegated_child_context
             with delegated_child_context(str(getattr(child, "session_id", "") or "")):
+                self.check_active()
                 result = child.run_conversation(
                     user_message=self.goal, task_id=self.child_task_id, stream_callback=self.relay_text,
                 )
+                self.check_active()
                 # Repairs share this worker's authority and the original wall-clock budget.
                 self.schema_outcome = _validate_child_output_schema(
-                    child, result, task_index, self.child_task_id, self.relay_text,
+                    child, result, task_index, self.child_task_id, self.relay_text, check_active=self.check_active,
                 )
                 return result
 
@@ -692,6 +710,7 @@ class _ChildRun:
         try:
             return future.result(timeout=child_timeout), None, False
         except Exception as wait_exc:
+            self.abandoned.set()
             exc: BaseException = wait_exc  # ``as`` targets are unbound after the except block
         finally:
             # Shut down without waiting — a child stuck on blocking I/O would hang wait=True forever.
