@@ -44,6 +44,11 @@ PYPROJECT_FILE = REPO_ROOT / "pyproject.toml"
 # This dict is kept only so existing history keeps resolving; the effective
 # AUTHOR_MAP below merges it with the directory (directory wins).
 LEGACY_AUTHOR_MAP = {
+    # Case-collision exception: the directory already maps the distinct Git
+    # identity agent@agents-Mac-mini.local to momomojo. Two filenames differing
+    # only by case cannot coexist on Windows/macOS. Original PR #88052 and
+    # commit aa500613f8a33178fad2c61a95a582f240aa7a37 identify skip-agent here.
+    "agent@Agents-Mac-mini.local": "skip-agent",
     "declanbatesmith@outlook.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option)
     "drbs2004@me.com": "cat-thats-fat",  # PR #60489 (desktop: first-run remote connection option; historical merge email)
     "122438640+ragingbulld@users.noreply.github.com": "ragingbulld",  # PR #65606 salvage (non-finite API wait deadlines; #65746)
