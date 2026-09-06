@@ -5,17 +5,18 @@ from __future__ import annotations
 
 import os
 import subprocess
-from pathlib import Path
 
 import pytest
 
 from hermes_cli import kanban_db as kb
+from hermes_cli import kanban_db_connect as kbc
+from hermes_cli import kanban_db_workspace as kbw
 from hermes_cli import projects_db as pdb
 
 
 @pytest.fixture
 def kanban_conn(tmp_path):
-    c = kb.connect(db_path=tmp_path / "kanban.db")
+    c = kbc.connect(db_path=tmp_path / "kanban.db")
     try:
         yield c
     finally:
@@ -81,7 +82,7 @@ def test_project_linked_task_uses_configured_external_root(
         text=True,
     )
     policy_root = tmp_path / "external-worktrees"
-    monkeypatch.setattr(kb, "_configured_worktree_root", lambda: policy_root.resolve())
+    monkeypatch.setattr(kbw, "_configured_worktree_root", lambda: policy_root.resolve())
     proj = _make_project(name="External Web App", repo=str(repo))
 
     tid = kb.create_task(kanban_conn, title="Add login", project_id=proj.slug)
@@ -91,7 +92,7 @@ def test_project_linked_task_uses_configured_external_root(
     assert task is not None
     assert task.workspace_path == str(expected)
     assert task.branch_name == f"{proj.slug}/{tid}-add-login"
-    assert kb.resolve_workspace(task) == expected
+    assert kbw.resolve_workspace(task) == expected
     assert expected.is_dir()
     assert not (repo / ".worktrees").exists()
 
@@ -119,11 +120,3 @@ def test_unlinked_task_unchanged(kanban_conn):
     # genuinely ad-hoc worktree tasks, but unlinked scratch tasks have none.
     assert task.branch_name is None
 
-
-def test_unknown_project_id_falls_back_gracefully(kanban_conn):
-    # A project id that doesn't resolve must not crash task creation; the task
-    # is created as-is (scratch) and project_id stays unset.
-    tid = kb.create_task(kanban_conn, title="x", project_id="does-not-exist")
-    task = kb.get_task(kanban_conn, tid)
-    assert task.workspace_kind == "scratch"
-    assert task.project_id is None

@@ -22,12 +22,12 @@ import yaml
 from hermes_constants import get_default_hermes_root
 from hermes_cli.auth import (
     AUTH_STORE_VERSION,
-    _auth_store_locks,
-    _auth_transition_lock,
     _load_auth_store,
     _save_auth_store,
 )
 from hermes_cli.auth_authority import resolve_auth_authority
+from hermes_cli.auth_store_locks import _auth_store_locks, _auth_transition_lock
+from hermes_cli.auth_migration_credentials import migration_source_store, profile_credential_artifacts
 from utils import IndentDumper, atomic_yaml_write, fast_safe_load
 
 
@@ -98,7 +98,7 @@ def _private_json_write(path: Path, payload: dict[str, Any]) -> None:
 
 def _read_json_object(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception as exc:
         raise AuthMigrationError(f"Unreadable auth store at {path}: {exc}") from exc
     if not isinstance(value, dict):
@@ -179,6 +179,13 @@ def _selected_profiles(*, all_profiles: bool, profile: Optional[str]) -> list[Pa
             ) from exc
         source = resolved_home / "auth.json"
         if source.is_file():
+            authority = resolve_auth_authority(
+                profile_home=resolved_home, shared_root=_root(), enforce_migration=False,
+            )
+            if authority.effective_mode != "profile":
+                if profile:
+                    raise AuthMigrationError(f"Profile {profile!r} already uses shared auth; its local store is retained for rollback")
+                continue
             result.append(resolved_home)
     return result
 
@@ -256,7 +263,7 @@ def _redacted_manifest(profile_homes: Iterable[Path], target: Path) -> dict[str,
             shared_root=_root(),
             enforce_migration=False,
         ).profile_id
-        store = _read_json_object(source)
+        store = migration_source_store(home)
         providers = sorted(_providers(store))
         sources.append({
             "profile": home.name,
@@ -273,6 +280,12 @@ def _redacted_manifest(profile_homes: Iterable[Path], target: Path) -> dict[str,
                 {
                     "artifact_class": "profile-config",
                     "exists": config.exists(),
+                    "profile_id": profile_id,
+                },
+                {
+                    "artifact_class": "profile-hermes-oauth",
+                    "exists": (home / ".anthropic_oauth.json").exists(),
+                    "migration_owner": "shared-credential-pool",
                     "profile_id": profile_id,
                 },
             ],
@@ -298,11 +311,18 @@ def _manifest_digest(manifest: dict[str, Any]) -> str:
 def plan_shared_migration(
     *, all_profiles: bool = False, profile: Optional[str] = None
 ) -> MigrationPlan:
+    # Candidate selection and the resulting content snapshot share one topology.
+    with _auth_transition_lock():
+        return _plan_shared_migration_locked(all_profiles=all_profiles, profile=profile)
+
+
+def _plan_shared_migration_locked(*, all_profiles: bool, profile: Optional[str]) -> MigrationPlan:
     homes = _selected_profiles(all_profiles=all_profiles, profile=profile)
     target = (_root() / "auth.json").resolve(strict=False)
     gateway_homes = _gateway_homes_for_target(homes, target)
     locked_paths = sorted(
-        {target, *(home / "auth.json" for home in homes), *(home / "config.yaml" for home in homes)},
+        {target, *(home / "auth.json" for home in homes), *(home / "config.yaml" for home in homes),
+         *profile_credential_artifacts(homes)},
         key=lambda path: os.fsencode(str(path.resolve(strict=False))),
     )
     with _auth_transition_lock(), _auth_store_locks(
@@ -313,6 +333,7 @@ def plan_shared_migration(
         plan_digest = _manifest_digest(manifest)
         preconditions = {
             str(target): _content_precondition(target),
+            **{str(path): _content_precondition(path) for path in profile_credential_artifacts(homes)},
             **{
                 str(home / "auth.json"): _content_precondition(home / "auth.json")
                 for home in homes
@@ -450,17 +471,30 @@ def apply_shared_migration(
         "preconditions": plan.get("preconditions", {}),
         "gateway_preconditions": plan.get("gateway_preconditions", {}),
     }
-    _private_json_write(journal_path, journal)
-    if failure_injector:
-        failure_injector("planned")
-
     locked_paths = sorted(
-        {*paths, *(home / "config.yaml" for home in homes)},
+        {*paths, *(home / "config.yaml" for home in homes), *profile_credential_artifacts(homes)},
         key=lambda path: os.fsencode(str(path.resolve(strict=False))),
     )
     with _auth_transition_lock(), _auth_store_locks(
         locked_paths, transaction_target=target
     ):
+        # A plan is single-use. Never overwrite its recovery history, even when
+        # its original inputs happen to match again following a rollback.
+        if journal_path.exists():
+            prior = _read_json_object(journal_path)
+            raise AuthMigrationError(
+                f"Migration plan {plan_id} was already used ({prior.get('phase', 'unknown')}); "
+                "recover or roll back that operation, or create a new plan"
+            )
+        for home in homes:
+            authority = resolve_auth_authority(
+                profile_home=home, shared_root=_root(), enforce_migration=False,
+            )
+            if authority.effective_mode != "profile":
+                raise AuthMigrationError(f"Profile {home.name!r} already uses shared auth; create a new migration plan")
+        _private_json_write(journal_path, journal)
+        if failure_injector:
+            failure_injector("planned")
         gateway_state = _gateway_snapshot(gateway_homes)
         running = next(
             ((home, pid) for home, pid in gateway_state.items() if pid is not None),
@@ -496,6 +530,11 @@ def apply_shared_migration(
                 raise AuthMigrationError(
                     "Migration inputs changed after dry-run; create a new plan"
                 )
+        if any(str(path) not in plan.get("preconditions", {}) for path in profile_credential_artifacts(homes)):
+            journal["phase"] = "aborted"
+            journal["reason"] = "obsolete_credential_plan"
+            _private_json_write(journal_path, journal)
+            raise AuthMigrationError("Migration plan lacks credential backing-file preconditions; create a new plan")
 
         backup_dir.mkdir(parents=True, exist_ok=True)
         if target.exists():
@@ -521,7 +560,7 @@ def apply_shared_migration(
 
         merged = _load_auth_store(target)
         for home in homes:
-            source = _load_auth_store(home / "auth.json")
+            source = migration_source_store(home)
             _merge_section(merged, source, "providers", conflict_policy)
             _merge_section(merged, source, "credential_pool", conflict_policy)
         updated_at = datetime.now(timezone.utc).isoformat()
@@ -575,6 +614,11 @@ def apply_shared_migration(
 
 def recover_shared_migration(*, plan_id: str) -> str:
     """Roll back an incomplete migration from its private recovery journal."""
+    with _auth_transition_lock():
+        return _recover_shared_migration_locked(plan_id=plan_id)
+
+
+def _recover_shared_migration_locked(*, plan_id: str) -> str:
     if not plan_id or Path(plan_id).name != plan_id:
         raise AuthMigrationError("A valid --plan-id is required")
     journal_path = _state_dir() / "journals" / f"{plan_id}.json"
@@ -614,6 +658,8 @@ def recover_shared_migration(*, plan_id: str) -> str:
                 "Migration state changed after interruption; refusing automatic recovery"
             )
 
+        if phase == "rollback_pending":
+            return _resume_migration_rollback(journal_path, journal)
         preconditions = journal.get("preconditions") or {}
         if phase == "committed":
             committed_ok = _matches_identity(target, journal.get("postcondition"))
@@ -686,28 +732,19 @@ def recover_shared_migration(*, plan_id: str) -> str:
                 require_manual("backup_invalid")
 
         changed_by_migration = target_is_migration or bool(migrated_configs)
-        if target_is_migration:
-            target_backup = backup_dir / "shared-auth.json"
-            if target_backup.is_file():
-                _private_bytes_write(target, target_backup.read_bytes())
-            else:
-                target.unlink(missing_ok=True)
-        for config in migrated_configs:
-            home = config.parent
-            config_backup = backup_dir / "profiles" / home.name / "config.yaml"
-            if config_backup.is_file():
-                _private_bytes_write(config, config_backup.read_bytes())
-            else:
-                config.unlink(missing_ok=True)
-        journal["phase"] = "rolled_back" if changed_by_migration else "aborted"
-        journal[f"{journal['phase']}_at"] = datetime.now(timezone.utc).isoformat()
-        journal.pop("resume_phase", None)
-        _private_json_write(journal_path, journal)
-    return str(journal["phase"])
+        return _start_migration_rollback(
+            journal_path, journal, terminal_phase="rolled_back" if changed_by_migration else "aborted",
+        )
+
 
 
 def rollback_shared_migration(*, plan_id: str) -> str:
     """Explicitly undo a committed migration when post-state is unchanged."""
+    with _auth_transition_lock():
+        return _rollback_shared_migration_locked(plan_id=plan_id)
+
+
+def _rollback_shared_migration_locked(*, plan_id: str) -> str:
     if not plan_id or Path(plan_id).name != plan_id:
         raise AuthMigrationError("A valid --plan-id is required")
     journal_path = _state_dir() / "journals" / f"{plan_id}.json"
@@ -717,6 +754,8 @@ def rollback_shared_migration(*, plan_id: str) -> str:
     phase = journal.get("phase")
     if phase == "rolled_back":
         return "rolled_back"
+    if phase == "rollback_pending" or (phase == "manual_required" and journal.get("resume_phase") == "rollback_pending"):
+        return _recover_shared_migration_locked(plan_id=plan_id)
     if phase != "committed":
         raise AuthMigrationError(
             "Only a committed migration can use --rollback; recover incomplete migrations instead"
@@ -753,23 +792,90 @@ def rollback_shared_migration(*, plan_id: str) -> str:
                     "Migration backup changed after commit; refusing rollback"
                 )
 
-        target_backup = backup_dir / "shared-auth.json"
-        if target_backup.is_file():
-            _private_bytes_write(target, target_backup.read_bytes())
-        else:
-            target.unlink(missing_ok=True)
-        for home in homes:
-            config = home / "config.yaml"
-            config_backup = backup_dir / "profiles" / home.name / "config.yaml"
-            if config_backup.is_file():
-                _private_bytes_write(config, config_backup.read_bytes())
-            else:
-                config.unlink(missing_ok=True)
-        journal["phase"] = "rolled_back"
-        journal["rolled_back_at"] = datetime.now(timezone.utc).isoformat()
         journal["rollback_kind"] = "explicit_committed_rollback"
+        return _start_migration_rollback(journal_path, journal)
+
+
+
+
+def _rollback_file_backups(journal: dict) -> dict[Path, Path]:
+    backup_dir = Path(journal["backup_dir"])
+    result = {Path(journal["target"]): backup_dir / "shared-auth.json"}
+    for raw_home in journal.get("profile_homes", []):
+        home = Path(raw_home)
+        result[home / "config.yaml"] = backup_dir / "profiles" / home.name / "config.yaml"
+    return result
+
+
+def _start_migration_rollback(journal_path: Path, journal: dict, *, terminal_phase: str = "rolled_back") -> str:
+    """Persist rollback intent before the first restore, including crash-window identities."""
+    journal["rollback_postconditions"] = {
+        str(path): _content_precondition(path) for path in _rollback_file_backups(journal)
+    }
+    journal["rollback_terminal_phase"] = terminal_phase
+    journal["phase"] = "rollback_pending"
+    journal["rollback_started_at"] = datetime.now(timezone.utc).isoformat()
+    journal["rollback_restored"] = []
+    journal.pop("resume_phase", None)
+    _private_json_write(journal_path, journal)
+    return _resume_migration_rollback(journal_path, journal)
+
+
+def _resume_migration_rollback(journal_path: Path, journal: dict) -> str:
+    """Restore only original or recorded migration bytes; a mixed state stays fail-closed."""
+    originals = journal.get("preconditions") or {}
+    migrated = journal.get("rollback_postconditions") or {}
+    backups = journal.get("backup_preconditions") or {}
+    file_backups = _rollback_file_backups(journal)
+
+    def refuse(reason: str) -> None:
+        journal.update(phase="manual_required", resume_phase="rollback_pending", reason=reason)
         _private_json_write(journal_path, journal)
-    return "rolled_back"
+        raise AuthMigrationError("Migration state or backup changed during rollback; refusing to overwrite it")
+
+    # Validate the whole restore set before touching any file. A crash after
+    # replacement but before the progress write is recognized by original bytes.
+    for path, backup in file_backups.items():
+        original = originals.get(str(path))
+        if original is None or str(path) not in migrated:
+            refuse("rollback_identity_missing")
+        if not (_matches_identity(path, original) or _matches_identity(path, migrated[str(path)])):
+            refuse("rollback_state_changed")
+        if original.get("exists") and (
+            str(backup) not in backups or not _matches_identity(backup, backups[str(backup)])
+            or not _matches_identity(backup, original)
+        ):
+            refuse("backup_invalid")
+    for raw_backup, expected in backups.items():
+        if not _matches_identity(Path(raw_backup), expected):
+            refuse("backup_invalid")
+
+    journal["phase"] = "rollback_pending"
+    journal.pop("resume_phase", None)
+    _private_json_write(journal_path, journal)
+    for path, backup in file_backups.items():
+        if not _matches_identity(path, originals[str(path)]):
+            if originals[str(path)].get("exists"):
+                _private_bytes_write(path, backup.read_bytes())
+            else:
+                path.unlink(missing_ok=True)
+        # Also sync already-restored files: a previous process may have died
+        # between replacement and directory fsync, before its progress write.
+        directory = os.open(str(path.parent), os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+        if not _matches_identity(path, originals[str(path)]):
+            refuse("rollback_restore_failed")
+        journal["rollback_restored"] = sorted(set(journal.get("rollback_restored", [])) | {str(path)})
+        _private_json_write(journal_path, journal)
+    phase = journal.get("rollback_terminal_phase", "rolled_back")
+    journal["phase"] = phase
+    journal[f"{phase}_at"] = datetime.now(timezone.utc).isoformat()
+    journal.pop("reason", None)
+    _private_json_write(journal_path, journal)
+    return phase
 
 
 def latest_migration_status() -> Optional[dict[str, Any]]:

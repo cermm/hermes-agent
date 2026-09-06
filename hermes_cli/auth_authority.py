@@ -266,12 +266,17 @@ def resolve_auth_authority(
 
 def get_auth_store_path() -> Path:
     """Return the canonical data-file path for authentication state."""
+    from hermes_cli.auth_store_locks import current_auth_transaction
+
+    transaction = current_auth_transaction()
+    if transaction is not None:
+        return transaction.path
     return resolve_auth_authority().auth_path
 
 
 def get_auth_lock_path() -> Path:
     """Return the lock path paired with the canonical authentication store."""
-    return resolve_auth_authority().lock_path
+    return get_auth_store_path().with_suffix(".lock")
 
 
 def _display_authority_path(path: Path, shared_root: Path) -> str:
