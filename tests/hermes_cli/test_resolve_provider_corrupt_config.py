@@ -99,7 +99,9 @@ class TestResolveProviderCorruptConfig:
 
     def test_corrupt_config_blocks_pool_probe_adoption(self, tmp_path, monkeypatch):
         """Corrupt config + pool-only credential must NOT resolve to openrouter."""
-        _setup_home(tmp_path, monkeypatch, CORRUPT_YAML)
+        # A usable credential exists before the user's configuration is damaged.
+        # Authority-aware pool reads/writes correctly refuse a corrupt config.
+        home, cfg = _setup_home(tmp_path, monkeypatch, VALID_YAML)
         _load_config_fresh()
 
         from agent.credential_pool import (
@@ -122,6 +124,28 @@ class TestResolveProviderCorruptConfig:
                 base_url="https://openrouter.ai/api/v1",
             )
         )
+
+        from hermes_cli.auth import AuthError, resolve_provider
+        from hermes_cli.auth_authority import AuthAuthorityConfigError
+
+        assert resolve_provider("auto") == "openrouter"
+        auth_bytes = (home / "auth.json").read_bytes()
+        cfg.write_text(CORRUPT_YAML)
+        _load_config_fresh()
+        with pytest.raises(AuthAuthorityConfigError):
+            load_pool("openrouter")
+        with pytest.raises(AuthError) as excinfo:
+            resolve_provider("auto")
+        assert excinfo.value.code == "corrupt_config"
+        assert (home / "auth.json").read_bytes() == auth_bytes
+        cfg.write_text(VALID_YAML)
+        assert resolve_provider("auto") == "openrouter"
+
+    def test_corrupt_config_blocks_other_provider_auto_adoption(self, tmp_path, monkeypatch):
+        """The same damaged provider choice cannot silently adopt an Anthropic key."""
+        _setup_home(tmp_path, monkeypatch, CORRUPT_YAML)
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-FAKE1234567890")
+        _load_config_fresh()
 
         from hermes_cli.auth import AuthError, resolve_provider
 

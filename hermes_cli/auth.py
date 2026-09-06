@@ -1234,7 +1234,7 @@ def _get_config_hint_for_unknown_provider(provider_name: str) -> str:
 
 
 def _refuse_env_adoption_if_config_corrupt() -> None:
-    """Refuse env-key/pool auto-adoption of openrouter while config.yaml is corrupt.
+    """Refuse automatic credential discovery while config.yaml is corrupt.
 
     A corrupt config loads as ``DEFAULT_CONFIG`` (no ``model.provider``), so the env sniff would
     silently adopt the PAID openrouter provider over whatever the broken config really names.
@@ -1250,7 +1250,7 @@ def _refuse_env_adoption_if_config_corrupt() -> None:
         return
     raise AuthError(
         f"config.yaml at {path} is corrupt ({err}) — refusing to auto-select "
-        f"an inference provider from environment keys. Fix the YAML (a backup "
+        f"an inference provider from discovered credentials. Fix the YAML (a backup "
         f"was saved next to it) or run hermes setup.",
         code="corrupt_config")
 
@@ -1440,9 +1440,12 @@ def resolve_provider(
     if cfg_provider:
         return cfg_provider
 
+    # Check before credential discovery: authority-aware pool reads also reject
+    # corrupt config, and their failure must not hide the actionable config error
+    # or let another environment/OAuth provider become an automatic fallback.
+    _refuse_env_adoption_if_config_corrupt()
     _scoped_key_env = _scoped_key_env_reader()
     if _openrouter_auto_detected(_scoped_key_env):
-        _refuse_env_adoption_if_config_corrupt()
         return "openrouter"
 
     # Determined up front so the env-key tier can warn when an exported key preempts it; the actual
