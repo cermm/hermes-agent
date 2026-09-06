@@ -249,10 +249,13 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
         race from hermes-agent#101861): a busy kernel stays put and a
         settled one goes instead, even if the busy one is older."""
         import threading
+        from concurrent.futures import ThreadPoolExecutor
 
         gate = threading.Event()
+        cell_started = threading.Event()
 
         def slow_cat(command):
+            cell_started.set()
             gate.wait(10)
             return {"output": json.dumps(_cell()), "returncode": 0}
 
@@ -262,16 +265,19 @@ class TestIdleReapAndCapEviction(RemoteKernelBase):
             ("cat ", slow_cat),
         ])
         with patch("tools.code_kernel._lifecycle_limits", return_value=(1, 1800)):
-            worker = threading.Thread(target=_run, args=(busy_env,), kwargs={"task": "busy"})
-            worker.start()
-            while not any(k.attached for k in _REMOTE_KERNELS.values()):
-                pass
-            env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
-            _run(env, task="settled")
-            owners = {key[0] for key in _REMOTE_KERNELS}
-            self.assertIn("busy", owners)
-            gate.set()
-            worker.join(10)
+            with ThreadPoolExecutor(max_workers=1) as executor:
+                worker = executor.submit(_run, busy_env, task="busy")
+                try:
+                    self.assertTrue(cell_started.wait(timeout=5), "busy cell did not start")
+                    env = ScriptedEnv(_spawn_ok_handlers([_cell()]))
+                    settled = _run(env, task="settled")
+                    self.assertEqual(settled["status"], "success", settled)
+                    owners = {key[0] for key in _REMOTE_KERNELS}
+                    self.assertIn("busy", owners)
+                finally:
+                    gate.set()
+                busy = worker.result(timeout=10)
+                self.assertEqual(busy["status"], "success", busy)
         self.assertFalse(any("kill 4242" in c for c in busy_env.commands))
 
 
