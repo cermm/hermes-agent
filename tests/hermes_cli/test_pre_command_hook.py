@@ -282,10 +282,6 @@ def _make_runner():
     runner._is_telegram_topic_root_lobby = lambda _source: False
     runner._should_send_telegram_lobby_reminder = lambda _source: False
     runner._check_slash_access = lambda _source, _command: None
-    runner._begin_session_run_generation = lambda _key: 1
-    runner._release_running_agent_state = (
-        lambda key: runner._running_agents.pop(key, None)
-    )
     return runner, adapter
 
 
@@ -302,6 +298,8 @@ async def test_gateway_fires_for_recognized_command(monkeypatch):
     runner, _adapter = _make_runner()
 
     async def _fake_agent(event, source, key, generation):
+        assert runner._is_session_run_current(key, generation)
+        assert runner._is_session_running(key)
         return {"final_response": "", "messages": []}
 
     runner._handle_message_with_agent = _fake_agent
@@ -314,6 +312,7 @@ async def test_gateway_fires_for_recognized_command(monkeypatch):
     assert captured["args_raw"] == "do it later"
     assert captured["platform"] == "telegram"
     assert captured["session_key"]
+    assert not runner._is_session_running(captured["session_key"])
 
 
 @pytest.mark.asyncio
