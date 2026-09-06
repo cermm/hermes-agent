@@ -1,6 +1,6 @@
 {
   "version": 1,
-  "phase": "prerequisite history integration including issue 21",
+  "phase": "reviewed integration and issue 21, 22 and 23 repairs",
   "test_files": [
     "tests/acp/test_approval_isolation.py",
     "tests/acp/test_edit_approval.py",
@@ -102,6 +102,7 @@
     "tests/scripts/test_contributor_map.py",
     "tests/test_active_session_exclusivity.py",
     "tests/test_hermes_state_conn_lock_audit.py",
+    "tests/test_local_astra_routing.py",
     "tests/test_tui_gateway_server.py",
     "tests/tools/test_approval.py",
     "tests/tools/test_approval_config_readonly.py",
@@ -145,10 +146,6 @@
   "expected_linux_skips": {
     "tests/hermes_cli/test_auth_store_lock_concurrent.py::test_many_concurrent_lock_acquisitions_do_not_raise_permission_error": "Requires real native Windows byte-range locking; upstream tests-os Windows lane is separate.",
     "tests/hermes_cli/test_kanban_db.py::test_cross_process_init_lock_uses_windows_byte_range_lock": "Requires real native Windows byte-range locking; upstream tests-os Windows lane is separate."
-  },
-  "later_issue_prs": {
-    "22": "Keep existing delegate/schema/steering files and rerun the full manifest after the separate fix PR.",
-    "23": "Add tests/test_local_astra_routing.py in the separate routing fix PR; final manifest then has 131 files."
   },
   "separate_baseline_diagnostic": {
     "nodeid": "tests/test_hermes_state.py::TestFTS5Search::test_search_projection_skips_context_enrichment_queries",

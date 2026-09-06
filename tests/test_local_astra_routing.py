@@ -29,7 +29,7 @@ def test_policy_preserves_credentials_and_is_idempotent():
 
 
 def test_worker_ladders_only_escalate_and_end_at_astra():
-    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text())
+    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     ladder = [tier["model"] for tier in policy["tiers"]]
     for entry in policy_script.compile_policy(policy):
         updates = entry["updates"]
@@ -41,10 +41,10 @@ def test_worker_ladders_only_escalate_and_end_at_astra():
 
 
 def test_compiled_routes_preserve_every_previous_profile_and_render_independently():
-    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text())
+    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     before = copy.deepcopy(policy)
     entries = policy_script.compile_policy(policy)
-    expected = json.loads((ROOT / "tests/fixtures/local-routing-v1-fingerprints.json").read_text())
+    expected = json.loads((ROOT / "tests/fixtures/local-routing-v1-fingerprints.json").read_text(encoding="utf-8"))
     assert {entry['profile']: hashlib.sha256(json.dumps(entry['updates'], sort_keys=True).encode()).hexdigest() for entry in entries} == expected
     for entry in entries:
         source = '# preserved comment\nmodel:\n  default: previous\n  provider: pinned-provider\n  api_key: fake-private-key\nagent:\n  max_turns: 42\n  system_prompt: Original instructions.\n'
@@ -61,7 +61,7 @@ def test_compiled_routes_preserve_every_previous_profile_and_render_independentl
 
 
 def test_one_tier_edit_updates_every_route_without_stale_copies():
-    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text())
+    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     old_model = policy['tiers'][1]['model']
     policy['tiers'][1]['model'] = 'synthetic-replacement-model'
     entries = policy_script.compile_policy(policy)
@@ -73,33 +73,35 @@ def test_one_tier_edit_updates_every_route_without_stale_copies():
 
 
 def test_real_policy_command_plans_applies_and_preserves_private_backups(tmp_path):
-    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text())
+    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     originals, expected = {}, {}
     for entry in policy_script.compile_policy(policy):
         relative = Path('config.yaml') if entry['profile'] == 'default' else Path('profiles') / entry['profile'] / 'config.yaml'
         path = tmp_path / relative
         path.parent.mkdir(parents=True, exist_ok=True)
-        source = f'# {entry["profile"]} private fixture\nmodel:\n  default: previous\n  provider: pinned-provider\n  api_key: fake-key\nagent:\n  max_turns: 42\n  system_prompt: Preserve my instructions.\n'
-        path.write_text(source)
+        source = f'# {entry["profile"]} private fixture\nmodel:\n  default: previous\n  provider: pinned-provider\n  api_key: fake-key\nagent:\n  max_turns: 42\n  system_prompt: Preserve my instructions. Žluťoučký kůň 🙂\n'
+        path.write_text(source, encoding="utf-8")
         path.chmod(0o600)
         originals[relative] = source
         expected[relative] = policy_script.render(source, {**entry, 'append_system_prompt': policy['routing_prompt']})
     command = [sys.executable, str(ROOT / 'scripts/apply_local_astra_routing.py'), '--home', str(tmp_path)]
-    environment = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path))
+    # File encoding must not depend on the invoking shell's locale.
+    environment = dict(os.environ, HOME=str(tmp_path), HERMES_HOME=str(tmp_path),
+                       PYTHONUTF8="0", PYTHONCOERCECLOCALE="0", LC_ALL="C")
     def run(*args):
-        result = subprocess.run([*command, *args], cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30)
+        result = subprocess.run([*command, *args], cwd=tmp_path, env=environment, capture_output=True, text=True, encoding="utf-8", timeout=30)
         assert result.returncode == 0, result.stderr
         return result
     run()
     assert not (tmp_path / 'backups').exists()
-    assert all((tmp_path / relative).read_text() == source for relative, source in originals.items())
+    assert all((tmp_path / relative).read_text(encoding="utf-8") == source for relative, source in originals.items())
     run('--apply')
     backups = list((tmp_path / 'backups').iterdir())
     assert len(backups) == 1
     for relative, source in originals.items():
         path = tmp_path / relative
-        assert path.read_text() == expected[relative]
-        assert (backups[0] / relative).read_text() == source
+        assert path.read_text(encoding="utf-8") == expected[relative]
+        assert (backups[0] / relative).read_text(encoding="utf-8") == source
         if os.name == 'posix':
             assert path.stat().st_mode & 0o777 == 0o600
             assert (backups[0] / relative).stat().st_mode & 0o777 == 0o600
@@ -109,7 +111,7 @@ def test_real_policy_command_plans_applies_and_preserves_private_backups(tmp_pat
 
 @pytest.mark.parametrize('defect', ['duplicate_tier', 'unknown_tier', 'duplicate_profile', 'traversal_profile'])
 def test_invalid_policy_is_rejected_before_rendering(defect):
-    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text())
+    policy = json.loads((ROOT / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     if defect == 'duplicate_tier':
         policy['tiers'].append(copy.deepcopy(policy['tiers'][0]))
     elif defect == 'unknown_tier':
