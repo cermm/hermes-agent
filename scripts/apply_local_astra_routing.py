@@ -52,13 +52,13 @@ def main():
     parser.add_argument("--home", type=Path, default=Path.home() / ".hermes")
     parser.add_argument("--apply", action="store_true")
     args = parser.parse_args()
-    policy = json.loads((Path(__file__).resolve().parents[1] / "config/local-astra-routing.json").read_text())
+    policy = json.loads((Path(__file__).resolve().parents[1] / "config/local-astra-routing.json").read_text(encoding="utf-8"))
     changes = []
     for entry in policy["entries"]:
         profile = entry["profile"]
         relative = Path("config.yaml") if profile == "default" else Path("profiles") / profile / "config.yaml"
         path = args.home / relative
-        source = path.read_text()
+        source = path.read_text(encoding="utf-8")
         updated = render(source, {**entry, "append_system_prompt": policy["routing_prompt"]})
         if updated != source:
             changes.append((relative, path, updated))
@@ -74,7 +74,7 @@ def main():
         shutil.copy2(path, saved)
         fd, temporary = tempfile.mkstemp(prefix=".astra-routing-", dir=path.parent)
         try:
-            with os.fdopen(fd, "w") as handle:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
                 handle.write(updated)
             os.chmod(temporary, path.stat().st_mode & 0o777)
             os.replace(temporary, path)
