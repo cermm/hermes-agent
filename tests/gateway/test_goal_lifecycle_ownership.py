@@ -26,9 +26,17 @@ def hermes_home(tmp_path, monkeypatch):
     monkeypatch.setattr(Path, 'home', lambda: tmp_path)
     monkeypatch.setenv('HERMES_HOME', str(home))
     from hermes_cli import goals
-    goals._DB_CACHE.clear()
-    yield home
-    goals._DB_CACHE.clear()
+    # These races require an existing durable goal. Construct the real private DB
+    # in this synchronous fixture, before the async test's event loop can take
+    # the production bounded-bootstrap fallback on a slow cold schema init.
+    monkeypatch.setattr(goals, '_DB_CACHE', {})
+    db = goals._get_session_db()
+    assert db is not None, 'private goal database did not initialize'
+    try:
+        yield home
+    finally:
+        db.close()
+        goals._DB_CACHE.pop(str(home), None)
 
 def _make_source() -> SessionSource:
     return SessionSource(platform=Platform.TELEGRAM, user_id='u1', chat_id='c1', user_name='tester', chat_type='dm')
