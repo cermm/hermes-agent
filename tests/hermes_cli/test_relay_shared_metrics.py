@@ -11,7 +11,8 @@ import stat
 import threading
 import time
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from copy import deepcopy
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -1418,6 +1419,65 @@ def test_concurrent_due_exports_create_one_daily_package(tmp_path):
     assert outbox_count == 1
     assert len(list(outbox_directory.glob("*.json"))) == 1
     assert store.counter_snapshot()[0]["packaged_value"] == 1
+
+
+@pytest.mark.parametrize("operation", [
+    "create_and_export_package", "create_and_export_package_if_due", "_export_pending_packages",
+])
+def test_export_waits_for_a_concurrent_writer_without_losing_or_duplicating_delta(
+    tmp_path, monkeypatch, operation
+):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    store.record_model_call(_dimensions(), _resource())
+    if operation == "_export_pending_packages":
+        # Exercise acknowledgment contention separately from package construction.
+        store._create_package()
+    attempted_write = threading.Event()
+    original_connection = store._connection
+
+    @contextmanager
+    def observed_connection(**kwargs):
+        with original_connection(**kwargs) as connection:
+            def trace(statement):
+                if statement == "BEGIN IMMEDIATE" or statement.startswith("UPDATE package_outbox"):
+                    attempted_write.set()
+            connection.set_trace_callback(trace)
+            yield connection
+
+    monkeypatch.setattr(store, "_connection", observed_connection)
+    with sqlite3.connect(store.database_path) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        writer.execute("BEGIN IMMEDIATE")
+        future = pool.submit(getattr(store, operation))
+        try:
+            assert attempted_write.wait(timeout=5), "export did not reach the real SQLite write"
+            # A daily export must survive contention beyond the 250ms event-recording
+            # budget. The real writer remains held throughout this observation.
+            with pytest.raises(FutureTimeoutError):
+                future.result(timeout=1)
+        finally:
+            writer.rollback()
+        future.result(timeout=10)
+
+    with sqlite3.connect(store.database_path) as connection:
+        [(count,)] = connection.execute("SELECT COUNT(*) FROM package_outbox WHERE exported_at IS NOT NULL")
+    [package_path] = list(store.outbox_directory.glob("*.json"))
+    package = json.loads(package_path.read_text(encoding="utf-8"))
+    assert count == 1
+    assert package["metrics"][0]["value"] == 1
+    assert store.counter_snapshot()[0]["packaged_value"] == 1
+
+
+def test_event_recording_keeps_its_short_contention_budget(tmp_path):
+    store = SharedMetricsStore(tmp_path / "metrics.sqlite3", tmp_path / "outbox")
+    with sqlite3.connect(store.database_path) as writer, ThreadPoolExecutor(max_workers=1) as pool:
+        writer.execute("BEGIN IMMEDIATE")
+        future = pool.submit(store.record_model_call, _dimensions(), _resource())
+        try:
+            with pytest.raises(sqlite3.OperationalError, match="locked"):
+                future.result(timeout=3)
+        finally:
+            writer.rollback()
+    assert store.counter_snapshot() == []
 
 
 def test_concurrent_model_call_updates_are_transactional(tmp_path):

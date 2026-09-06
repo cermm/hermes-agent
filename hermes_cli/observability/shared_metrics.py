@@ -29,6 +29,9 @@ _PACKAGE_SCHEMA_VERSION = "hermes.shared_metrics.v2"
 _STORE_SCHEMA_VERSION = "2"
 _BUSY_TIMEOUT_MS = 250
 _SCHEMA_BUSY_TIMEOUT_MS = 5_000
+# Package export is durable background/explicit work: concurrent exporters may
+# wait for committed deltas. Event recording keeps its short best-effort budget.
+_EXPORT_BUSY_TIMEOUT_MS = 5_000
 _LOCAL_HISTORY_RETENTION_DAYS = 30
 _ACTIVE_INSTALL_STATE_KEY = "client_active_recorded_at"
 _ACTIVE_INSTALL_INTERVAL = timedelta(hours=24)
@@ -259,7 +262,7 @@ class SharedMetricsStore:
 
     def create_and_export_package(self) -> list[Path]:
         """Commit every pending delta package (one per period), then export the outbox."""
-        with self._connection() as connection:
+        with self._connection(busy_timeout_ms=_EXPORT_BUSY_TIMEOUT_MS) as connection:
             row = connection.execute(_PENDING_PERIOD_COUNT_SQL).fetchone()
         for _ in range(int(row["period_count"]) if row is not None else 0):
             if self._create_package() is None:
@@ -382,7 +385,7 @@ class SharedMetricsStore:
 
     def _create_pending_packages_if_due(self) -> None:
         now = _utc_now()
-        with self._write() as connection:
+        with self._write(busy_timeout_ms=_EXPORT_BUSY_TIMEOUT_MS) as connection:
             # Gate on the committed package, not its file write, so a failed
             # outbox export can be retried without packaging deltas twice.
             package_created_today = connection.execute(
@@ -394,7 +397,7 @@ class SharedMetricsStore:
                     pass
 
     def _create_package(self) -> dict[str, Any] | None:
-        with self._write() as connection:
+        with self._write(busy_timeout_ms=_EXPORT_BUSY_TIMEOUT_MS) as connection:
             return self._create_package_in_transaction(connection, _utc_now())
 
     def _create_package_in_transaction(
@@ -478,7 +481,7 @@ class SharedMetricsStore:
         }
 
     def _export_pending_packages(self) -> list[Path]:
-        with self._connection() as connection:
+        with self._connection(busy_timeout_ms=_EXPORT_BUSY_TIMEOUT_MS) as connection:
             rows = connection.execute(
                 "SELECT package_id, payload_json FROM package_outbox"
                 " WHERE exported_at IS NULL ORDER BY created_at, package_id"
@@ -491,7 +494,7 @@ class SharedMetricsStore:
             atomic_json_write(
                 path, json.loads(row["payload_json"]), indent=2, sort_keys=True, mode=0o600
             )
-            with self._connection() as connection:
+            with self._connection(busy_timeout_ms=_EXPORT_BUSY_TIMEOUT_MS) as connection:
                 connection.execute(
                     "UPDATE package_outbox SET exported_at = ?"
                     " WHERE package_id = ? AND exported_at IS NULL",
