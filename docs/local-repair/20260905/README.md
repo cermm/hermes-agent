@@ -20,6 +20,10 @@ venv/bin/python scripts/apply_local_astra_routing.py --apply
 
 The script renders every selected configuration before applying changes, backs up private originals under the Hermes home, preserves credentials and unrelated settings, and is idempotent. It requires the installed ruamel.yaml package. Restart the gateway to load code and model defaults after applying.
 
+Issue #23 replaces repeated ladders with a version 2 policy: `tiers` is the ordered source of provider/model pairs, and each profile references its starting tier. Worker and delegation fallbacks are the remaining suffix of that table. Profile exceptions are explicit: the default profile preserves its existing provider and top-level fallbacks; planner/reviewer profiles delegate from Luna; builder-high keeps high delegation effort. Changing a tier updates every generated route that uses it.
+
+The conversion preserves all nine version 1 profile updates exactly, checked against fingerprints captured before the refactor. The command is also exercised as a separate process against nine disposable profile configurations, including dry-run, credential/comment preservation, private backup permissions and repeated apply. Use `--home /path/to/disposable/hermes` without `--apply` to inspect routing before applying. Private backups retain each profile's relative path under `backups/astra-routing-TIMESTAMP`; restore those files while the installation is stopped to roll back a configuration change.
+
 | Role | Default Model |
 | --- | --- |
 | Main, planner, final reviewer | GPT-6 Astra |
