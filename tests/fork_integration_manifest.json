@@ -143,10 +143,10 @@
   },
   "separate_baseline_diagnostic": {
     "nodeid": "tests/test_hermes_state.py::TestFTS5Search::test_search_projection_skips_context_enrichment_queries",
-    "baseline_log": "gateway-state-projection-baseline.log",
-    "integration_family_log": "gateway-review-final.log",
-    "behavior": "FTS context is present, but existing SQL trace matcher counts0 enrichment queries instead of1 on unchanged baseline as well.",
-    "coverage": "Full261-case database suite was exercised:260 pass,1 baseline-only failure. Not part of affected manifest; run separately and report unchanged failure honestly."
+    "baseline_log": "fts-trace-wal-red.log",
+    "integration_family_log": "fts-trace-full-wal.log",
+    "behavior": "Corrected the stale SQL trace instrumentation to observe actual borrowed read connections in both configured WAL and DELETE modes; production database behavior is unchanged.",
+    "coverage": "The required full Python suite covers this entire database file. Independent installed-runtime verification passed262 tests with no skips; the CI runtime passed259 with3 explicit WAL-unavailable skips. This separate full-file coverage supplements the bounded affected manifest."
   },
   "excluded_helper_only_receipt": {
     "file": "tests/hermes_cli/test_subparser_routing_fallback.py",
