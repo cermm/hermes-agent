@@ -51,8 +51,8 @@ concurrency:
 jobs:
   os-tests:
     name: ${{ matrix.name }}
-    runs-on: ${{ matrix.runner }}
-    timeout-minutes: 30
+    runs-on: ${{ github.repository == 'cermm/hermes-agent' && matrix.marker == 'windows_only' && 'windows-latest' || matrix.runner }}
+    timeout-minutes: ${{ github.repository == 'cermm/hermes-agent' && matrix.marker == 'windows_only' && 60 || 30 }}
     strategy:
       fail-fast: false
       matrix:
