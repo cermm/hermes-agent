@@ -5075,6 +5075,7 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     """Grace reaping claims under the lock but finalizes after releasing it."""
     scheduled = {}
     teardown_started = threading.Event()
+    teardown_finished = threading.Event()
     release_teardown = threading.Event()
 
     class _Timer:
@@ -5087,7 +5088,10 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     def _slow_teardown(_session, *, end_reason="tui_close"):
         assert end_reason == "ws_orphan_reap"
         teardown_started.set()
-        assert release_teardown.wait(timeout=2.0)
+        try:
+            assert release_teardown.wait(timeout=30.0)
+        finally:
+            teardown_finished.set()
 
     monkeypatch.setattr(server, "_WS_ORPHAN_REAP_GRACE_S", 0.01)
     monkeypatch.setattr(server.threading, "Timer", _Timer)
@@ -5102,15 +5106,19 @@ def test_ws_orphan_reap_releases_resume_lock_before_slow_teardown(monkeypatch):
     thread.start()
     acquired = False
     try:
-        assert teardown_started.wait(timeout=1.0)
+        # Allow worker scheduling on busy runners; lock ownership itself is
+        # checked immediately while teardown is still blocked on our event.
+        assert teardown_started.wait(timeout=10.0)
         assert "slow-orphan" not in server._sessions
-        acquired = server._session_resume_lock.acquire(timeout=0.2)
+        assert not teardown_finished.is_set()
+        acquired = server._session_resume_lock.acquire(blocking=False)
         assert acquired, "orphan teardown kept the global resume lock held"
+        assert not teardown_finished.is_set()
     finally:
         if acquired:
             server._session_resume_lock.release()
         release_teardown.set()
-        thread.join(timeout=2.0)
+        thread.join(timeout=10.0)
         server._sessions.pop("slow-orphan", None)
 
     assert not thread.is_alive()
