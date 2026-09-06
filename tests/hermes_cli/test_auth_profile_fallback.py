@@ -12,6 +12,8 @@ authenticated only at the global root.
 from __future__ import annotations
 
 import json
+import time
+from contextlib import contextmanager
 from pathlib import Path
 
 import pytest
@@ -53,6 +55,263 @@ def _write(path: Path, payload: dict) -> None:
 # ---------------------------------------------------------------------------
 # read_credential_pool — provider-slice reads
 # ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+def test_missing_global_auth_file_is_safe(profile_env):
+    """Profile processes that never had a global auth.json still work."""
+    from hermes_cli.auth import read_credential_pool
+
+    # No global auth.json written at all.
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "prof-1",
+            "label": "profile",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-profile",
+        }],
+    }))
+
+    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
+    assert read_credential_pool("anthropic") == []
+
+
+def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
+    (profile_env["global"] / "auth.json").write_text("{not valid json")
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "prof-1",
+            "label": "profile",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-profile",
+        }],
+    }))
+
+    from hermes_cli.auth import read_credential_pool
+
+    # Profile reads still work; malformed global is silently ignored.
+    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
+    # And no fallback for anthropic since global is unreadable.
+    assert read_credential_pool("anthropic") == []
+
+
+# ---------------------------------------------------------------------------
+# read_credential_pool — whole-pool reads (provider_id=None)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# get_provider_auth_state — singleton fallback
+# ---------------------------------------------------------------------------
+
+
+def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):
+    from hermes_cli.auth import get_provider_auth_state
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "nous-global", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    state = get_provider_auth_state("nous")
+    assert state is not None
+    assert state["access_token"] == "nous-global"
+
+
+def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
+    from hermes_cli.auth import get_provider_auth_state
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={}))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    assert get_provider_auth_state("nous") is None
+
+
+# ---------------------------------------------------------------------------
+# _load_provider_state — internal global fallback (issue #18594 follow-up)
+#
+# Several runtime helpers (notably ``resolve_nous_runtime_credentials`` and
+# ``resolve_nous_access_token``) call ``_load_provider_state`` directly with
+# a profile-loaded auth store rather than going through
+# ``get_provider_auth_state``. Without the fallback wired into
+# ``_load_provider_state`` itself, those helpers raise ``"Hermes is not
+# logged into Nous Portal"`` even though the user has a valid global Nous
+# login. These tests pin the per-provider shadowing into the helper.
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+# ---------------------------------------------------------------------------
+# Classic mode — no fallback path should ever trigger
+# ---------------------------------------------------------------------------
+
+
+
+
+# ---------------------------------------------------------------------------
+# Writes stay scoped to the profile
+# ---------------------------------------------------------------------------
+
+
+def test_write_credential_pool_targets_profile_when_authority_profile(profile_env):
+    (profile_env["profile"] / "config.yaml").write_text("auth:\n  authority: profile\n")
+    from hermes_cli.auth import read_credential_pool, write_credential_pool
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
+        "openrouter": [{
+            "id": "glob-1",
+            "label": "global",
+            "auth_type": "api_key",
+            "priority": 0,
+            "source": "manual",
+            "access_token": "sk-global",
+        }],
+    }))
+
+    write_credential_pool("openrouter", [{
+        "id": "prof-new",
+        "label": "profile-new",
+        "auth_type": "api_key",
+        "priority": 0,
+        "source": "manual",
+        "access_token": "sk-profile-new",
+    }])
+
+    # Global auth.json unchanged.
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert global_data["credential_pool"]["openrouter"][0]["id"] == "glob-1"
+
+    # Profile auth.json holds the new entry.
+    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
+    assert profile_data["credential_pool"]["openrouter"][0]["id"] == "prof-new"
+
+    # Subsequent read returns profile (shadows global).
+    assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
+
+
+
+
+def test_auth_lock_reentrancy_is_scoped_after_profile_context_switch(profile_env):
+    """Changing profile context cannot inherit another store's lock depth."""
+    import hermes_cli.auth as auth
+    from hermes_constants import reset_hermes_home_override, set_hermes_home_override
+
+    profile_b = profile_env["global"] / "profiles" / "reviewer"
+    profile_b.mkdir(parents=True)
+    (profile_env["profile"] / "config.yaml").write_text("auth:\n  authority: profile\n")
+    (profile_b / "config.yaml").write_text("auth:\n  authority: profile\n")
+    profile_b_lock = profile_b / "auth.lock"
+
+    with auth._auth_store_lock():
+        holder_a = auth._auth_lock_holder_for(profile_env["profile"] / "auth.json")
+        assert getattr(holder_a, "depth", 0) == 1
+
+        token = set_hermes_home_override(profile_b)
+        try:
+            holder_b = auth._auth_lock_holder_for(profile_b / "auth.json")
+            assert holder_b is not holder_a
+            assert getattr(holder_b, "depth", 0) == 0
+            assert not profile_b_lock.exists()
+
+            with auth._auth_store_lock():
+                assert profile_b_lock.exists()
+                assert getattr(holder_b, "depth", 0) == 1
+        finally:
+            reset_hermes_home_override(token)
+
+    assert getattr(holder_a, "depth", 0) == 0
+
+
+# ---------------------------------------------------------------------------
+# write_credential_pool — stale-snapshot cooldown merge
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture()
+def classic_env(tmp_path, monkeypatch):
+    """Classic single-root layout (HERMES_HOME != ~/.hermes, no profiles)."""
+    fake_home = tmp_path / "home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    hermes_home = tmp_path / "classic"
+    hermes_home.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+    return hermes_home
+
+
+def _pool_entry(**overrides) -> dict:
+    entry = {
+        "id": "cred-x",
+        "label": "key-x",
+        "auth_type": "api_key",
+        "priority": 0,
+        "source": "manual",
+        "access_token": "sk-x",
+    }
+    entry.update(overrides)
+    return entry
+
+
+
+
+def test_write_pool_never_merges_cooldown_onto_reauthed_entry(classic_env):
+    """A token change means re-auth: the old cooldown must never carry over.
+
+    A fresh login intentionally clears the entry's status; resurrecting the
+    stale cooldown onto the new credentials would bench a just-authorized key.
+    """
+    from hermes_cli.auth import write_credential_pool
+
+    _write(classic_env / "auth.json", _make_auth_store(pool={
+        "openrouter": [_pool_entry(
+            access_token="sk-old",
+            last_status="exhausted",
+            last_status_at=time.time() - 60,  # newer AND unexpired
+            last_error_code=429,
+        )],
+    }))
+
+    # Same entry id, freshly re-authed with a new token and cleared status.
+    write_credential_pool("openrouter", [_pool_entry(access_token="sk-new")])
+
+    data = json.loads((classic_env / "auth.json").read_text())
+    persisted = data["credential_pool"]["openrouter"][0]
+    assert persisted["access_token"] == "sk-new"
+    assert persisted.get("last_status") != "exhausted"
+    assert persisted.get("last_error_code") is None
+
+
+def test_legacy_fallback_source_write_holds_root_lock(profile_env):
+    from hermes_cli import auth
+    from hermes_cli.auth_store_locks import current_auth_transaction
+
+    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
+        "nous": {"access_token": "global-nous-token", "refresh_token": "rt-global"},
+    }))
+    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
+
+    with auth._auth_store_lock():
+        auth_store = auth._load_auth_store()
+        state, source_path = auth._load_provider_state_with_source(auth_store, "nous")
+        assert source_path == profile_env["global"] / "auth.json"
+        assert source_path.resolve(strict=False) in current_auth_transaction().locked_paths
+        state["access_token"] = "rotated-global-token"
+        auth._save_provider_state_to_source(auth_store, "nous", state, source_path)
+
+    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
+    assert global_data["providers"]["nous"]["access_token"] == "rotated-global-token"
 
 
 def test_profile_with_zero_entries_falls_back_to_global(profile_env):
@@ -149,52 +408,6 @@ def test_per_provider_shadowing_is_independent(profile_env):
     assert [e["id"] for e in ant_entries] == ["glob-ant"]
 
 
-def test_missing_global_auth_file_is_safe(profile_env):
-    """Profile processes that never had a global auth.json still work."""
-    from hermes_cli.auth import read_credential_pool
-
-    # No global auth.json written at all.
-    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
-        "openrouter": [{
-            "id": "prof-1",
-            "label": "profile",
-            "auth_type": "api_key",
-            "priority": 0,
-            "source": "manual",
-            "access_token": "profile-test-token",
-        }],
-    }))
-
-    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
-    assert read_credential_pool("anthropic") == []
-
-
-def test_malformed_global_auth_file_does_not_break_profile_read(profile_env):
-    (profile_env["global"] / "auth.json").write_text("{not valid json")
-    _write(profile_env["profile"] / "auth.json", _make_auth_store(pool={
-        "openrouter": [{
-            "id": "prof-1",
-            "label": "profile",
-            "auth_type": "api_key",
-            "priority": 0,
-            "source": "manual",
-            "access_token": "profile-test-token",
-        }],
-    }))
-
-    from hermes_cli.auth import read_credential_pool
-
-    # Profile reads still work; malformed global is silently ignored.
-    assert read_credential_pool("openrouter")[0]["id"] == "prof-1"
-    # And no fallback for anthropic since global is unreadable.
-    assert read_credential_pool("anthropic") == []
-
-
-# ---------------------------------------------------------------------------
-# read_credential_pool — whole-pool reads (provider_id=None)
-# ---------------------------------------------------------------------------
-
-
 def test_whole_pool_merges_global_providers_when_missing_locally(profile_env):
     from hermes_cli.auth import read_credential_pool
 
@@ -233,24 +446,6 @@ def test_whole_pool_merges_global_providers_when_missing_locally(profile_env):
     assert [e["id"] for e in pool["anthropic"]] == ["glob-ant"]
 
 
-# ---------------------------------------------------------------------------
-# get_provider_auth_state — singleton fallback
-# ---------------------------------------------------------------------------
-
-
-def test_provider_auth_state_falls_back_to_global_when_profile_has_none(profile_env):
-    from hermes_cli.auth import get_provider_auth_state
-
-    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
-        "nous": {"access_token": "nous-global", "refresh_token": "rt-global"},
-    }))
-    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
-
-    state = get_provider_auth_state("nous")
-    assert state is not None
-    assert state["access_token"] == "nous-global"
-
-
 def test_provider_auth_state_profile_wins_when_present(profile_env):
     from hermes_cli.auth import get_provider_auth_state
 
@@ -264,28 +459,6 @@ def test_provider_auth_state_profile_wins_when_present(profile_env):
     state = get_provider_auth_state("nous")
     assert state is not None
     assert state["access_token"] == "nous-profile"
-
-
-def test_provider_auth_state_returns_none_when_neither_has_it(profile_env):
-    from hermes_cli.auth import get_provider_auth_state
-
-    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={}))
-    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
-
-    assert get_provider_auth_state("nous") is None
-
-
-# ---------------------------------------------------------------------------
-# _load_provider_state — internal global fallback (issue #18594 follow-up)
-#
-# Several runtime helpers (notably ``resolve_nous_runtime_credentials`` and
-# ``resolve_nous_access_token``) call ``_load_provider_state`` directly with
-# a profile-loaded auth store rather than going through
-# ``get_provider_auth_state``. Without the fallback wired into
-# ``_load_provider_state`` itself, those helpers raise ``"Hermes is not
-# logged into Nous Portal"`` even though the user has a valid global Nous
-# login. These tests pin the per-provider shadowing into the helper.
-# ---------------------------------------------------------------------------
 
 
 def test_load_provider_state_falls_back_to_global(profile_env):
@@ -367,11 +540,6 @@ def test_load_provider_state_malformed_global_does_not_break_profile(profile_env
     assert state["access_token"] == "profile-token"
 
 
-# ---------------------------------------------------------------------------
-# Classic mode — no fallback path should ever trigger
-# ---------------------------------------------------------------------------
-
-
 def test_classic_mode_does_not_double_read_same_file(tmp_path, monkeypatch):
     """In classic mode (HERMES_HOME == global root), no fallback path runs.
 
@@ -412,11 +580,6 @@ def test_classic_mode_does_not_double_read_same_file(tmp_path, monkeypatch):
     assert entries[0]["id"] == "only"
 
 
-# ---------------------------------------------------------------------------
-# Writes use shared authority by default; explicit profile authority stays local
-# ---------------------------------------------------------------------------
-
-
 def test_write_credential_pool_targets_shared_by_default(profile_env):
     from hermes_cli.auth import read_credential_pool, write_credential_pool
 
@@ -447,60 +610,6 @@ def test_write_credential_pool_targets_shared_by_default(profile_env):
     # No profile-local auth.json is created unless the profile opts in.
     assert not (profile_env["profile"] / "auth.json").exists()
     assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new", "glob-1"]
-
-
-def test_write_credential_pool_targets_profile_when_authority_profile(profile_env):
-    from hermes_cli.auth import read_credential_pool, write_credential_pool
-
-    (profile_env["profile"] / "config.yaml").write_text(
-        "auth:\n  authority: profile\n", encoding="utf-8"
-    )
-    _write(profile_env["global"] / "auth.json", _make_auth_store(pool={
-        "openrouter": [{
-            "id": "glob-1",
-            "label": "global",
-            "auth_type": "api_key",
-            "priority": 0,
-            "source": "manual",
-            "access_token": "global-test-token",
-        }],
-    }))
-
-    write_credential_pool("openrouter", [{
-        "id": "prof-new",
-        "label": "profile-new",
-        "auth_type": "api_key",
-        "priority": 0,
-        "source": "manual",
-        "access_token": "profile-test-token",
-    }])
-
-    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
-    assert global_data["credential_pool"]["openrouter"][0]["id"] == "glob-1"
-
-    profile_data = json.loads((profile_env["profile"] / "auth.json").read_text())
-    assert profile_data["credential_pool"]["openrouter"][0]["id"] == "prof-new"
-    assert [e["id"] for e in read_credential_pool("openrouter")] == ["prof-new"]
-
-
-def test_legacy_fallback_source_write_holds_root_lock(profile_env):
-    from hermes_cli import auth
-
-    _write(profile_env["global"] / "auth.json", _make_auth_store(providers={
-        "nous": {"access_token": "global-nous-token", "refresh_token": "rt-global"},
-    }))
-    _write(profile_env["profile"] / "auth.json", _make_auth_store(providers={}))
-
-    with auth._auth_store_lock():
-        auth_store = auth._load_auth_store()
-        state, source_path = auth._load_provider_state_with_source(auth_store, "nous")
-        assert source_path == profile_env["global"] / "auth.json"
-        assert source_path.resolve(strict=False) in auth._auth_transaction_target.locked_paths
-        state["access_token"] = "rotated-global-token"
-        auth._save_provider_state_to_source(auth_store, "nous", state, source_path)
-
-    global_data = json.loads((profile_env["global"] / "auth.json").read_text())
-    assert global_data["providers"]["nous"]["access_token"] == "rotated-global-token"
 
 
 def test_fallback_source_write_without_source_lock_fails_closed(profile_env):
