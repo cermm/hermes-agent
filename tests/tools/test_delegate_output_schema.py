@@ -299,6 +299,93 @@ class TestRunSingleChildSchemaValidation:
         child.run_conversation = run
         return child
 
+    @pytest.mark.parametrize("escalate", [False, True])
+    @pytest.mark.parametrize("terminal", ["completed", "failed", "interrupted"])
+    def test_retry_result_describes_last_turn_and_total_work(self, escalate, terminal):
+        child = self.escalating_child(["bad", '{"city":"Prague"}'])
+        child._delegate_escalate_on_validation_failure = escalate
+        original = _StubChild.run_conversation
+        first_messages = [{"role": "assistant", "content": "bad"}]
+        last_messages = [{"role": "assistant", "content": '{"city":"Prague"}'}]
+
+        def run(**kwargs):
+            result = original(child, **kwargs)
+            result["completed"] = len(child.calls) > 1 and terminal == "completed"
+            result["api_calls"] = len(child.calls)
+            result["messages"] = first_messages if len(child.calls) == 1 else (
+                (kwargs.get("conversation_history") or []) + last_messages
+            )
+            if len(child.calls) > 1 and terminal == "failed":
+                result.update(failed=True, error="provider rejected retry", failure_reason="billing")
+            if len(child.calls) > 1 and terminal == "interrupted":
+                result["interrupted"] = True
+            return result
+
+        child.run_conversation = run
+        entry = _run(child)
+        assert entry["status"] == terminal
+        assert entry["exit_reason"] == ("error" if terminal == "failed" else terminal)
+        assert not entry["truncated"]
+        assert entry["api_calls"] == 3
+        if terminal == "failed":
+            assert entry["failure_reason"] == "billing"
+            assert entry["error"] == "provider rejected retry"
+
+    @pytest.mark.parametrize("escalate", [False, True])
+    @pytest.mark.parametrize("first_steer", [None, "accepted before repair"])
+    def test_schema_retry_preserves_each_unconsumed_steer(self, escalate, first_steer):
+        child = self.escalating_child(["bad", "bad", '{"city":"Prague"}'] if escalate else ["bad", '{"city":"Prague"}'])
+        child._delegate_escalate_on_validation_failure = escalate
+        original = _StubChild.run_conversation
+        pending = [first_steer, "accepted during repair"]
+        if escalate:
+            pending.append("accepted during final repair")
+
+        def run(**kwargs):
+            result = original(child, **kwargs)
+            result["pending_steer"] = pending[len(child.calls) - 1]
+            return result
+
+        child.run_conversation = run
+        entry = _run(child)
+        assert entry["status"] == "completed"
+        assert entry["missed_steer"] == "\n".join(text for text in pending if text)
+
+    @pytest.mark.parametrize("attempts", [0, 1, 2, 3])
+    def test_schema_diagnostic_reports_executed_retries(self, attempts):
+        child = self.escalating_child(["bad"] * (attempts + 1))
+        child._fallback_chain = child._fallback_chain[:attempts]
+        entry = _run(child)
+        assert entry.get("schema_retries", 0) == attempts
+        suffix = "retry" if attempts == 1 else "retries"
+        assert entry["error"].endswith(f"(after {attempts} {suffix})." if attempts else "output_schema.")
+
+    @pytest.mark.parametrize("escalate", [False, True])
+    @pytest.mark.parametrize("outcome", ["exception", "invalid_result", "provider_failure"])
+    def test_retry_failure_classification_survives_schema_failure(self, escalate, outcome):
+        child = self.escalating_child(["bad", "still bad"])
+        child._delegate_escalate_on_validation_failure = escalate
+        original = _StubChild.run_conversation
+        def run(**kwargs):
+            if not child.calls:
+                return original(child, **kwargs)
+            if outcome == "exception":
+                raise RuntimeError("retry transport failed")
+            if outcome == "invalid_result":
+                return None
+            return {"completed": False, "failed": True, "error": "provider rejected retry",
+                    "failure_reason": "billing", "final_response": "provider rejected retry"}
+        child.run_conversation = run
+        entry = _run(child)
+        assert entry["status"] == "failed"
+        assert entry["exit_reason"] == "error"
+        assert entry["schema_retries"] == 1
+        assert not entry["schema_valid"]
+        assert not entry["truncated"]
+        assert entry["failure_reason"] == {"exception": "schema_retry_error", "invalid_result": "invalid_child_result", "provider_failure": "billing"}[outcome]
+        assert "output_schema" not in entry["error"]
+
+
     def test_validation_escalates_until_valid(self):
         child = self.escalating_child(["bad", "bad", '{"city":"Oslo"}'])
         entry = _run(child)
