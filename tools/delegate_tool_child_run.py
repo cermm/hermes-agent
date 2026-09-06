@@ -400,6 +400,10 @@ def _merge_schema_retry_result(result: Dict[str, Any], retry: Dict[str, Any], *,
     messages = retry.get("messages")
     if isinstance(messages, list):
         result["messages"] = messages if history_supplied else (result.get("messages") or []) + messages
+    # Each turn finalizer drains its accepted, unconsumed steer; retrying cannot recover it later.
+    if pending := retry.get("pending_steer"):
+        existing = result.get("pending_steer")
+        result["pending_steer"] = f"{existing}\n{pending}" if isinstance(existing, str) and existing else pending
     for key in ("completed", "interrupted", "failed", "error", "failure_reason"):
         result.pop(key, None)
         if key in retry:

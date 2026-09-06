@@ -331,6 +331,26 @@ class TestRunSingleChildSchemaValidation:
             assert entry["failure_reason"] == "billing"
             assert entry["error"] == "provider rejected retry"
 
+    @pytest.mark.parametrize("escalate", [False, True])
+    @pytest.mark.parametrize("first_steer", [None, "accepted before repair"])
+    def test_schema_retry_preserves_each_unconsumed_steer(self, escalate, first_steer):
+        child = self.escalating_child(["bad", "bad", '{"city":"Prague"}'] if escalate else ["bad", '{"city":"Prague"}'])
+        child._delegate_escalate_on_validation_failure = escalate
+        original = _StubChild.run_conversation
+        pending = [first_steer, "accepted during repair"]
+        if escalate:
+            pending.append("accepted during final repair")
+
+        def run(**kwargs):
+            result = original(child, **kwargs)
+            result["pending_steer"] = pending[len(child.calls) - 1]
+            return result
+
+        child.run_conversation = run
+        entry = _run(child)
+        assert entry["status"] == "completed"
+        assert entry["missed_steer"] == "\n".join(text for text in pending if text)
+
     @pytest.mark.parametrize("attempts", [0, 1, 2, 3])
     def test_schema_diagnostic_reports_executed_retries(self, attempts):
         child = self.escalating_child(["bad"] * (attempts + 1))
