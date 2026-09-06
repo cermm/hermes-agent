@@ -232,9 +232,9 @@ function GalleryTile({
 }) {
   return (
     <button
+      aria-label={title}
       className={cn('relative block size-full cursor-zoom-in overflow-hidden bg-muted/55', className)}
       onClick={onOpen}
-      title={title}
       type="button"
     >
       <img
