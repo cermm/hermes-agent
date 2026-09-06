@@ -159,11 +159,24 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
     agent._cached_system_prompt = "sys"
     monkeypatch.setattr(
         "agent.conversation_compression.resolve_context_compression_timeouts",
-        lambda cfg=None: (0.05, 0.1),
+        # Bootstrap/plugin setup is outside this blocked-provider contract.
+        # The short host budget is armed below only after the provider starts.
+        lambda cfg=None: (10.0, 20.0),
     )
 
     provider_started = threading.Event()
     release_provider = threading.Event()
+    real_budget_wait = cc._await_worker_within_budget
+
+    def _wait_after_provider_start(future, fence, **_kwargs):
+        assert provider_started.wait(timeout=5), "protected provider never started"
+        fence.touch_progress()
+        fence.set_total_ceiling_seconds(4.0)
+        return real_budget_wait(
+            future, fence, idle=2.0, ceiling=4.0, wait_started=time.monotonic()
+        )
+
+    monkeypatch.setattr(cc, "_await_worker_within_budget", _wait_after_provider_start)
 
     def _blocked_provider(_kwargs):
         provider_started.set()
@@ -182,11 +195,11 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             live, "sys", approx_tokens=120_000
         )
         assert returned is live
-        assert provider_started.wait(timeout=1)
+        assert provider_started.is_set()
         assert not release_provider.is_set()
 
-        deadline = time.time() + 1
-        while time.time() < deadline:
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
             with cc._compress_admission_lock:
                 if cc._compress_admitted_count == 0:
                     break
