@@ -150,6 +150,22 @@ def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = ()
 
 # ---- bespoke spawn builders ----
 
+def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
+    from agent.lsp.typescript import resolve_sdk
+    override = ctx.binary_overrides.get("typescript")
+    command = list(override) if override else None
+    binary = (shutil.which(command[0]) or command[0]) if command else _find_binary(
+        ctx, "typescript", ("typescript-language-server",), "typescript-language-server")
+    if binary is None:
+        return None
+    spec = _make_spec(root, ctx, "typescript", command or [binary, "--stdio"], seed=True)
+    sdk, _source = resolve_sdk(root, binary, spec.initialization_options)
+    # Copy nested options so per-project selection cannot mutate profile configuration.
+    spec.initialization_options = {**spec.initialization_options, "tsserver": {
+        **(spec.initialization_options.get("tsserver") or {}), "path": sdk}}
+    return spec
+
+
 def _spawn_pyright(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
     bin_path = _find_binary(ctx, "pyright", ("pyright-langserver", "pyright"), "pyright")
     if bin_path is None:
@@ -283,7 +299,7 @@ SERVERS: List[ServerDef] = [
             build_spawn=_spawn_pyright, multi_root=True),
     _server("typescript", (".ts", ".tsx", ".js", ".jsx", ".mjs", ".cjs", ".mts", ".cts"),
             "JavaScript/TypeScript — typescript-language-server", resolve_root=_root_typescript,
-            which=("typescript-language-server",), args=("--stdio",), install_pkg="typescript-language-server", seed=True),
+            build_spawn=_spawn_typescript, seed=True),
     _server("vue-language-server", (".vue",), "Vue.js — @vue/language-server", resolve_root=_root_typescript,
             args=("--stdio",), install_pkg="@vue/language-server"),
     _server("svelte-language-server", (".svelte",), "Svelte — svelte-language-server", resolve_root=_root_typescript,

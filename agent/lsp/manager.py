@@ -424,7 +424,11 @@ class LSPService:
             workspace_root=root, install_strategy=self._install_strategy, binary_overrides=self._binary_overrides,
             env_overrides=self._env_overrides, init_overrides=self._init_overrides,
         )
-        spec = srv.build_spawn(root, ctx)
+        try:
+            spec = srv.build_spawn(root, ctx)
+        except ValueError as exc:
+            eventlog.log_spawn_failed(srv.server_id, root, exc)
+            return None
         if spec is None:
             # Binary not locatable (auto-install off, manual-only, or install failed) — surface once.
             eventlog.log_server_unavailable(srv.server_id, srv.server_id)

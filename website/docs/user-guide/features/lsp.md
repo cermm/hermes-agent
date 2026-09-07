@@ -133,9 +133,44 @@ hermes lsp restart         # tear down running clients
 hermes lsp which <id>      # print resolved binary path
 ```
 
-`hermes lsp status` is the best starting point — it shows which
-languages will get semantic diagnostics today and which need a
-binary installed.
+`hermes lsp status` shows binary availability and process-local client state.
+An installed binary alone does not prove that a project can receive diagnostics.
+For TypeScript it also checks SDK prerequisites for the current directory and
+active profile. `prerequisites-present` means `tsserver.js` and SDK version metadata
+were found; it does **not** run initialization or validate a diagnostic response.
+`sdk-unavailable` includes a repair hint. JSON output includes this information in
+the TypeScript registry row's `backend` field.
+
+### TypeScript SDK compatibility
+
+The managed recipe pins `typescript-language-server@5.3.0` with `typescript@6.0.3`.
+The wrapper requires the JavaScript SDK entrypoint `lib/tsserver.js`; a native
+TypeScript package without that file cannot serve as its SDK. Existing staged
+packages are not silently downgraded when resolving a server. Repair the active
+profile's `<HERMES_HOME>/lsp` installation explicitly using the pinned recipe, or
+configure an already available compatible SDK:
+
+```yaml
+lsp:
+  servers:
+    typescript:
+      initialization_options:
+        tsserver:
+          path: /absolute/path/to/typescript/lib/tsserver.js
+```
+
+Resolution checks the explicit `tsserver.path`, workspace Node/Yarn SDKs,
+`tsserver.fallbackPath`, the selected wrapper's package tree, then the active
+profile's staged SDK. A configured path may also name the SDK's `lib` directory.
+An invalid explicit path is reported rather than silently replaced. Project SDKs
+keep precedence over the managed fallback; neither resolution nor status installs
+packages. The configured server command and its arguments are preserved.
+
+A cold TypeScript project can exceed the default five-second diagnostic wait.
+Increase `lsp.wait_timeout` for that profile if logs report timeouts, and validate
+an introduced type error and its repair in a disposable project. A timeout means
+no verdict, not a clean file; no default timeout increase is made by this change.
+The CLI client count describes its own process, not a separate running gateway.
 
 ## Configuration
 
