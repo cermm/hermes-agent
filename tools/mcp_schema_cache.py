@@ -34,6 +34,10 @@ def config_fingerprint(config: dict) -> str:
         "transport": config.get("transport"),
         "tools_include": sorted(tools_filter.get("include") or []),
         "tools_exclude": sorted(tools_filter.get("exclude") or [])}
+    if config.get("project") is not None:
+        payload["project_binding"] = config.get("_project_binding")
+        payload["project"] = config["project"]
+        payload["cwd"] = config.get("cwd")
     raw = json.dumps(payload, sort_keys=True, separators=(",", ":"))
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
 

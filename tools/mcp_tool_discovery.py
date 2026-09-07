@@ -47,6 +47,8 @@ def _enabled(cfg: dict) -> bool:
 async def _connect_server(name: str, config: dict) -> _core.MCPServerTask:
     """Create an MCPServerTask, start it, return once ready (tear down with ``server.shutdown()``
     on the same loop). Raises on bad config, missing HTTP support or connect failure."""
+    from tools.mcp_tool_project import validate_launch
+    config = validate_launch(config)
     server = _core.MCPServerTask(name)
     claim = _core._connect_server_claim.get()
     if claim is not None:
@@ -199,6 +201,8 @@ def _get_connected_server_for_call(server_name: str) -> Optional[_core.MCPServer
 
 async def _discover_and_register_server(name: str, config: dict) -> List[str]:
     """Connect one server, register its tools; return the registered names."""
+    from tools.mcp_tool_project import validate_launch
+    config = validate_launch(config)
     # The claim fires inside _connect_server while this frame is suspended (list, not nonlocal).
     claimed: List[_core.MCPServerTask] = []
     claim_token = _core._connect_server_claim.set(claimed.append)
@@ -363,7 +367,15 @@ def register_mcp_servers(servers: Dict[str, dict]) -> List[str]:
     if not servers:
         logger.debug("No explicit MCP servers provided")
         return []
-    new_servers = _select_new_servers(servers)
+    from tools.mcp_tool_project import prepare_project_config, ProjectBindingError
+    prepared = {}
+    for name, cfg in servers.items():
+        try:
+            prepared[name] = prepare_project_config(cfg) if _enabled(cfg) else cfg
+        except ProjectBindingError as exc:
+            _note_connect_failure(name, exc)
+            logger.warning("MCP project binding for %s: %s", name, exc)
+    new_servers = _select_new_servers(prepared)
     if not new_servers:
         return _registration._existing_tool_names()
     new_servers, lazy_registered, lazy_server_count = _register_lazy_from_cache(new_servers)
@@ -481,6 +493,14 @@ def get_mcp_status() -> List[dict]:
                 entry["sampling"] = dict(server._sampling.metrics)
         elif status == "failed":
             entry["error"] = connect_errors[name]
+        binding = getattr(server, "_config", {}).get("_project_binding") if server else None
+        if binding:
+            from tools.mcp_tool_project import _check_binding, ProjectBindingError
+            entry["project_identity"] = {k: binding[k] for k in ("root", "commit", "mode")}
+            try:
+                entry["project_identity"] = _check_binding(name, binding, None)
+            except ProjectBindingError as exc:
+                entry["project_error"] = str(exc)
         result.append(entry)
     return result
 

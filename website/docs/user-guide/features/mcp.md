@@ -934,3 +934,57 @@ The gateway does NOT need to be running for read operations (listing conversatio
 - [CLI Commands](/reference/cli-commands)
 - [Slash Commands](/reference/slash-commands)
 - [FAQ](/reference/faq)
+
+
+### Bind a semantic server to a local Git worktree
+
+A healthy MCP connection can still point at the wrong checkout. Opt in per stdio server:
+
+```yaml
+mcp_servers:
+  project_navigation:
+    command: your-semantic-server
+    args: ["--project", "${projectRoot}"]
+    project:
+      mode: workspace
+    tools:
+      include: [find_symbol, find_referencing_symbols, get_symbols_overview]
+```
+
+`project.mode: workspace` resolves the logical task working directory to its canonical Git
+worktree root and freezes its HEAD at discovery. `${projectRoot}` must be a whole launch
+argument; Hermes replaces it with that root and pins subprocess `cwd` to the same directory.
+If explicitly supplied, `cwd` must be `${projectRoot}` or that exact root. Adapt the argument
+syntax and navigation allowlist to the server. The server must actually interpret this
+argument as its project target: do not also pass a contradictory project option.
+
+Every registered tool, resource and prompt call checks the task root, target HEAD, profile
+and frozen connection identity before dispatch and after the response. Successful responses
+include `project_identity` with root, commit, mode and `matches_task`. A mismatch returns
+`project_binding_error` without exposing the semantic response. Schema-cache fingerprints
+include the binding, so a manifest from another root or commit cannot authorize lazy reuse.
+These checks describe a trusted server's launch contract; they do not attest its internal
+index or sandbox its filesystem access. Exclude project-activation, shell-execution and other
+retargeting tools through an explicit navigation allowlist. Ordinary edits without a new
+commit remain supported; freshness of the server's index is still its responsibility.
+
+The existing connection and tool schema remain fixed for the conversation. After changing
+HEAD or task checkout, use a fresh worker process. Two different worktrees in one process
+must use separately named servers; sharing one name fails closed for the mismatched worker.
+This is not transparent multi-worktree multiplexing. Remote terminal backends, HTTP servers,
+uncommitted repositories and non-Git projects are unsupported by this opt-in binding.
+Existing servers without `project` retain their previous behavior.
+
+For intentional access to a fixed external checkout, use the same launch argument with:
+
+```yaml
+project:
+  mode: fixed
+  root: /absolute/path/to/external-checkout
+```
+
+Fixed mode still pins target HEAD and profile, but allows callers from other worktrees.
+Their responses explicitly report `matches_task: false`; they are external-project results.
+Configuration changes take effect in a new worker/session; do not retarget a connection
+belonging to an active conversation. MCP status includes the live `project_identity` and
+any `project_error` separately from transport connectivity.
