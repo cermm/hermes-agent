@@ -43,7 +43,7 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "pyright": _npm("pyright", "pyright-langserver"),
     # tsserver must be importable from the same node_modules tree or
     # initialize() fails with "Could not find a valid TypeScript installation".
-    "typescript-language-server": _npm("typescript-language-server", "typescript-language-server", extra_pkgs=["typescript"]),
+    "typescript-language-server": _npm("typescript-language-server@5.3.0", "typescript-language-server", extra_pkgs=["typescript@6.0.3"]),
     "@vue/language-server": _npm("@vue/language-server", "vue-language-server"),
     "svelte-language-server": _npm("svelte-language-server", "svelteserver"),
     "@astrojs/language-server": _npm("@astrojs/language-server", "astro-ls"),
@@ -62,8 +62,8 @@ INSTALL_RECIPES: Dict[str, Dict[str, Any]] = {
     "powershell": _manual("pwsh"),
 }
 
-_install_locks: Dict[str, threading.Lock] = {}
-_install_results: Dict[str, Optional[str]] = {}
+_install_locks: Dict[tuple[str, str], threading.Lock] = {}
+_install_results: Dict[tuple[str, str], Optional[str]] = {}
 _install_lock_meta = threading.Lock()
 _WINDOWS_WRAPPER_SUFFIXES = (".cmd", ".exe", ".bat")
 
@@ -98,7 +98,9 @@ def _first_existing(*bases: Path) -> Optional[Path]:
 
 def _existing_binary(name: str) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
-    for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
+    from hermes_constants import get_hermes_home
+
+    for staged in _native_binary_candidates(get_hermes_home() / "lsp" / "bin" / name):
         if staged.exists() and os.access(staged, os.X_OK):
             return str(staged)
     suffixes = ("", *_WINDOWS_WRAPPER_SUFFIXES) if _is_windows() else ("",)
@@ -109,18 +111,19 @@ def try_install(pkg: str, strategy: str = "auto") -> Optional[str]:
     """Try to install ``pkg``; return the binary path or ``None``.
 
     Only ``"auto"`` installs; ``"manual"``/``"off"`` just probe for an existing
-    binary.  Results are cached per package and concurrent calls are serialized.
+    binary. Results are cached per profile/package and concurrent calls are serialized.
     """
     if strategy != "auto":
         return _existing_binary(INSTALL_RECIPES.get(pkg, {}).get("bin", pkg))
-    if pkg in _install_results:
-        return _install_results[pkg]
+    key = (str(hermes_lsp_bin_dir().parent.resolve()), pkg)
+    if key in _install_results:
+        return _install_results[key]
     with _install_lock_meta:
-        lock = _install_locks.setdefault(pkg, threading.Lock())
+        lock = _install_locks.setdefault(key, threading.Lock())
     with lock:
-        if pkg not in _install_results:
-            _install_results[pkg] = _do_install(pkg)
-        return _install_results[pkg]
+        if key not in _install_results:
+            _install_results[key] = _do_install(pkg)
+        return _install_results[key]
 
 
 def _do_install(pkg: str) -> Optional[str]:

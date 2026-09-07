@@ -94,6 +94,20 @@ def main():
                 return 0
             continue
 
+        if msg.get("method") == "test/environment":
+            params = msg["params"]
+            # Report only presence/equality, never inherited credential values.
+            write_message({
+                "jsonrpc": "2.0", "id": msg["id"],
+                "result": {
+                    "present": {key: key in os.environ for key in params["keys"]},
+                    "matches": {key: os.environ.get(key) == value
+                                for key, value in params["expected"].items()},
+                    "cwd_matches": os.getcwd() == params["cwd"],
+                },
+            })
+            continue
+
         if msg.get("method") == "initialized":
             continue
 

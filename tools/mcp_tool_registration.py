@@ -221,11 +221,12 @@ def _resolve_name_collisions(name: str, candidates: List[_Candidate]) -> List[_C
 
 
 def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: Callable,
-                         scope: Callable[[], Optional[str]], lazy: bool) -> List[str]:
+                         scope: Callable[[], Optional[str]], lazy: bool, config: Optional[dict] = None) -> List[str]:
     """Register candidates under toolset ``mcp-{name}``; returns the names that landed. The
     ownership pre-check is advisory (servers connect in parallel): ``registry.register()`` is
     the atomic gate and its verdict is re-read after every call."""
     from tools.registry import registry
+    from tools.mcp_tool_project import bind_handler
     toolset_name = f"mcp-{name}"
     registered: List[str] = []
     for c in candidates:
@@ -243,7 +244,7 @@ def _register_candidates(name: str, candidates: List[_Candidate], *, check_fn: C
                                "preserve built-in", name, c.origin, c.registry_name, existing_toolset)
             continue
         registry.register(
-            name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=c.handler, check_fn=check_fn,
+            name=c.registry_name, toolset=toolset_name, schema=c.schema, handler=bind_handler(name, config or {}, c.handler), check_fn=check_fn,
             is_async=False, description=c.schema.get("description") or "", scope=scope())
         if registry.get_toolset_for_tool(c.registry_name) == toolset_name:
             _track_mcp_tool_server(c.registry_name, name)
@@ -296,7 +297,7 @@ def _register_server_tools(name: str, server: "MCPServerTask", config: dict) -> 
     candidates += _utility_candidates(name, _select_utility_schemas(name, server, config), server.tool_timeout)
     registered = _register_candidates(
         name, _resolve_name_collisions(name, candidates),
-        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(name), lazy=False)
+        check_fn=_make_check_fn(name), scope=lambda: _core._server_registry_scope(name), lazy=False, config=config)
     if registered:
         _write_schema_cache(name, server, config, should_register)
     return registered
@@ -317,7 +318,7 @@ def _register_from_cache_sync(name: str, config: dict, entry: dict) -> List[str]
     candidates = _tool_candidates(name, cached_tools, _make_tool_filter(name, config), tool_timeout)
     candidates += _utility_candidates(name, utility_tools_from_cache_entry(entry), tool_timeout)
     registered = _register_candidates(
-        name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True)
+        name, candidates, check_fn=_make_check_fn(name), scope=_core._mcp_registry_scope, lazy=True, config=config)
     if registered:
         with _core._lock:
             _core._lazy_server_configs[name] = dict(config)

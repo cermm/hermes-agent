@@ -66,10 +66,14 @@ def _cmd_status(emit_json: bool) -> int:
     from agent.lsp.servers import SERVERS
     svc = get_service()
     info = svc.get_status() if svc is not None else {"enabled": False}
+    typescript_backend = _typescript_backend_status()
     if emit_json:
         import json
         registry = [{"server_id": s.server_id, "extensions": list(s.extensions), "description": s.description,
                      "binary_status": _status_for(s.server_id)} for s in SERVERS]
+        for entry in registry:
+            if entry["server_id"] == "typescript":
+                entry["backend"] = typescript_backend
         sys.stdout.write(json.dumps({"service": info, "registry": registry}, indent=2) + "\n")
         return 0
 
@@ -87,6 +91,10 @@ def _cmd_status(emit_json: bool) -> int:
             out += [f"    - {b}" for b in broken]
         if disabled := info.get("disabled_servers"):
             out.append(f"  disabled in cfg: {', '.join(disabled)}")
+    out += [f"  TypeScript backend: {typescript_backend['status']}",
+            f"    {typescript_backend['message']}"]
+    if typescript_backend.get("sdk_path"):
+        out.append(f"    SDK: {typescript_backend['sdk_path']} ({typescript_backend['sdk_source']})")
     # Sidecar gaps the registry table can't show (bash-language-server -> shellcheck).
     if backend_warnings := _backend_warnings():
         out += ["", "Backend warnings", "================"] + [f"  ! {line}" for line in backend_warnings]
@@ -189,3 +197,19 @@ def _backend_warnings() -> list:
         return ["bash-language-server is installed but shellcheck is missing — "
                 "diagnostics will be empty (apt: shellcheck, brew: shellcheck, scoop: shellcheck)."]
     return []
+
+
+def _typescript_backend_status() -> dict:
+    import os
+    from agent.lsp.typescript import backend_status
+    from hermes_cli.config import load_config_readonly
+    cfg = load_config_readonly()
+    server = ((cfg.get("lsp") or {}).get("servers") or {}).get("typescript") or {}
+    from agent.lsp.servers import find_server_for_file
+    from agent.lsp.workspace import find_git_worktree
+    cwd = os.getcwd()
+    definition = find_server_for_file("status.ts")
+    root = definition.resolve_root(cwd, find_git_worktree(cwd) or cwd)
+    if root is None:
+        return {"status": "disabled-for-project", "message": "TypeScript LSP is excluded by this project's markers."}
+    return {"workspace_root": root, **backend_status(root, server.get("command"), server.get("initialization_options"))}

@@ -146,8 +146,8 @@ class LSPClient:
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
 
-        # Server → client requests; anything else gets method-not-found.  Capability (un)registration
-        # and diagnostic refresh are acknowledged but not acted on: we re-pull on every touch anyway.
+        # Capability (un)registration is acknowledged, but some peers (Pyright)
+        # unregister while continuing to serve pulls. Only -32601 is definitive.
         self._request_handlers: Dict[str, Callable[[Any], Awaitable[Any]]] = {
             "window/workDoneProgress/create": self._handle_null,
             "workspace/configuration": self._handle_workspace_configuration,
@@ -164,6 +164,7 @@ class LSPClient:
         self._docs: Dict[str, _DocState] = {}  # keyed by absolute path (NOT URI)
         self._state: str = "stopped"
         self._sync_kind: int = 1  # 1=Full, 2=Incremental
+        self._pull_diagnostics_supported: Optional[bool] = None
         self._stopping: bool = False
         # Waiters snapshot ``_push_counter`` and treat any increase as "recheck the
         # predicate" — avoids the asyncio.Event sticky-state trap.
@@ -193,6 +194,10 @@ class LSPClient:
         """Spawn + initialize handshake.  On failure the process is killed and state is ``"error"``; re-call to retry."""
         if self._state in _LIVE_STATES:
             return
+        # Negotiation and freshness belong to this connection, not the previous peer.
+        self._stopping = False
+        self._pull_diagnostics_supported = None
+        self._docs.clear()
         self._state = "starting"
         try:
             await self._spawn()
@@ -206,6 +211,12 @@ class LSPClient:
             raise
 
     async def _spawn(self) -> None:
+        from tools.environments.local import hermes_subprocess_env
+
+        # Language servers need only their deliberately configured credentials.
+        env = hermes_subprocess_env(inherit_credentials=False)
+        if self._env:
+            env.update(self._env)
         cmd = self._command
         if sys.platform == "win32" and cmd[0].lower().endswith((".cmd", ".bat")):
             cmd = ["cmd.exe", "/c", *cmd]  # CreateProcess can't run .cmd/.bat shims directly
@@ -217,7 +228,7 @@ class LSPClient:
             self._proc = await asyncio.create_subprocess_exec(
                 cmd[0], *cmd[1:],
                 stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-                env={**os.environ, **(self._env or {})}, cwd=self._cwd,
+                env=env, cwd=self._cwd,
                 start_new_session=True, creationflags=windows_hide_flags(),
             )
         except FileNotFoundError as e:
@@ -289,7 +300,11 @@ class LSPClient:
             "initializationOptions": self._init_options, "capabilities": _CLIENT_CAPABILITIES,
         }
         result = await asyncio.wait_for(self._send_request("initialize", params), timeout=INITIALIZE_TIMEOUT)
-        sync = (result.get("capabilities") or {}).get("textDocumentSync")
+        capabilities = result.get("capabilities") or {}
+        provider = capabilities.get("diagnosticProvider")
+        # Some compatible peers omit this capability; allow a probe unless explicitly disabled.
+        self._pull_diagnostics_supported = False if provider is False else (True if provider is not None else None)
+        sync = capabilities.get("textDocumentSync")
         if isinstance(sync, dict):
             sync = sync.get("change")
         self._sync_kind = sync if isinstance(sync, int) else 1  # default to Full
@@ -520,7 +535,9 @@ class LSPClient:
     async def _pull_document_diagnostics(self, path: str) -> None:
         """Send ``textDocument/diagnostic`` for one file into the pull store.  Results are tagged with the
         version captured at send time, so a didChange racing past the request makes them stale
-        automatically.  Silently no-ops on errors (server may not support pull)."""
+        automatically.  A method-not-found response disables pulls for this connection."""
+        if self._pull_diagnostics_supported is False:
+            return
         abs_path = os.path.abspath(path)
         doc = self._docs.get(abs_path)
         sent_version = doc.version if doc else -1
@@ -530,6 +547,8 @@ class LSPClient:
                 timeout=DIAGNOSTICS_REQUEST_TIMEOUT,
             )
         except (LSPRequestError, LSPProtocolError, asyncio.TimeoutError) as e:
+            if isinstance(e, LSPRequestError) and e.code == ERROR_METHOD_NOT_FOUND:
+                self._pull_diagnostics_supported = False
             logger.debug("[%s] document diagnostic pull failed: %s", self.server_id, e)
             return
         if not isinstance(result, dict):
@@ -556,27 +575,31 @@ class LSPClient:
         """
         if not (timeout is not None and timeout > 0):
             timeout = DIAGNOSTICS_FULL_WAIT if mode == "full" else DIAGNOSTICS_DOCUMENT_WAIT
-        now = asyncio.get_event_loop().time
-        deadline = now() + timeout
         abs_path = os.path.abspath(path)
-        while True:
+        if not self._connection_is_open():
+            raise LSPProtocolError("server connection closed while waiting for diagnostics")
+        # Keep the same push waiter alive when a pull is unsupported, fails, or yields
+        # no fresh data. Retrying that completed pull in a tight loop starves pushes.
+        push = asyncio.create_task(self._wait_for_fresh_push(abs_path, version, timeout))
+        tasks = {push}
+        if self._pull_diagnostics_supported is not False:
+            tasks.add(asyncio.create_task(self._pull_document_diagnostics(abs_path)))
+        try:
+            done, _ = await asyncio.wait(tasks, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            for task in done:
+                task.result()
+            doc = self._docs.get(abs_path)
+            if not (doc and doc.fresh(version)) and push not in done:
+                await push
             if not self._connection_is_open():
                 raise LSPProtocolError("server connection closed while waiting for diagnostics")
-            remaining = deadline - now()
-            if remaining <= 0:
-                return False
-            # Concurrent: document pull + push wait.
-            tasks = {
-                asyncio.create_task(self._pull_document_diagnostics(abs_path)),
-                asyncio.create_task(self._wait_for_fresh_push(abs_path, version, remaining)),
-            }
-            _done, pending = await asyncio.wait(tasks, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
-            for t in pending:
-                t.cancel()
-            await asyncio.gather(*pending, return_exceptions=True)
             doc = self._docs.get(abs_path)
-            if doc and doc.fresh(version):
-                return True
+            return bool(doc and doc.fresh(version))
+        finally:
+            for task in tasks:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
 
     async def _await_push(self, timeout: float) -> bool:
         """Block until the next publishDiagnostics or ``timeout``; True iff a push woke us."""
@@ -593,6 +616,8 @@ class LSPClient:
         deadline = now() + timeout
         baseline = self._push_counter
         while True:
+            if not self._connection_is_open():
+                raise LSPProtocolError("server connection closed while waiting for diagnostics")
             doc = self._docs.get(path)
             if doc and doc.fresh_push(version):
                 # Debounce: TS often emits in pairs.  Snapshot the counter so
