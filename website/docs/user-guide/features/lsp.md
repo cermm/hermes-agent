@@ -161,7 +161,8 @@ lsp:
 
 Resolution checks the explicit `tsserver.path`, workspace Node/Yarn SDKs,
 `tsserver.fallbackPath`, the selected wrapper's package tree, then the active
-profile's staged SDK. A configured path may also name the SDK's `lib` directory.
+profile's staged SDK. A configured path may also name the SDK's `lib` directory, package directory,
+or `bin/tsserver` executable (including a PATH-resolved `tsserver`).
 An invalid explicit path is reported rather than silently replaced. Project SDKs
 keep precedence over the managed fallback; neither resolution nor status installs
 packages. The configured server command and its arguments are preserved.

@@ -6,6 +6,7 @@ without those optional development dependencies only that test is skipped.
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import time
@@ -14,7 +15,7 @@ from pathlib import Path
 import pytest
 
 from agent.lsp.servers import ServerContext, find_server_for_file
-from agent.lsp.typescript import backend_status
+from agent.lsp.typescript import backend_status, resolve_sdk
 
 
 def test_sdk_preflight_respects_overrides_workspace_and_profile(tmp_path, monkeypatch, capsys):
@@ -74,7 +75,8 @@ def test_sdk_preflight_respects_overrides_workspace_and_profile(tmp_path, monkey
     assert "tsserver.path" in row["backend"]["message"]
 
 
-def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch):
+@pytest.mark.parametrize("sdk_selection", ["profile", "explicit-bin"])
+def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch, sdk_selection):
     binary = shutil.which("typescript-language-server")
     tsserver = shutil.which("tsserver")
     sdk = Path(tsserver).resolve().parent.parent / "lib/tsserver.js" if tsserver else None
@@ -96,9 +98,12 @@ def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch):
     staged = profile / "lsp/node_modules"
     staged.mkdir(parents=True)
     (staged / "typescript").symlink_to(sdk.parent.parent, target_is_directory=True)
+    init_options = {"disableAutomaticTypingAcquisition": True}
+    if sdk_selection == "explicit-bin":
+        init_options["tsserver"] = {"path": tsserver}
     (profile / "config.yaml").write_text(json.dumps({"lsp": {"enabled": True, "install_strategy": "manual",
         "wait_timeout": 5, "servers": {"typescript": {"command": [binary, "--stdio"],
-        "initialization_options": {"disableAutomaticTypingAcquisition": True}}}}}))
+        "initialization_options": init_options}}}}))
     shutdown_service()
     operations = ShellFileOperations(LocalEnvironment(cwd=str(project)))
     source = project / "probe.ts"
@@ -107,7 +112,7 @@ def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch):
     source.write_text(good)
     timings = {}
     try:
-        status = backend_status(str(project), [binary])
+        status = backend_status(str(project), [binary], init_options)
         assert status["status"] == "prerequisites-present"
         for label, content, expected_error in [("cold-error", bad, True), ("repair", good, False), ("warm-error", bad, True), ("repair-again", good, False)]:
             start = time.monotonic()
@@ -125,3 +130,53 @@ def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch):
         print("Real TypeScript write timings:", json.dumps(timings, sort_keys=True))
     finally:
         shutdown_service()
+
+
+def test_status_and_spawn_agree_on_wrapper_and_supported_sdk_forms(tmp_path, monkeypatch):
+    profile = tmp_path / "profile"
+    project = tmp_path / "project"
+    project.mkdir()
+    monkeypatch.setenv("HERMES_HOME", str(profile))
+    monkeypatch.chdir(project)
+    staged_wrapper = profile / "lsp/bin/typescript-language-server"
+    staged_wrapper.parent.mkdir(parents=True)
+    staged_wrapper.write_text("staged wrapper without SDK")
+    staged_wrapper.chmod(0o755)
+    package_tree = tmp_path / "global/node_modules"
+    sdk_root = package_tree / "typescript"
+    (sdk_root / "lib").mkdir(parents=True)
+    (sdk_root / "bin").mkdir()
+    (sdk_root / "package.json").write_text(json.dumps({"version": "6.0.3"}))
+    sdk = sdk_root / "lib/tsserver.js"
+    sdk.write_text("SDK prerequisite fixture")
+    sdk_binary = sdk_root / "bin/tsserver"
+    sdk_binary.write_text("SDK binary prerequisite fixture")
+    sdk_binary.chmod(0o755)
+    wrapper = package_tree / "typescript-language-server/bin/typescript-language-server"
+    wrapper.parent.mkdir(parents=True)
+    wrapper.write_text("PATH wrapper with SDK")
+    wrapper.chmod(0o755)
+    monkeypatch.setenv("PATH", str(wrapper.parent) + os.pathsep + str(sdk_binary.parent))
+    server = find_server_for_file(str(project / "test.ts"))
+    spec = server.build_spawn(str(project), ServerContext(str(project), install_strategy="manual"))
+    status = backend_status(str(project))
+    assert status["status"] == "prerequisites-present"
+    assert status["binary"] == spec.command[0] == str(wrapper)
+    assert status["sdk_path"] == spec.initialization_options["tsserver"]["path"] == str(sdk)
+    unrelated_file = sdk_root / "bin/unrelated"
+    unrelated_file.write_text("not a tsserver launcher")
+    for option_name in ("path", "fallbackPath"):
+        for supported in (str(sdk_binary), "tsserver", str(sdk_root), str(sdk.parent), str(sdk)):
+            resolved, _source = resolve_sdk(str(project), str(wrapper), {"tsserver": {option_name: supported}})
+            assert resolved == str(sdk), supported
+        for invalid in (str(sdk_root / "missing"), str(sdk_root / "missing.js"), str(project), str(unrelated_file)):
+            with pytest.raises(ValueError, match="Configured TypeScript"):
+                resolve_sdk(str(project), str(wrapper), {"tsserver": {option_name: invalid}})
+    # Discovery without either wrapper must not invoke any installer from status.
+    monkeypatch.setenv("PATH", "")
+    staged_wrapper.unlink()
+    assert backend_status(str(project))["status"] == "binary-missing"
+    untouched_profile = tmp_path / "untouched-profile"
+    monkeypatch.setenv("HERMES_HOME", str(untouched_profile))
+    assert backend_status(str(project))["status"] == "binary-missing"
+    assert not untouched_profile.exists()

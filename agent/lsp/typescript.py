@@ -28,9 +28,20 @@ def _sdk_file(value: str, root: str) -> Path | None:
     if not candidate.is_absolute():
         candidate = Path(shutil.which(value) or os.path.join(root, value))
     candidate = candidate.resolve()
-    if candidate.is_dir():
-        candidate = candidate / "tsserver.js"
-    if candidate.name != "tsserver.js" or not candidate.is_file():
+    if not candidate.exists():
+        return None
+    if candidate.is_file() and candidate.name not in {"tsserver.js", "tsserver", "tsserver.cmd", "tsserver.exe", "tsserver.bat"}:
+        return None
+    if not (candidate.name == "tsserver.js" and candidate.is_file()):
+        # TLS accepts package/lib directories and executables such as bin/tsserver:
+        # find their nearest package.json, then resolve that package's lib/tsserver.js.
+        directory = candidate.parent if candidate.is_file() else candidate
+        package_root = next((d for d in (directory, *directory.parents)
+                             if (d / "package.json").is_file()), None)
+        if package_root is None:
+            return None
+        candidate = package_root / "lib/tsserver.js"
+    if not candidate.is_file():
         return None
     # TLS itself needs package.json to identify the SDK version.
     package = candidate.parent.parent / "package.json"
@@ -84,11 +95,18 @@ def resolve_sdk(root: str, binary: str | None, initialization_options: dict[str,
     raise ValueError(f"TypeScript wrapper found but no usable SDK with lib/tsserver.js. {SDK_REPAIR}")
 
 
+def resolve_binary(command: list[str] | None = None) -> str | None:
+    """Shared read-only discovery: explicit command → PATH → active-profile staging."""
+    from agent.lsp.install import _existing_binary
+    if command:
+        return shutil.which(command[0]) or command[0]
+    return shutil.which("typescript-language-server") or _existing_binary("typescript-language-server")
+
+
 def backend_status(root: str, command: list[str] | None = None,
                    initialization_options: dict[str, Any] | None = None) -> dict[str, Any]:
     """Inspect prerequisites for the current workspace/profile; never install or spawn."""
-    from agent.lsp.install import _existing_binary
-    binary = (shutil.which(command[0]) or command[0]) if command else _existing_binary("typescript-language-server")
+    binary = resolve_binary(command)
     if not binary or not os.path.isfile(binary):
         return {"status": "binary-missing", "message": "TypeScript language-server command is missing."}
     try:

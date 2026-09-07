@@ -151,11 +151,13 @@ def _simple_spawn(server_id: str, which: Sequence[str], args: Sequence[str] = ()
 # ---- bespoke spawn builders ----
 
 def _spawn_typescript(root: str, ctx: ServerContext) -> Optional[SpawnSpec]:
-    from agent.lsp.typescript import resolve_sdk
+    from agent.lsp.typescript import resolve_binary, resolve_sdk
     override = ctx.binary_overrides.get("typescript")
     command = list(override) if override else None
-    binary = (shutil.which(command[0]) or command[0]) if command else _find_binary(
-        ctx, "typescript", ("typescript-language-server",), "typescript-language-server")
+    binary = resolve_binary(command)
+    if binary is None:
+        from agent.lsp.install import try_install
+        binary = try_install("typescript-language-server", ctx.install_strategy)
     if binary is None:
         return None
     spec = _make_spec(root, ctx, "typescript", command or [binary, "--stdio"], seed=True)

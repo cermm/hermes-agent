@@ -98,7 +98,9 @@ def _first_existing(*bases: Path) -> Optional[Path]:
 
 def _existing_binary(name: str) -> Optional[str]:
     """Probe the staging dir + PATH for a binary named ``name``."""
-    for staged in _native_binary_candidates(hermes_lsp_bin_dir() / name):
+    from hermes_constants import get_hermes_home
+
+    for staged in _native_binary_candidates(get_hermes_home() / "lsp" / "bin" / name):
         if staged.exists() and os.access(staged, os.X_OK):
             return str(staged)
     suffixes = ("", *_WINDOWS_WRAPPER_SUFFIXES) if _is_windows() else ("",)
