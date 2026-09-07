@@ -146,12 +146,13 @@ class LSPClient:
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
 
-        # Server → client requests; anything else gets method-not-found.
+        # Capability (un)registration is acknowledged, but some peers (Pyright)
+        # unregister while continuing to serve pulls. Only -32601 is definitive.
         self._request_handlers: Dict[str, Callable[[Any], Awaitable[Any]]] = {
             "window/workDoneProgress/create": self._handle_null,
             "workspace/configuration": self._handle_workspace_configuration,
-            "client/registerCapability": self._handle_register_capability,
-            "client/unregisterCapability": self._handle_unregister_capability,
+            "client/registerCapability": self._handle_null,
+            "client/unregisterCapability": self._handle_null,
             "workspace/workspaceFolders": self._handle_workspace_folders,
             "workspace/diagnostic/refresh": self._handle_null,
         }
@@ -438,20 +439,6 @@ class LSPClient:
 
     async def _handle_null(self, params: Any) -> Any:
         return None
-
-    async def _handle_register_capability(self, params: Any) -> None:
-        if isinstance(params, dict) and any(
-            item.get("method") == "textDocument/diagnostic"
-            for item in params.get("registrations", []) if isinstance(item, dict)
-        ):
-            self._pull_diagnostics_supported = True
-
-    async def _handle_unregister_capability(self, params: Any) -> None:
-        if isinstance(params, dict) and any(
-            item.get("method") == "textDocument/diagnostic"
-            for item in params.get("unregisterations", []) if isinstance(item, dict)
-        ):
-            self._pull_diagnostics_supported = False
 
     async def _handle_workspace_folders(self, params: Any) -> Any:
         return self._workspace_folders()
