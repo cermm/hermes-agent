@@ -109,12 +109,17 @@ class _DocState:
     push_version: int = -1
     pull_version: int = -1
     seed_seen: bool = False
+    seed_refresh_version: Optional[int] = None
+    seed_refresh_claimed: bool = False
+    sync_uncertain: bool = False
+    sync_inflight: bool = False
+    sync_push: Optional[tuple[int, List[Dict[str, Any]]]] = None
 
     def fresh_push(self, version: Optional[int] = None) -> bool:
-        return self.push_version >= (self.version if version is None else version)
+        return not self.sync_uncertain and self.push_version >= max(self.version, self.version if version is None else version)
 
     def fresh_pull(self, version: Optional[int] = None) -> bool:
-        return self.pull_version >= (self.version if version is None else version)
+        return not self.sync_uncertain and self.pull_version >= max(self.version, self.version if version is None else version)
 
     def fresh(self, version: Optional[int] = None) -> bool:
         return self.fresh_push(version) or self.fresh_pull(version)
@@ -143,6 +148,7 @@ class LSPClient:
         self._stderr_task: Optional[asyncio.Task] = None
         self._reader_task: Optional[asyncio.Task] = None
         self._cleanup_lock = asyncio.Lock()
+        self._document_sync_lock = asyncio.Lock()
         self._next_id: int = 0
         self._pending: Dict[int, asyncio.Future] = {}
 
@@ -471,14 +477,20 @@ class LSPClient:
         is_seed = self._seed_first_push and not doc.seed_seen
         doc.seed_seen = True
         doc.push = diagnostics if isinstance(diagnostics, list) else []
-        if is_seed:
-            # First push is baseline data only: it predates any didChange we sent,
-            # so it's stored WITHOUT a freshness tag and never satisfies a waiter.
-            return
+        quarantine = is_seed and not (type(version) is int and version == doc.version)
+        if quarantine and doc.version > 0:
+            # A cold baseline can time out before this first notification. Its
+            # arrival after an edit does not prove it describes that edit.
+            doc.seed_refresh_version = doc.version
         # Tag with the echoed version when provided; otherwise credit the current
         # version (a push observed after our change describes it or newer).  doc.version
         # is -1 for never-opened paths (relatedDocuments spillover), keeping them unfresh.
-        doc.push_version = version if isinstance(version, int) else doc.version
+        if not quarantine and doc.sync_inflight and type(version) is int and version == doc.version:
+            # The peer can reply after receiving the frame but before drain
+            # completes. Retain an exact-generation reply without attesting yet.
+            doc.sync_push = (version, doc.push)
+        elif not (quarantine or doc.seed_refresh_version is not None or doc.sync_uncertain):
+            doc.push_version = version if type(version) is int else doc.version
         # Keep the Event sticky-set so in-progress waits resolve; waiters
         # compare ``_push_counter`` to detect a genuinely new push.
         self._push_counter += 1
@@ -488,6 +500,10 @@ class LSPClient:
 
     async def open_file(self, path: str, *, language_id: str = "plaintext") -> int:
         """Send didOpen (first time) or didChange (subsequent); return the new document version."""
+        async with self._document_sync_lock:
+            return await self._open_file_locked(path, language_id=language_id)
+
+    async def _open_file_locked(self, path: str, *, language_id: str) -> int:
         if not self.is_running:
             raise LSPProtocolError("client not running")
         abs_path = os.path.abspath(path)
@@ -511,17 +527,49 @@ class LSPClient:
                 {"textDocument": {"uri": uri, "languageId": language_id, "version": 0, "text": text}},
             )
             return 0
+        return await self._change_file_text(abs_path, doc, text)
+
+    async def _change_file_text(self, path: str, doc: _DocState, text: str) -> int:
+        """Serialize with open_file; reserve versions even if a write is cancelled."""
         change: Dict[str, Any] = {"text": text}
-        if self._sync_kind == 2:
+        if self._sync_kind == 2 and not doc.sync_uncertain:
             change["range"] = {"start": {"line": 0, "character": 0}, "end": _end_position(doc.text)}
         new_version = doc.version + 1
-        await self._send_notification(
-            "textDocument/didChange",
-            {"textDocument": {"uri": uri, "version": new_version}, "contentChanges": [change]},
-        )
-        # Bumping the version is the whole invalidation story (see _DocState).
+        # A cancelled drain may already have sent bytes. Never reuse its version
+        # or report freshness; the next edit can recover with a full replacement.
         doc.version, doc.text = new_version, text
+        doc.sync_uncertain = True
+        doc.sync_push = None
+        self._require_open("textDocument/didChange")
+        doc.sync_inflight = True
+        try:
+            await self._write(make_notification("textDocument/didChange", {
+                "textDocument": {"uri": file_uri(path), "version": new_version}, "contentChanges": [change]}))
+            doc.sync_uncertain = False
+            if (self._docs.get(path) is doc and doc.version == new_version
+                    and doc.sync_push is not None and self._connection_is_open()):
+                doc.push_version, doc.push = doc.sync_push
+        except _WRITE_ERRORS as exc:
+            raise LSPProtocolError(f"document sync failed: {exc}") from exc
+        finally:
+            doc.sync_inflight = False
+            doc.sync_push = None
         return new_version
+
+    async def _refresh_seed(self, path: str, doc: _DocState) -> None:
+        """One equivalent change, owned by a waiter; a newer edit supersedes it.
+
+        This requests another calculation, not a protocol ordering barrier:
+        subsequent unversioned pushes retain the normal current-version
+        assumption. A server may suppress a repeated empty publication, in
+        which case the caller receives no verdict, not checked-clean.
+        """
+        try:
+            async with self._document_sync_lock:
+                if self._docs.get(path) is doc and doc.version == doc.seed_refresh_version:
+                    await self._change_file_text(path, doc, doc.text)
+        finally:
+            doc.seed_refresh_version = None
 
     async def save_file(self, path: str) -> None:
         """Send didSave for ``path``.  Some linters re-scan only on save."""
@@ -619,11 +667,26 @@ class LSPClient:
             if not self._connection_is_open():
                 raise LSPProtocolError("server connection closed while waiting for diagnostics")
             doc = self._docs.get(path)
+            if doc and doc.seed_refresh_version is not None and not doc.seed_refresh_claimed:
+                # Claim before any await: concurrent/later waiters cannot repeat
+                # this attempt, including when cancellation or backpressure wins.
+                doc.seed_refresh_claimed = True
+                remaining = deadline - now()
+                if remaining <= 0:
+                    doc.seed_refresh_version = None
+                    return
+                try:
+                    await asyncio.wait_for(self._refresh_seed(path, doc), remaining)
+                except asyncio.TimeoutError:
+                    return
+                finally:
+                    doc.seed_refresh_version = None
+                continue
             if doc and doc.fresh_push(version):
                 # Debounce: TS often emits in pairs.  Snapshot the counter so
                 # we wake on a *new* push, not the one that just satisfied us.
                 debounce_baseline = self._push_counter
-                debounce_deadline = now() + PUSH_DEBOUNCE
+                debounce_deadline = min(deadline, now() + PUSH_DEBOUNCE)
                 while self._push_counter == debounce_baseline:
                     remaining = debounce_deadline - now()
                     if remaining <= 0 or not await self._await_push(remaining):
