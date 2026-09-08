@@ -1037,7 +1037,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         for p in (src, dst):
             denied = get_write_denied_error(p, verb="Move")
             if denied:
-                return self._unchecked_lsp_result(WriteResult(error=denied), path, "write_failed")
+                return self._unchecked_lsp_result(WriteResult(error=denied), p, "write_failed", "move")
         result = self._exec(f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}")
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")
@@ -1325,9 +1325,16 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         if file_ending:
             new_content = _normalize_line_endings(new_content, file_ending)
         write_result = self.write_file(path, new_content, pre_content=raw_content)
+        write_verification = getattr(write_result, "lsp_verification", None)
+        if write_verification is None:
+            # Legacy providers may override write_file without the additive field.
+            # Preserve the single write and report its unverified semantic scope.
+            from agent.lsp.outcome import operation_outcome, verification
+            write_verification = verification([operation_outcome(
+                path, "replace", "write_failed" if write_result.error else "legacy_provider")])
         if write_result.error:
             return PatchResult(error=f"Failed to write changes: {write_result.error}",
-                               lsp_verification=write_result.lsp_verification)
+                               lsp_verification=write_verification)
         verify_error = self._verify_patch_persisted(path, new_content)
         if verify_error is not None:
             return self._unchecked_lsp_result(verify_error, path, "verification_failed")
@@ -1336,7 +1343,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
             # From the internal write_file call, whose baseline was the pre-patch content.
-            lsp_diagnostics=write_result.lsp_diagnostics, lsp_verification=write_result.lsp_verification)
+            lsp_diagnostics=write_result.lsp_diagnostics, lsp_verification=write_verification)
 
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /

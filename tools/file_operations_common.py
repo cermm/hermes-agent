@@ -42,9 +42,9 @@ class WriteResult:
     # LSP semantic diagnostics, kept separate from ``lint`` (syntax) so the model
     # reads the two as independent signals. None when LSP is off/inapplicable.
     lsp_diagnostics: Optional[str] = None
-    lsp_verification: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     warning: Optional[str] = None
+    lsp_verification: Optional[Dict[str, Any]] = None
 
     def to_dict(self) -> dict:
         return {k: v for k, v in self.__dict__.items() if v is not None}
@@ -60,11 +60,11 @@ class PatchResult:
     files_deleted: List[str] = field(default_factory=list)
     lint: Optional[Dict[str, Any]] = None
     lsp_diagnostics: Optional[str] = None  # see WriteResult.lsp_diagnostics
-    lsp_verification: Optional[Dict[str, Any]] = None
     error: Optional[str] = None
     # Success-shaped no-op: the edit was already present, nothing written; ``note`` says why.
     no_change: bool = False
     note: Optional[str] = None
+    lsp_verification: Optional[Dict[str, Any]] = None
 
     # Emission order is part of the output contract.
     _DICT_FIELDS: ClassVar[tuple] = (
