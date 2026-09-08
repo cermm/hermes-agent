@@ -1804,7 +1804,7 @@ def _normalize_post_delivery_callbacks(entry: Any) -> list[dict]:
         return [{"generation": generation, "callback": callback, "owner_token": None}]
     return [{"generation": None, "callback": entry, "owner_token": None}]
 
-def _compose_post_delivery_callbacks(entries: list[dict]) -> Callable | None:
+def _compose_post_delivery_callbacks(entries: list[dict], *, inflight: set | None = None) -> Callable | None:
     """Compose callback records into the historical single-callable API.
 
     Multiple selected records must be owner-isolated: one stuck callback cannot
@@ -1829,6 +1829,8 @@ def _compose_post_delivery_callbacks(entries: list[dict]) -> Callable | None:
             logger.debug("Post-delivery callback failed", exc_info=True)
 
     def _consume_task_exception(task: asyncio.Task) -> None:
+        if inflight is not None:
+            inflight.discard(task)
         try:
             task.exception()
         except (asyncio.CancelledError, Exception):
@@ -1836,6 +1838,8 @@ def _compose_post_delivery_callbacks(entries: list[dict]) -> Callable | None:
 
     async def _chained() -> None:
         tasks = [asyncio.create_task(_run_callback(callback)) for callback in callbacks]
+        if inflight is not None:
+            inflight.update(tasks)
         for task in tasks:
             task.add_done_callback(_consume_task_exception)
         try:
@@ -3210,7 +3214,7 @@ class BasePlatformAdapter(ABC):
             self._post_delivery_callbacks[session_key] = remaining
         else:
             self._post_delivery_callbacks.pop(session_key, None)
-        return _compose_post_delivery_callbacks(selected)
+        return _compose_post_delivery_callbacks(selected, inflight=_lazy_attr(self, "_inflight_post_delivery_callbacks", set))
 
     # ── Processing lifecycle hooks (Discord 👀/✅/❌ reactions). Adapters exposing
     # ``_add_reaction(chat_id, message_id, emoji)`` / ``_remove_reaction(chat_id, message_id)``
@@ -3987,7 +3991,24 @@ class BasePlatformAdapter(ABC):
             with contextlib.suppress(asyncio.TimeoutError, Exception):
                 _post_result = _post_cb()
                 if inspect.isawaitable(_post_result):
-                    await asyncio.wait_for(_post_result, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                    # wait_for waits for cancellation acknowledgement and can exceed
+                    # its deadline indefinitely. Retain the callback until it really
+                    # exits, but bound the session's wait independently of that exit.
+                    callback_task = asyncio.ensure_future(_post_result)
+                    inflight = _lazy_attr(self, "_inflight_post_delivery_callbacks", set)
+                    inflight.add(callback_task)
+
+                    def completed(task):
+                        inflight.discard(task)
+                        with contextlib.suppress(asyncio.CancelledError, Exception):
+                            task.result()
+
+                    callback_task.add_done_callback(completed)
+                    try:
+                        await asyncio.wait({callback_task}, timeout=_POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS)
+                    finally:
+                        if not callback_task.done():
+                            callback_task.cancel()
 
     def _finish_session_task(self, session_key: str, interrupt_event: asyncio.Event) -> None:
         """End-of-task guard/ownership reconciliation. A late ``_pending_messages`` arrival must not

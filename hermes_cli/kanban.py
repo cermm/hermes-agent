@@ -475,6 +475,8 @@ def _cmd_show(args: argparse.Namespace) -> int:
             return _err(f"no such task: {args.task_id}")
         comments = kb.list_comments(conn, args.task_id)
         events = kb.list_events(conn, args.task_id)
+        from hermes_cli.kanban_db_identity import board_identity
+        identity = board_identity(conn)
         parents = kb.parent_ids(conn, args.task_id)
         children = kb.child_ids(conn, args.task_id)
         runs = kb.list_runs(conn, args.task_id, **rsk)
@@ -485,9 +487,12 @@ def _cmd_show(args: argparse.Namespace) -> int:
 
     if want_json:
         _print_json({
+            "board": kb.get_current_board(),
+            "board_identity": identity,
             "task": _task_to_dict(task), "latest_summary": latest_summary, "parents": parents, "children": children,
             "comments": [_obj_dict(c, ("author", "body", "created_at")) for c in comments],
-            "events": [_obj_dict(e, ("kind", "payload", "created_at", "run_id")) for e in events],
+            "events": [_obj_dict(e, ("id", "kind", "payload", "created_at", "run_id")) for e in events],
+            "task_generation": max((e.id for e in events), default=None),
             "runs": [_obj_dict(r, _SHOW_RUN_FIELDS) for r in runs],
         })
         return 0

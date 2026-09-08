@@ -2149,6 +2149,9 @@ def _claim_and_open_run(
 def claim_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_task_event_id: Optional[int] = None,
+    expected_board_identity: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomically transition ``ready -> running``.
 
@@ -2159,6 +2162,12 @@ def claim_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Generation check belongs in the same transaction as the claim CAS.
+        # A stale targeted request must not reclaim, demote, or open any run.
+        if expected_task_event_id is not None:
+            from hermes_cli.kanban_db_identity import target_snapshot_matches
+            if not target_snapshot_matches(conn, task_id, expected_task_event_id, expected_board_identity, expected_assignee):
+                return None
         # Single enforcement point: never ready -> running with an undone
         # parent, whichever writer set 'ready'. Demote to 'todo';
         # recompute_ready re-promotes when the parents finish.
@@ -2184,6 +2193,9 @@ def claim_task(
 def claim_review_task(
     conn: sqlite3.Connection, task_id: str, *, ttl_seconds: Optional[int] = None,
     claimer: Optional[str] = None,
+    expected_task_event_id: Optional[int] = None,
+    expected_board_identity: Optional[str] = None,
+    expected_assignee: Optional[str] = None,
 ) -> Optional[Task]:
     """Atomic ``review -> running`` (None when lost). Parents are re-checked
     (one may have reopened meanwhile) and a NEW run tracks the reviewer
@@ -2192,6 +2204,12 @@ def claim_review_task(
     lock = claimer or _claimer_id()
     expires = now + _resolve_claim_ttl_seconds(ttl_seconds)
     with write_txn(conn):
+        # Generation check belongs in the same transaction as the claim CAS.
+        # A stale targeted request must not reclaim, demote, or open any run.
+        if expected_task_event_id is not None:
+            from hermes_cli.kanban_db_identity import target_snapshot_matches
+            if not target_snapshot_matches(conn, task_id, expected_task_event_id, expected_board_identity, expected_assignee):
+                return None
         if not _parents_satisfied(conn, task_id):
             demoted = conn.execute(
                 "UPDATE tasks SET status = 'todo' "
@@ -2550,6 +2568,8 @@ def complete_task(
     summary: Optional[str] = None, metadata: Optional[dict] = None,
     created_cards: Optional[Iterable[str]] = None, expected_run_id: Optional[int] = None,
     fire_lifecycle_hook: bool = True,
+    expected_worker_pid: Optional[int] = None,
+    expected_board_identity: Optional[str] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2561,6 +2581,12 @@ def complete_task(
     :class:`HallucinatedCardsError` after an auditable event; afterwards the
     prose is scanned for unresolvable ``t_<hex>`` refs (advisory event only).
     """
+    if expected_worker_pid is not None and (type(expected_worker_pid) is not int or expected_worker_pid <= 0 or expected_run_id is None):
+        raise ValueError("worker finalization requires an exact run and positive worker PID")
+    if expected_board_identity is not None:
+        from hermes_cli.kanban_db_identity import board_identity
+        if board_identity(conn) != expected_board_identity:
+            return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2571,6 +2597,8 @@ def complete_task(
     )
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
+        if expected_board_identity is not None and board_identity(conn) != expected_board_identity:
+            return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
         if not _parents_satisfied(conn, task_id):
@@ -2593,6 +2621,9 @@ def complete_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if expected_worker_pid is not None:
+            sql += " AND status='running' AND EXISTS (SELECT 1 FROM task_runs r WHERE r.id=tasks.current_run_id AND r.task_id=tasks.id AND r.status='running' AND r.worker_pid=?)"
+            params = (*params, expected_worker_pid)
         if conn.execute(sql, params).rowcount != 1:
             return False
         if isinstance(metadata, dict):
@@ -2919,13 +2950,21 @@ def edit_completed_task_result(
 def block_task(
     conn: sqlite3.Connection, task_id: str, *, reason: Optional[str] = None,
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
+    expected_worker_pid: Optional[int] = None,
+    expected_board_identity: Optional[str] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
     so a forever-flaky task escalates. True on any transition."""
+    if expected_worker_pid is not None and (type(expected_worker_pid) is not int or expected_worker_pid <= 0 or expected_run_id is None):
+        raise ValueError("worker finalization requires an exact run and positive worker PID")
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
+        if expected_board_identity is not None:
+            from hermes_cli.kanban_db_identity import board_identity
+            if board_identity(conn) != expected_board_identity:
+                return False
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -2950,6 +2989,9 @@ def block_task(
         if expected_run_id is not None:
             sql += " AND current_run_id = ?"
             params = (*params, int(expected_run_id))
+        if expected_worker_pid is not None:
+            sql += " AND status='running' AND EXISTS (SELECT 1 FROM task_runs r WHERE r.id=tasks.current_run_id AND r.task_id=tasks.id AND r.status='running' AND r.worker_pid=?)"
+            params = (*params, expected_worker_pid)
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
