@@ -126,20 +126,78 @@ def test_unicode_lease_json_is_read_as_utf8(tmp_path):
     assert lease_valid(spec)
 
 
-def make_spec(tmp_path, code, seconds=12):
+def make_spec(tmp_path, code, seconds=12, *, python_executable="/usr/bin/python3"):
     state, workspace = tmp_path / "private", tmp_path / "workspace"
     state.mkdir(mode=0o700)
     workspace.mkdir()
     script = workspace / "probe.py"
     script.write_text(code)
+    # CI system-bin directories also contain mutable links to unrelated tools.
+    # Select the resolved executable, not that whole ambient tool collection.
+    executable = str(Path(python_executable).resolve(strict=True))
     return GuardSpec(
         permit_id=tmp_path.name, scope={"board": "fixture", "task": "exact", "run": "r1", "generation": 3, "fence": 9},
-        command=("/usr/bin/python3", "/workspace/probe.py"),
-        read_only_paths=("/usr/bin", "/usr/lib/x86_64-linux-gnu", "/usr/lib/python3.12", "/usr/lib64"),
+        command=(executable, "/workspace/probe.py"),
+        read_only_paths=(executable, "/usr/lib/x86_64-linux-gnu", "/usr/lib/python3.12", "/usr/lib64"),
         workspace=str(workspace), state_dir=str(state), lease_path=str(state / "lease.json"),
         controller=ProcessIdentity.capture(os.getpid()), deadline_monotonic=time.monotonic() + seconds,
         process_limit=16,
     )
+
+
+def _ci_style_python(tmp_path):
+    tools = tmp_path / "system-bin"
+    cache = tmp_path / "tool-cache"
+    tools.mkdir()
+    cache.mkdir()
+    executable = cache / "python3"
+    shutil.copy2(Path("/usr/bin/python3").resolve(strict=True), executable)
+    selected = tools / "python3"
+    selected.symlink_to(executable)
+    unrelated = tmp_path / "mutable-unselected-tool"
+    unrelated.write_text("inert unselected tool", encoding="utf-8")
+    unrelated.chmod(0o666)
+    (tools / "unrelated").symlink_to(unrelated)
+    return selected, unrelated
+
+
+@pytest.mark.linux_only
+def test_ci_style_symlinked_python_selects_only_its_resolved_binary(tmp_path):
+    from hermes_cli.worker_guard import _validate_runtime_tree
+
+    selected, unrelated = _ci_style_python(tmp_path)
+    spec = make_spec(tmp_path, "pass", python_executable=str(selected))
+    spec.validate()
+    assert Path(spec.command[0]).samefile(selected)
+    assert str(selected.resolve(strict=True)) in spec.read_only_paths
+    assert str(selected.parent) not in spec.read_only_paths
+    # A trusted system directory is not permission for an unrelated link to a
+    # writable tool-cache target, even when the Python target itself is trusted.
+    with pytest.raises(GuardError, match="unsafe nested runtime symlink target"):
+        _validate_runtime_tree(selected.parent, True, (selected.resolve().parent,), (), time.monotonic() + 5)
+    with pytest.raises(GuardError, match="unsafe nested runtime symlink"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(selected.parent))).validate()
+    assert unrelated.read_text(encoding="utf-8") == "inert unselected tool"
+
+
+@pytest.mark.linux_only
+def test_ci_style_symlinked_python_executes_without_exposing_other_tools(tmp_path, namespace_capability):
+    selected, unrelated = _ci_style_python(tmp_path)
+    code = ("import json\nfrom pathlib import Path\n"
+            + f"result={{'executed':True,'unselected_visible':Path({str(unrelated)!r}).exists()}}\n"
+            + "Path('/workspace/result.json').write_text(json.dumps(result),encoding='utf-8')")
+    spec = make_spec(tmp_path, code, python_executable=str(selected))
+    handle, server = run_probe(spec)
+    try:
+        receipt = handle.wait()
+        assert receipt["exit_verified"] and receipt["artifacts_exported"]
+        result = json.loads((Path(receipt["artifacts_path"]) / "result.json").read_text(encoding="utf-8"))
+        assert result == {"executed": True, "unselected_visible": False}
+    finally:
+        server.close()
+        if handle.process.poll() is None:
+            handle.stop()
+            handle.wait()
 
 
 def run_probe(spec):
@@ -568,7 +626,7 @@ def test_first_pass_copied_native_mount_validation_preserves_startup_lease_margi
     policy.write_text("{}", encoding="utf-8")
     spec = make_spec(tmp_path, "pass", seconds=30)
     spec = replace(spec, command=(sys.executable, "/workspace/probe.py"),
-                   read_only_paths=(*spec.read_only_paths, str(Path(sys.base_prefix).resolve().parent),
+                   read_only_paths=("/usr/bin", *spec.read_only_paths[1:], str(Path(sys.base_prefix).resolve().parent),
                                     str(Path(sys.prefix)), str(copied), str(policy)))
     # First traversal of fresh source inodes, with no cached validation receipt.
     # Slow pre-authorization I/O must not consume the actual five-second lease.
@@ -800,6 +858,7 @@ def test_parent_death_armed_after_reparenting_cannot_execute(tmp_path):
 @pytest.mark.linux_only
 def test_independent_guardian_observes_controller_death(tmp_path, namespace_capability):
     module_root = Path(__file__).resolve().parents[2]
+    executable = str(Path("/usr/bin/python3").resolve(strict=True))
     script = tmp_path / "controller.py"
     script.write_text(
         "import os,sys,time,socket,json,threading\nfrom pathlib import Path\n"
@@ -807,8 +866,8 @@ def test_independent_guardian_observes_controller_death(tmp_path, namespace_capa
         + f"base=Path({str(tmp_path)!r})\n"
         + "state=base/'private';state.mkdir(mode=0o700)\nworkspace=base/'workspace';workspace.mkdir()\n"
         + "(workspace/'probe.py').write_text('import time\\nwhile True: time.sleep(1)\\n')\n"
-        + "spec=GuardSpec('controller-exit',{'run':'exact'},('/usr/bin/python3','/workspace/probe.py'),"
-        + "('/usr/bin','/usr/lib/x86_64-linux-gnu','/usr/lib/python3.12','/usr/lib64'),str(workspace),str(state),str(state/'lease.json'),ProcessIdentity.capture(os.getpid()),time.monotonic()+20)\n"
+        + f"spec=GuardSpec('controller-exit',{{'run':'exact'}},({executable!r},'/workspace/probe.py'),"
+        + f"({executable!r},'/usr/lib/x86_64-linux-gnu','/usr/lib/python3.12','/usr/lib64'),str(workspace),str(state),str(state/'lease.json'),ProcessIdentity.capture(os.getpid()),time.monotonic()+20)\n"
         + "renew_lease(spec.lease_path,spec,5)\ndef renew():\n    while True:\n        renew_lease(spec.lease_path,spec,2)\n        time.sleep(.2)\nthreading.Thread(target=renew,daemon=True).start()\na,b=socket.socketpair()\nhandle=launch_guard(spec,b.fileno())\nb.close()\n"
         + "(base/'ready').write_text(str(handle.receipt_path))\nwhile True: time.sleep(1)\n"
     )
