@@ -13,6 +13,81 @@ GOOD = 'count: int = 1\n'
 BAD = 'count: int = "bad"\n'
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("finish", ["success", "failed", "cancelled", "stale", "unversioned"])
+async def test_reply_received_before_send_completion_requires_successful_current_sync(tmp_path, finish):
+    document = tmp_path / "source.py"
+    client = LSPClient(server_id="cold-seed", workspace_root=str(tmp_path),
+                       command=[sys.executable, PEER], seed_diagnostics_on_first_push=True)
+    transmitted, release, observed = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    waiter = None
+    try:
+        waiter = await late_edit(client, document)
+        version = client._docs[str(document)].version
+        write = client._write
+
+        async def held_completion(message):
+            await write(message)
+            if (message.get("method") == "textDocument/didChange"
+                    and message["params"]["textDocument"]["version"] == version + 1):
+                transmitted.set()
+                await release.wait()
+                if finish == "failed":
+                    raise BrokenPipeError("controlled completion failure")
+
+        handler = client._notification_handlers["textDocument/publishDiagnostics"]
+
+        def observe(params):
+            handler(params)
+            if transmitted.is_set():
+                observed.set()
+
+        client._write = held_completion
+        client._notification_handlers["textDocument/publishDiagnostics"] = observe
+        await client._send_request("test/seed", {"kind": "unversioned-stale"})
+        await asyncio.wait_for(transmitted.wait(), 2)
+        # A real peer has received the frame; its only response precedes the
+        # caller's successful drain, failed completion, or cancellation.
+        tag = None if finish == "unversioned" else version if finish == "stale" else version + 1
+        await client._send_request("test/publish", {"text": BAD, "version": tag})
+        await asyncio.wait_for(observed.wait(), 2)
+        assert not client._docs[str(document)].fresh()
+        if finish == "cancelled":
+            waiter.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+        else:
+            release.set()
+            if finish == "failed":
+                with pytest.raises(LSPProtocolError, match="document sync failed"):
+                    await waiter
+            elif finish == "success":
+                assert await waiter, "The only current reply was lost during successful send completion"
+                assert client.diagnostics_for(str(document), fresh_only=True)[0]["code"] == "bad-assignment"
+            else:
+                assert not await waiter
+        if finish != "success":
+            assert not client._docs[str(document)].fresh()
+        state = await client._send_request("test/state", {})
+        assert len(state["changes"]) == 2 and state["pulls"] == 1
+        # Neither failed completion nor an ineligible reply poisons a later edit.
+        release.set()
+        client._write = write
+        document.write_text(GOOD)
+        latest = await client.open_file(str(document))
+        await client._send_request("test/release", {})
+        assert await client.wait_for_diagnostics(str(document), latest)
+        assert client.diagnostics_for(str(document), fresh_only=True) == []
+    finally:
+        release.set()
+        if waiter and not waiter.done():
+            waiter.cancel()
+            await asyncio.gather(waiter, return_exceptions=True)
+        proc = client._proc
+        await client.shutdown()
+        assert proc is None or proc.returncode is not None
+
+
 async def late_edit(client, document, current=BAD):
     document.write_text(GOOD)
     await client.start()

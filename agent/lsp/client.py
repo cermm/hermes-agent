@@ -112,6 +112,8 @@ class _DocState:
     seed_refresh_version: Optional[int] = None
     seed_refresh_claimed: bool = False
     sync_uncertain: bool = False
+    sync_inflight: bool = False
+    sync_push: Optional[tuple[int, List[Dict[str, Any]]]] = None
 
     def fresh_push(self, version: Optional[int] = None) -> bool:
         return not self.sync_uncertain and self.push_version >= max(self.version, self.version if version is None else version)
@@ -483,7 +485,11 @@ class LSPClient:
         # Tag with the echoed version when provided; otherwise credit the current
         # version (a push observed after our change describes it or newer).  doc.version
         # is -1 for never-opened paths (relatedDocuments spillover), keeping them unfresh.
-        if not (quarantine or doc.seed_refresh_version is not None or doc.sync_uncertain):
+        if not quarantine and doc.sync_inflight and type(version) is int and version == doc.version:
+            # The peer can reply after receiving the frame but before drain
+            # completes. Retain an exact-generation reply without attesting yet.
+            doc.sync_push = (version, doc.push)
+        elif not (quarantine or doc.seed_refresh_version is not None or doc.sync_uncertain):
             doc.push_version = version if type(version) is int else doc.version
         # Keep the Event sticky-set so in-progress waits resolve; waiters
         # compare ``_push_counter`` to detect a genuinely new push.
@@ -533,13 +539,21 @@ class LSPClient:
         # or report freshness; the next edit can recover with a full replacement.
         doc.version, doc.text = new_version, text
         doc.sync_uncertain = True
+        doc.sync_push = None
         self._require_open("textDocument/didChange")
+        doc.sync_inflight = True
         try:
             await self._write(make_notification("textDocument/didChange", {
                 "textDocument": {"uri": file_uri(path), "version": new_version}, "contentChanges": [change]}))
+            doc.sync_uncertain = False
+            if (self._docs.get(path) is doc and doc.version == new_version
+                    and doc.sync_push is not None and self._connection_is_open()):
+                doc.push_version, doc.push = doc.sync_push
         except _WRITE_ERRORS as exc:
             raise LSPProtocolError(f"document sync failed: {exc}") from exc
-        doc.sync_uncertain = False
+        finally:
+            doc.sync_inflight = False
+            doc.sync_push = None
         return new_version
 
     async def _refresh_seed(self, path: str, doc: _DocState) -> None:
