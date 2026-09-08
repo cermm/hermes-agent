@@ -276,7 +276,7 @@ def test_watchdog_and_kernel_parent_death_end_namespace(tmp_path, failure, names
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("alias", ["direct", "hardlink"])
+@pytest.mark.parametrize("alias", ["direct", "hardlink", "nested_name", "nested_hardlink"])
 def test_inert_credential_fixture_cannot_cross_actual_containment(tmp_path, monkeypatch, alias):
     home = tmp_path / "synthetic-home"
     secret = home / ".ssh" / "custom_key"
@@ -286,7 +286,21 @@ def test_inert_credential_fixture_cannot_cross_actual_containment(tmp_path, monk
     if alias == "hardlink":
         mount = tmp_path / "runtime-key"
         os.link(secret, mount)
-    spec = make_spec(tmp_path, f"from pathlib import Path\nPath('/workspace/leaked.txt').write_bytes(Path({str(mount)!r}).read_bytes())")
+    exposed = mount
+    if alias.startswith("nested_"):
+        mount = tmp_path / "selected-runtime"
+        exposed = mount / "package" / ("auth.json" if alias == "nested_name" else "ordinary.data")
+        exposed.parent.mkdir(parents=True)
+        if alias == "nested_hardlink":
+            try:
+                os.link(secret, exposed)
+            except OSError as error:
+                if error.errno not in {18, 38, 95}:
+                    raise
+                pytest.skip("Fixture filesystem does not support hardlinks")
+        else:
+            exposed.write_bytes(secret.read_bytes())
+    spec = make_spec(tmp_path, f"from pathlib import Path\nPath('/workspace/leaked.txt').write_bytes(Path({str(exposed)!r}).read_bytes())")
     spec = replace(spec, read_only_paths=(*spec.read_only_paths, str(mount)))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
     try:
@@ -304,6 +318,78 @@ def test_inert_credential_fixture_cannot_cross_actual_containment(tmp_path, monk
         if handle.process.poll() is None:
             handle.stop()
             handle.wait()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("relative", [
+    "package/.env", "package/auth.json", "package/credentials", "package/credentials.json",
+    "package/id_rsa", "package/id_ed25519", "package/.ssh/custom_key",
+    "package/.aws/token", "package/.azure/token", "package/.config/token", "package/.hermes/token",
+])
+def test_nested_credential_names_are_refused_before_launch(tmp_path, relative):
+    mount = tmp_path / "selected-runtime"
+    credential = mount / relative
+    credential.parent.mkdir(parents=True)
+    credential.write_text("inert fixture", encoding="utf-8")
+    spec = make_spec(tmp_path, "raise AssertionError('nested credentials must not launch')")
+    with pytest.raises(GuardError, match="credential"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(mount))).validate()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "late_credential", "completed_child", "completed_mount", "unreadable"])
+def test_recursive_runtime_inspection_fails_closed_on_unsafe_nodes_and_changes(tmp_path, monkeypatch, kind):
+    mount = tmp_path / "selected-runtime"
+    nested = mount / "package"
+    nested.mkdir(parents=True)
+    safe = nested / "ordinary.data"
+    safe.write_text("ordinary fixture", encoding="utf-8")
+    if kind == "symlink":
+        (nested / "alias").symlink_to(safe)
+    elif kind == "fifo":
+        os.mkfifo(nested / "pipe")
+    elif kind == "unreadable":
+        nested.chmod(0)
+    else:
+        original = os.scandir
+        target_identity = (nested.stat().st_dev, nested.stat().st_ino)
+        if kind in {"completed_child", "completed_mount"}:
+            later = (mount if kind == "completed_child" else tmp_path) / "later"
+            later.mkdir()
+            (later / "ordinary.data").write_text("later sibling", encoding="utf-8")
+            target_identity = (later.stat().st_dev, later.stat().st_ino)
+
+        class MutatingScan:
+            def __init__(self, fd, mutate):
+                self.scan = original(fd)
+                self.mutate = mutate
+
+            def __enter__(self):
+                return iter(sorted(self.scan, key=lambda entry: entry.name == "later"))
+
+            def __exit__(self, *args):
+                self.scan.close()
+                if self.mutate:
+                    (nested / "auth.json").write_text("late inert credential", encoding="utf-8")
+
+        def changing_scan(fd):
+            info = os.fstat(fd)
+            if (info.st_dev, info.st_ino) == target_identity:
+                return MutatingScan(fd, True)
+            if (info.st_dev, info.st_ino) == (mount.stat().st_dev, mount.stat().st_ino):
+                return MutatingScan(fd, False)
+            return original(fd)
+
+        monkeypatch.setattr(os, "scandir", changing_scan)
+    spec = make_spec(tmp_path, "raise AssertionError('unsafe directory must not launch')")
+    mounts = (*spec.read_only_paths, str(mount))
+    if kind == "completed_mount":
+        mounts = (*mounts, str(later))
+    try:
+        with pytest.raises(GuardError, match="runtime|credential"):
+            replace(spec, read_only_paths=mounts).validate()
+    finally:
+        nested.chmod(0o700)
 
 
 @pytest.mark.linux_only

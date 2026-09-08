@@ -55,6 +55,113 @@ def digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, separators=(",", ":"), allow_nan=False).encode()).hexdigest()
 
 
+_CREDENTIAL_NAMES = frozenset({".env", "auth.json", "credentials", "credentials.json",
+                               "id_rsa", "id_ed25519", ".ssh", ".aws", ".azure", ".config", ".hermes"})
+
+
+def _mount_node_identity(info: os.stat_result) -> tuple:
+    return (info.st_dev, info.st_ino, info.st_mode, info.st_uid, info.st_gid,
+            info.st_nlink, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _verify_runtime_witnesses(witnesses: list[tuple], deadline: float) -> None:
+    try:
+        for path, identity, target, target_identity in witnesses:
+            if time.monotonic() >= deadline:
+                raise GuardError("runtime credential inspection bound exceeded")
+            if _mount_node_identity(path.lstat()) != identity:
+                raise GuardError("runtime node changed during credential inspection")
+            if target is not None and (path.resolve(strict=True) != target
+                                       or _mount_node_identity(target.stat()) != target_identity):
+                raise GuardError("runtime symlink target changed during credential inspection")
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, GuardError):
+            raise
+        raise GuardError("runtime credential readback failed") from error
+
+
+def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tuple[Path, ...],
+                           credential_roots: tuple[Path, ...], deadline: float) -> list[tuple]:
+    """Inspect nested nodes without following directory aliases or hiding I/O errors.
+
+    Exact interpreter trees already carry executable-equivalent trust and uv may
+    hardlink their packages. That exception never permits nested credential names.
+    Ordinary selected source/data directories get no such hardlink exception.
+    """
+    count = 0
+    witnesses = []
+
+    def walk(fd: int, directory: Path, depth: int) -> None:
+        nonlocal count
+        before = os.fstat(fd)
+        witnesses.append((directory, _mount_node_identity(before), None, None))
+        if depth > 64:
+            raise GuardError("runtime credential inspection depth exceeded")
+        with os.scandir(fd) as entries:
+            for entry in entries:
+                count += 1
+                if count > 100000 or time.monotonic() >= deadline:
+                    raise GuardError("runtime credential inspection bound exceeded")
+                if entry.name in _CREDENTIAL_NAMES:
+                    raise GuardError("runtime mount contains nested credential material")
+                info = os.stat(entry.name, dir_fd=fd, follow_symlinks=False)
+                path = directory / entry.name
+                target = None
+                target_identity = None
+                system_node = info.st_uid == 0 and not info.st_mode & 0o022
+                if stat.S_ISDIR(info.st_mode):
+                    child = os.open(entry.name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=fd)
+                    try:
+                        if _mount_node_identity(os.fstat(child)) != _mount_node_identity(info):
+                            raise GuardError("runtime directory changed during credential inspection")
+                        walk(child, path, depth + 1)
+                    finally:
+                        os.close(child)
+                elif stat.S_ISREG(info.st_mode):
+                    if info.st_nlink != 1 and not (trusted_runtime or system_node):
+                        raise GuardError("nested multiply-linked credential alias forbidden")
+                elif stat.S_ISLNK(info.st_mode):
+                    # Package and OS loader links are necessary. Arbitrary
+                    # user-owned source/data directory aliases are not admitted.
+                    system_directory = before.st_uid == 0 and not before.st_mode & 0o022
+                    if not trusted_runtime and not system_directory:
+                        raise GuardError("unsafe nested runtime symlink forbidden")
+                    target = path.resolve(strict=True)
+                    target_info = target.stat()
+                    target_identity = _mount_node_identity(target_info)
+                    inside_runtime = any(target.is_relative_to(runtime) for runtime in runtime_roots)
+                    if (any(part in _CREDENTIAL_NAMES for part in target.parts) and not inside_runtime
+                            or any(target.is_relative_to(credential) for credential in credential_roots
+                                   if not (inside_runtime and credential.name == ".hermes"))):
+                        raise GuardError("nested symlink targets credential material")
+                    if not (stat.S_ISREG(target_info.st_mode) or stat.S_ISDIR(target_info.st_mode)):
+                        raise GuardError("unsafe nested runtime symlink target")
+                    if not inside_runtime and (target_info.st_uid != 0 or target_info.st_mode & 0o022):
+                        raise GuardError("unsafe nested runtime symlink target")
+                else:
+                    raise GuardError("unsafe nested runtime node type")
+                if not stat.S_ISDIR(info.st_mode):
+                    witnesses.append((path, _mount_node_identity(info), target, target_identity))
+                if _mount_node_identity(os.stat(entry.name, dir_fd=fd, follow_symlinks=False)) != _mount_node_identity(info):
+                    raise GuardError("runtime node changed during credential inspection")
+        if (_mount_node_identity(os.fstat(fd)) != _mount_node_identity(before)
+                or _mount_node_identity(directory.stat()) != _mount_node_identity(before)):
+            raise GuardError("runtime directory changed during credential inspection")
+
+    try:
+        fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+        try:
+            walk(fd, root, 0)
+        finally:
+            os.close(fd)
+        _verify_runtime_witnesses(witnesses, deadline)
+        return witnesses
+    except (OSError, RuntimeError) as error:
+        if isinstance(error, GuardError):
+            raise
+        raise GuardError("runtime credential inspection failed") from error
+
+
 @dataclass(frozen=True)
 class GuardSpec:
     permit_id: str
@@ -128,6 +235,7 @@ class GuardSpec:
                               and generation.name.startswith("generation-")
                               and generation.resolve(strict=True) == generation
                               and base_runtime.resolve(strict=True) == base_runtime)
+        directory_mounts = []
         for path in paths:
             resolved = path.resolve(strict=True)
             if str(path) in forbidden or str(resolved) in forbidden or not path.is_absolute():
@@ -145,14 +253,25 @@ class GuardSpec:
                     raise GuardError("host home or credential root mount forbidden")
             if resolved.is_file() and resolved.stat().st_nlink != 1:
                 raise GuardError("multiply-linked credential file alias mount forbidden")
-            if resolved.name in {".env", "auth.json", "credentials", "credentials.json", "id_rsa", "id_ed25519"}:
+            if resolved.name in _CREDENTIAL_NAMES:
                 raise GuardError("credential file mount forbidden")
-            if resolved.is_dir() and any((resolved / name).exists() for name in (".env", "auth.json", "credentials.json", ".ssh", ".aws")):
-                raise GuardError("runtime mount contains credential material")
+            if resolved.is_dir():
+                directory_mounts.append((resolved, runtime_mount))
             if resolved == workspace or workspace.is_relative_to(resolved) or resolved.is_relative_to(workspace):
                 raise GuardError("workspace must not alias a runtime mount")
             if not (resolved.is_file() or resolved.is_dir()):
                 raise GuardError("runtime mount must be a regular file or directory")
+        runtime_roots = tuple(path for path, trusted in directory_mounts if trusted)
+        protected = tuple(root for _, lexical, physical in credential_roots for root in (lexical, physical))
+        inspection_deadline = min(self.deadline_monotonic, time.monotonic() + 10)
+        witnesses = []
+        for directory, trusted in directory_mounts:
+            witnesses.extend(_validate_runtime_tree(directory, trusted, runtime_roots, protected, inspection_deadline))
+            if len(witnesses) > 100000:
+                raise GuardError("runtime credential inspection bound exceeded")
+        # A later sibling or mount may change an already-completed subtree.
+        # Retain all witnesses until every selected tree has been inspected.
+        _verify_runtime_witnesses(witnesses, inspection_deadline)
         executable = Path(self.command[0]).resolve(strict=True)
         if not any(executable == p.resolve() or executable.is_relative_to(p.resolve()) for p in paths):
             raise GuardError("executable is outside pinned runtime mounts")
