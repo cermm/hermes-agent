@@ -107,15 +107,44 @@ class GuardSpec:
             raise GuardError("guardian state must be owned and private")
         forbidden = {"/", "/home", "/root", "/proc", "/sys", "/dev", "/run", "/tmp", "/etc", "/mnt", "/media"}
         paths = [Path(p).absolute() for p in self.read_only_paths]
-        credential_roots = [Path.home(), *(Path.home() / name for name in (".hermes", ".ssh", ".aws", ".azure", ".config"))]
+        home = Path.home().absolute()
+        credential_roots = [(name, home / name, (home / name).resolve())
+                            for name in (".hermes", ".ssh", ".aws", ".azure", ".config")]
+        # The already-running trusted interpreter is the sole supported runtime
+        # exception below .hermes, together with its bundled CPython generation.
+        # Admit only those whole canonical directories, never a supplied prefix,
+        # alias, individual file or arbitrary descendant.
+        runtime = home / ".hermes" / "hermes-agent" / "venv"
+        base_runtime = Path(sys.base_prefix).absolute()
+        generation = base_runtime.parent
+        bundled_parent = home / ".hermes" / "hermes-agent" / ".hermes-runtime" / "python"
+        interpreter = Path(sys.executable).resolve(strict=True)
+        trusted_interpreter = (Path(sys.prefix).absolute() == runtime
+                               and Path(sys.prefix).resolve(strict=True) == runtime
+                               and Path(self.command[0]).absolute() == Path(sys.executable).absolute()
+                               and Path(self.command[0]).resolve(strict=True) == interpreter
+                               and interpreter.is_relative_to(base_runtime.resolve(strict=True)))
+        bundled_generation = (generation.parent == bundled_parent
+                              and generation.name.startswith("generation-")
+                              and generation.resolve(strict=True) == generation
+                              and base_runtime.resolve(strict=True) == base_runtime)
         for path in paths:
             resolved = path.resolve(strict=True)
             if str(path) in forbidden or str(resolved) in forbidden or not path.is_absolute():
                 raise GuardError("broad host mount forbidden")
             if path.is_symlink() or resolved == state or state.is_relative_to(resolved):
                 raise GuardError("symlink or guardian state mount forbidden")
-            if any(resolved == credential or credential.is_relative_to(resolved) for credential in credential_roots):
+            if home.is_relative_to(path) or home.resolve().is_relative_to(resolved):
                 raise GuardError("host home or credential root mount forbidden")
+            runtime_mount = (trusted_interpreter and path.is_dir() and resolved == path
+                             and (path == runtime or (bundled_generation and path == generation)))
+            for name, lexical, physical in credential_roots:
+                overlaps = (path.is_relative_to(lexical) or lexical.is_relative_to(path)
+                            or resolved.is_relative_to(physical) or physical.is_relative_to(resolved))
+                if overlaps and not (name == ".hermes" and runtime_mount):
+                    raise GuardError("host home or credential root mount forbidden")
+            if resolved.is_file() and resolved.stat().st_nlink != 1:
+                raise GuardError("multiply-linked credential file alias mount forbidden")
             if resolved.name in {".env", "auth.json", "credentials", "credentials.json", "id_rsa", "id_ed25519"}:
                 raise GuardError("credential file mount forbidden")
             if resolved.is_dir() and any((resolved / name).exists() for name in (".env", "auth.json", "credentials.json", ".ssh", ".aws")):

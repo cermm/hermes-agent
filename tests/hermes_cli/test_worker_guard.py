@@ -18,6 +18,77 @@ import pytest
 from hermes_cli.worker_guard import GuardError, GuardSpec, ProcessIdentity, launch_guard, renew_lease, reconcile_guard
 
 
+def _require_namespace_probe_success(result):
+    if result.returncode == 0:
+        return
+    denied = {
+        "unshare: unshare failed: Operation not permitted",
+        "unshare: write failed /proc/self/uid_map: Operation not permitted",
+    }
+    if result.returncode == 1 and result.stderr.strip() in denied:
+        pytest.skip("Host policy denies required user/mount/net/PID namespaces: " + result.stderr.strip())
+    raise AssertionError(f"Unexpected namespace capability probe failure: {result.returncode}: {result.stderr}")
+
+
+@pytest.fixture(scope="session")
+def namespace_capability():
+    result = subprocess.run([
+        "/usr/bin/unshare", "--user", "--map-root-user", "--mount", "--net", "--pid",
+        "--fork", "--kill-child=KILL", "/usr/bin/true",
+    ], capture_output=True, text=True, encoding="utf-8", timeout=10,
+        env={"PATH": "/usr/bin:/bin", "LANG": "C", "LC_ALL": "C"})
+    _require_namespace_probe_success(result)
+
+
+@pytest.mark.parametrize("diagnostic", [
+    "unshare: unshare failed: Operation not permitted",
+    "unshare: write failed /proc/self/uid_map: Operation not permitted",
+])
+def test_namespace_capability_skips_only_independent_known_host_denial(diagnostic):
+    with pytest.raises(pytest.skip.Exception, match="Host policy denies"):
+        _require_namespace_probe_success(subprocess.CompletedProcess([], 1, "", diagnostic))
+    _require_namespace_probe_success(subprocess.CompletedProcess([], 0, "", ""))
+    for code, message in ((2, diagnostic), (1, "guardian containment failed"), (1, "unshare: unexpected failure")):
+        with pytest.raises(AssertionError, match="Unexpected namespace"):
+            _require_namespace_probe_success(subprocess.CompletedProcess([], code, "", message))
+
+
+@pytest.mark.linux_only
+def test_kernel_denied_namespace_keeps_production_launch_closed(tmp_path):
+    from dataclasses import asdict
+
+    spec = make_spec(tmp_path, "raise AssertionError('denied namespace launched worker')")
+    source = Path(__file__).parents[2]
+    script = tmp_path / "deny-namespace.py"
+    script.write_text(
+        "import ctypes,json,os,socket,sys\n"
+        + f"sys.path.insert(0,{str(source)!r})\n"
+        + "from hermes_cli.worker_guard import GuardError,GuardSpec,ProcessIdentity,renew_lease,launch_guard\n"
+        + f"data=json.loads({json.dumps(asdict(spec))!r})\n"
+        + "data['controller']=ProcessIdentity.capture(os.getpid())\nspec=GuardSpec(**data)\n"
+        + "libc=ctypes.CDLL(None,use_errno=True)\nassert libc.prctl(38,1,0,0,0)==0\n"
+        + "seccomp=ctypes.CDLL('libseccomp.so.2')\n"
+        + "seccomp.seccomp_init.argtypes=[ctypes.c_uint]\nseccomp.seccomp_init.restype=ctypes.c_void_p\n"
+        + "seccomp.seccomp_syscall_resolve_name.argtypes=[ctypes.c_char_p]\n"
+        + "seccomp.seccomp_rule_add.argtypes=[ctypes.c_void_p,ctypes.c_uint,ctypes.c_int,ctypes.c_uint]\n"
+        + "seccomp.seccomp_load.argtypes=[ctypes.c_void_p]\n"
+        + "context=seccomp.seccomp_init(0x7fff0000)\nassert context\n"
+        + "call=seccomp.seccomp_syscall_resolve_name(b'unshare')\nassert call>=0\n"
+        + "assert seccomp.seccomp_rule_add(context,0x00050001,call,0)==0\n"
+        + "assert seccomp.seccomp_load(context)==0\n"
+        + "server,worker=socket.socketpair()\nrenew_lease(spec.lease_path,spec,5)\n"
+        + "try:\n    launch_guard(spec,worker.fileno())\n"
+        + "except GuardError as error:\n    assert 'Operation not permitted' in str(error),str(error)\n    print('kernel-denied-launch-held')\n"
+        + "else:\n    raise AssertionError('namespace denial admitted worker')\n"
+        + "finally:\n    server.close()\n    worker.close()\n",
+        encoding="utf-8")
+    result = subprocess.run([sys.executable, str(script)], capture_output=True,
+                            text=True, encoding="utf-8", timeout=20)
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == "kernel-denied-launch-held"
+    assert not (Path(spec.state_dir) / "artifacts").exists()
+
+
 def test_unsupported_host_refuses_identity_and_lease_before_filesystem(monkeypatch):
     from hermes_cli import worker_guard
 
@@ -108,7 +179,7 @@ def await_file(path):
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("operation", ["socket", "host_secret", "readonly_write", "namespace_escape", "broker", "pinned_tmp_config"])
-def test_actual_containment_denies_bypass_and_retains_only_broker(tmp_path, operation):
+def test_actual_containment_denies_bypass_and_retains_only_broker(tmp_path, operation, namespace_capability):
     secret = tmp_path / "secret"
     secret.write_text("credential-never-mounted")
     checks = {
@@ -152,7 +223,7 @@ def test_actual_containment_denies_bypass_and_retains_only_broker(tmp_path, oper
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("failure", ["deadline", "lease", "stop", "guardian", "detached", "broker"])
-def test_watchdog_and_kernel_parent_death_end_namespace(tmp_path, failure):
+def test_watchdog_and_kernel_parent_death_end_namespace(tmp_path, failure, namespace_capability):
     code = "import os,signal,time\nsignal.signal(signal.SIGTERM,signal.SIG_IGN)\n"
     if failure == "detached":
         code += "if os.fork()==0:\n    os.setsid()\n    if os.fork()==0:\n        os.write(int(os.environ['HERMES_WORKER_BROKER_FD']),b'D')\n        while True: time.sleep(1)\n    os._exit(0)\n"
@@ -205,6 +276,171 @@ def test_watchdog_and_kernel_parent_death_end_namespace(tmp_path, failure):
 
 
 @pytest.mark.linux_only
+@pytest.mark.parametrize("alias", ["direct", "hardlink"])
+def test_inert_credential_fixture_cannot_cross_actual_containment(tmp_path, monkeypatch, alias):
+    home = tmp_path / "synthetic-home"
+    secret = home / ".ssh" / "custom_key"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("INERT-CREDENTIAL-FIXTURE", encoding="utf-8")
+    mount = secret
+    if alias == "hardlink":
+        mount = tmp_path / "runtime-key"
+        os.link(secret, mount)
+    spec = make_spec(tmp_path, f"from pathlib import Path\nPath('/workspace/leaked.txt').write_bytes(Path({str(mount)!r}).read_bytes())")
+    spec = replace(spec, read_only_paths=(*spec.read_only_paths, str(mount)))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    try:
+        spec.validate()
+    except GuardError as error:
+        assert "credential" in str(error)
+        return
+    handle, server = run_probe(spec)
+    try:
+        receipt = handle.wait()
+        leaked = Path(receipt["artifacts_path"]) / "leaked.txt"
+        assert leaked.read_text(encoding="utf-8") != "INERT-CREDENTIAL-FIXTURE", "credential fixture escaped into worker artifacts"
+    finally:
+        server.close()
+        if handle.process.poll() is None:
+            handle.stop()
+            handle.wait()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("credential_root", [".hermes", ".ssh", ".aws", ".azure", ".config"])
+@pytest.mark.parametrize("alias", [False, True])
+def test_credential_descendant_mount_is_refused_before_worker(tmp_path, monkeypatch, credential_root, alias):
+    home = tmp_path / "synthetic-home"
+    secret = home / credential_root / "custom_key"
+    secret.parent.mkdir(parents=True)
+    secret.write_text("INERT-CREDENTIAL-FIXTURE", encoding="utf-8")
+    mount = secret
+    if alias:
+        link = tmp_path / "directory-alias"
+        link.symlink_to(secret.parent, target_is_directory=True)
+        mount = link / secret.name
+    spec = make_spec(tmp_path, "raise AssertionError('credential mount must not launch')")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(GuardError, match="credential"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(mount))).validate()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("credential_root", [".hermes", ".ssh", ".aws", ".azure", ".config"])
+def test_symlinked_credential_root_protects_its_physical_target(tmp_path, monkeypatch, credential_root):
+    home = tmp_path / "synthetic-home"
+    home.mkdir()
+    physical = tmp_path / "physical-credentials"
+    physical.mkdir()
+    (home / credential_root).symlink_to(physical, target_is_directory=True)
+    secret = physical / "custom_key"
+    secret.write_text("INERT-CREDENTIAL-FIXTURE", encoding="utf-8")
+    spec = make_spec(tmp_path, "pass")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    with pytest.raises(GuardError, match="credential"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(secret))).validate()
+
+
+@pytest.mark.linux_only
+def test_safe_home_sibling_remains_mountable(tmp_path, monkeypatch):
+    home = tmp_path / "synthetic-home"
+    safe = home / ".aws-safe" / "runtime"
+    safe.mkdir(parents=True)
+    spec = make_spec(tmp_path, "pass")
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    replace(spec, read_only_paths=(*spec.read_only_paths, str(safe))).validate()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("mutation", ["child", "file", "alias", "wrong_command", "other_credential_root"])
+def test_hermes_runtime_exception_is_exact_and_cannot_overlap_other_credentials(tmp_path, monkeypatch, mutation):
+    home = tmp_path / "synthetic-home"
+    runtime = home / ".hermes" / "hermes-agent" / "venv"
+    runtime.mkdir(parents=True)
+    executable = runtime / "python"
+    executable.symlink_to(sys.executable)
+    spec = replace(make_spec(tmp_path, "pass"), command=(str(executable), "-c", "pass"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sys, "prefix", str(runtime))
+    monkeypatch.setattr(sys, "executable", str(executable))
+    mount = runtime
+    if mutation == "child":
+        mount = runtime / "subdirectory"
+        mount.mkdir()
+    elif mutation == "file":
+        mount = runtime / "custom_key"
+        mount.write_text("INERT", encoding="utf-8")
+    elif mutation == "alias":
+        alias = tmp_path / "runtime-parent-alias"
+        alias.symlink_to(runtime.parent, target_is_directory=True)
+        mount = alias / runtime.name
+    elif mutation == "wrong_command":
+        spec = replace(spec, command=("/usr/bin/python3", "-c", "pass"))
+    else:
+        (home / ".aws").symlink_to(runtime, target_is_directory=True)
+    with pytest.raises(GuardError, match="credential"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(mount))).validate()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("mutation", ["parent", "child", "alias", "wrong_command", "other_credential_root", "interpreter_outside_base"])
+def test_bundled_runtime_exception_is_exact(tmp_path, monkeypatch, mutation):
+    home = tmp_path / "synthetic-home"
+    runtime = home / ".hermes" / "hermes-agent" / "venv"
+    runtime.mkdir(parents=True)
+    generation = runtime.parent / ".hermes-runtime" / "python" / "generation-fixture"
+    base = generation / "cpython-fixture"
+    (base / "bin").mkdir(parents=True)
+    binary = base / "bin" / "python"
+    binary.write_text("inert executable identity fixture", encoding="utf-8")
+    executable = runtime / "python"
+    executable.symlink_to(binary)
+    spec = replace(make_spec(tmp_path, "pass"), command=(str(executable), "-c", "pass"))
+    monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(sys, "prefix", str(runtime))
+    monkeypatch.setattr(sys, "base_prefix", str(base))
+    monkeypatch.setattr(sys, "executable", str(executable))
+    replace(spec, read_only_paths=(*spec.read_only_paths, str(generation))).validate()
+    mount = generation
+    if mutation == "parent":
+        mount = generation.parent
+    elif mutation == "child":
+        mount = base
+    elif mutation == "alias":
+        alias = tmp_path / "generation-parent-alias"
+        alias.symlink_to(generation.parent, target_is_directory=True)
+        mount = alias / generation.name
+    elif mutation == "wrong_command":
+        spec = replace(spec, command=("/usr/bin/python3", "-c", "pass"))
+    elif mutation == "other_credential_root":
+        (home / ".ssh").symlink_to(generation, target_is_directory=True)
+    else:
+        executable.unlink()
+        executable.symlink_to("/usr/bin/python3")
+    with pytest.raises(GuardError, match="credential"):
+        replace(spec, read_only_paths=(*spec.read_only_paths, str(mount))).validate()
+
+
+@pytest.mark.linux_only
+def test_actual_trusted_runtime_directory_remains_usable(tmp_path, namespace_capability):
+    code = "from pathlib import Path\nPath('/workspace/runtime-ok').write_text('trusted runtime executed', encoding='utf-8')"
+    spec = make_spec(tmp_path, code)
+    spec = replace(spec, command=(sys.executable, "/workspace/probe.py"),
+                   read_only_paths=(*spec.read_only_paths, str(Path(sys.prefix)),
+                                    str(Path(sys.base_prefix).resolve().parent)))
+    handle, server = run_probe(spec)
+    try:
+        receipt = handle.wait()
+        assert receipt["exit_verified"] and receipt["artifacts_exported"]
+        assert (Path(receipt["artifacts_path"]) / "runtime-ok").read_text(encoding="utf-8") == "trusted runtime executed"
+    finally:
+        server.close()
+        if handle.process.poll() is None:
+            handle.stop()
+            handle.wait()
+
+
+@pytest.mark.linux_only
 def test_stale_identity_lease_and_credential_configuration_refuse_before_effect(tmp_path):
     spec = make_spec(tmp_path, "raise AssertionError('must never execute')")
     with pytest.raises(GuardError):
@@ -229,7 +465,7 @@ def test_stale_identity_lease_and_credential_configuration_refuse_before_effect(
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("limit", ["fork", "memory"])
-def test_actual_kernel_resource_limits_are_conservative_for_tree(tmp_path, limit):
+def test_actual_kernel_resource_limits_are_conservative_for_tree(tmp_path, limit, namespace_capability):
     if limit == "fork":
         code = "import os,time,json\ncount=0\ntry:\n    for i in range(32):\n        pid=os.fork()\n        if pid==0:\n            while True: time.sleep(1)\n        count+=1\nexcept OSError as error:\n    open('/workspace/result.json','w').write(json.dumps({'count':count,'errno':error.errno}))\n"
     else:
@@ -281,7 +517,7 @@ def test_parent_death_armed_after_reparenting_cannot_execute(tmp_path):
 
 
 @pytest.mark.linux_only
-def test_independent_guardian_observes_controller_death(tmp_path):
+def test_independent_guardian_observes_controller_death(tmp_path, namespace_capability):
     module_root = Path(__file__).resolve().parents[2]
     script = tmp_path / "controller.py"
     script.write_text(
@@ -336,7 +572,7 @@ def test_kernel_socket_domain_rejects_mislabeled_connected_network_descriptor(tm
 
 
 @pytest.mark.linux_only
-def test_supervisor_and_namespace_ignore_timestamp_valid_stale_bytecode(tmp_path, monkeypatch):
+def test_supervisor_and_namespace_ignore_timestamp_valid_stale_bytecode(tmp_path, monkeypatch, namespace_capability):
     import hermes_cli.worker_guard as guard
     copied = tmp_path / "private-code"
     copied.mkdir()
@@ -364,7 +600,7 @@ def test_supervisor_and_namespace_ignore_timestamp_valid_stale_bytecode(tmp_path
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("resource", ["bytes", "inodes"])
-def test_kernel_workspace_aggregate_limits_and_verified_export(tmp_path, resource):
+def test_kernel_workspace_aggregate_limits_and_verified_export(tmp_path, resource, namespace_capability):
     code = "import os,json\ncreated=[]\ntry:\n    for index in range(1000):\n        name='/workspace/f'+str(index)\n        created.append(name)\n        with open(name,'wb') as stream:\n"
     code += "            stream.write(b'x'*524288)\n" if resource == "bytes" else "            pass\n"
     code += "except OSError as error:\n    evidence={'errno':error.errno,'files':len(created)}\nelse:\n    evidence={'escaped':True}\nfor name in created:\n    try: os.unlink(name)\n    except FileNotFoundError: pass\nopen('/workspace/result.json','w').write(json.dumps(evidence))\n"
@@ -386,7 +622,7 @@ def test_kernel_workspace_aggregate_limits_and_verified_export(tmp_path, resourc
 
 @pytest.mark.linux_only
 @pytest.mark.parametrize("kind", ["symlink", "hardlink", "fifo"])
-def test_untrusted_link_or_special_output_cannot_be_exported(tmp_path, kind):
+def test_untrusted_link_or_special_output_cannot_be_exported(tmp_path, kind, namespace_capability):
     operations = {"symlink": "os.symlink('/usr/bin/python3','/workspace/escape')",
                   "hardlink": "os.link('/workspace/probe.py','/workspace/escape')",
                   "fifo": "os.mkfifo('/workspace/escape')"}
@@ -403,7 +639,7 @@ def test_untrusted_link_or_special_output_cannot_be_exported(tmp_path, kind):
 
 
 @pytest.mark.linux_only
-def test_seed_links_are_rejected_before_worker_execution(tmp_path):
+def test_seed_links_are_rejected_before_worker_execution(tmp_path, namespace_capability):
     spec = make_spec(tmp_path, "raise AssertionError('must not run')")
     (Path(spec.workspace) / "secret").symlink_to('/etc/passwd')
     with pytest.raises(GuardError, match="links or special"):
@@ -412,7 +648,7 @@ def test_seed_links_are_rejected_before_worker_execution(tmp_path):
 
 
 @pytest.mark.linux_only
-def test_deep_output_cannot_exhaust_trusted_export_stack_or_manifest(tmp_path):
+def test_deep_output_cannot_exhaust_trusted_export_stack_or_manifest(tmp_path, namespace_capability):
     code = "import os\nfor i in range(140):\n    os.mkdir('d')\n    os.chdir('d')\nopen('result','w').write('untrusted nested output')\n"
     spec = make_spec(tmp_path, code)
     handle, server = run_probe(spec)

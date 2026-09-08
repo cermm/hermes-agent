@@ -66,6 +66,9 @@ def test_cli_exact_selection_spawns_only_requested_generation(board, monkeypatch
     assert receipt["board"] == "default"
     assert receipt["board_identity"] == identity
     assert receipt["effect_status"] == "spawned"
+    assert receipt["dry_run"] is False
+    assert receipt["would_spawn"] == []
+    assert receipt["no_spawn_reason"] is None
     assert receipt["selection"] == {"task_id": target, "lane": lane,
         "expected_task_event_id": expected, "expected_board_identity": identity, "expected_assignee": "qa"}
     assert receipt["spawned"][0]["task_id"] == target
@@ -381,3 +384,30 @@ def test_legacy_lost_claim_cannot_overwrite_successor_workspace(board, monkeypat
     assert current.workspace_path == str(successor_workspace)
     assert current.branch_name == "wt/successor"
     assert result.no_spawn_reason == "target_claim_changed"
+
+@pytest.mark.parametrize("targeted", [False, True])
+def test_cli_dry_run_reports_candidates_without_spawn_effect(board, monkeypatch, capsys, targeted):
+    target = kb.create_task(board, title="eligible preview", assignee="qa")
+    expected = generation(board, target)
+    identity = board_identity(board)
+    before = list(board.iterdump())
+    monkeypatch.setattr(dispatch, "_default_spawn", lambda *a, **kw: pytest.fail("dry run entered spawn"))
+    parser = argparse.ArgumentParser()
+    build_parser(parser.add_subparsers())
+    command = ["kanban", "--board", "default", "dispatch", "--max", "1", "--dry-run", "--json"]
+    if targeted:
+        command += ["--task-id", target, "--lane", "ready",
+                    "--expected-task-event-id", str(expected),
+                    "--expected-board-identity", identity, "--expected-assignee", "qa"]
+    assert cli.kanban_command(parser.parse_args(command)) == 0
+    receipt = json.loads(capsys.readouterr().out)
+    # A preview of an eligible task must not masquerade as an actual worker receipt.
+    assert receipt["effect_status"] == "not_spawned"
+    assert receipt["dry_run"] is True
+    assert receipt["effect_unknown"] is None
+    assert receipt["no_spawn_reason"] == "dry_run"
+    assert receipt["spawned"] == []
+    assert receipt["would_spawn"] == [{"task_id": target, "assignee": "qa", "workspace": "", "run_id": None}]
+    assert kb.get_task(board, target).status == "ready"
+    assert kb.get_task(board, target).current_run_id is None
+    assert list(board.iterdump()) == before
