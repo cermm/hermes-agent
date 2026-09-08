@@ -134,6 +134,10 @@ def shutdown_mcp_servers(*, scope: Optional[str] = None):
     with _core._lock:
         _clear_connect_cooldowns()
     _loop._stop_mcp_loop(only_if_idle=scope is not None)
+    with _core._lock:
+        for name, (owner_scope, _profile, _mode) in list(_core._server_project_modes.items()):
+            if scope is None or (owner_scope == scope and name not in _core._server_connecting):
+                _core._server_project_modes.pop(name, None)
 
 
 def _take_reapable_pids(include_active: bool, server_name: Optional[str]) -> tuple[Dict[int, str], Dict[int, int]]:

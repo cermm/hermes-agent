@@ -249,8 +249,12 @@ def _select_new_servers(servers: Dict[str, dict]) -> Dict[str, dict]:
         stale_cached = [_core._servers[k] for k in servers
                         if k in _core._servers and getattr(_core._servers[k], "session", None) is None]
         _core._server_connecting.update(new_servers)
-        for srv_name in new_servers:
+        from hermes_constants import get_hermes_home
+        scope, profile = _core._mcp_registry_scope(), str(get_hermes_home().resolve())
+        for srv_name, srv_cfg in new_servers.items():
             _core._server_connect_errors.pop(srv_name, None)
+            _core._server_project_modes[srv_name] = (
+                scope, profile, (srv_cfg.get("project") or {}).get("mode"))
         # Track which servers opt-in to parallel tool calls (idempotent).
         for srv_name, srv_cfg in servers.items():
             if _parse_boolish(srv_cfg.get("supports_parallel_tool_calls", False), default=False):
