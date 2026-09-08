@@ -26,7 +26,7 @@ def _active(svc: Optional[LSPService]) -> Optional[LSPService]:
     return svc if (svc is not None and svc.is_active()) else None
 
 
-def get_service() -> Optional[LSPService]:
+def get_service(*, include_disabled: bool = False) -> Optional[LSPService]:
     """Return the lazily created process-wide LSP service singleton, or None when disabled.
 
     Also registers an :mod:`atexit` hook so a clean exit tears down spawned servers:
@@ -42,7 +42,7 @@ def get_service() -> Optional[LSPService]:
                 if not _atexit_registered:
                     atexit.register(_atexit_shutdown)
                     _atexit_registered = True
-    return _active(_service)
+    return _service if include_disabled else _active(_service)
 
 
 def shutdown_service() -> None:

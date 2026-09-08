@@ -177,8 +177,12 @@ def main():
                 )
                 continue
             diagnostics = []
-            if script == "errors":
+            if script in {"errors", "warning", "unknown_baseline"}:
                 diagnostics = error_diag
+            if script == "warning":
+                diagnostics[0]["severity"] = 2
+            if script == "unknown_baseline" and not is_change:
+                continue
             write_message(
                 {
                     "jsonrpc": "2.0",
@@ -193,7 +197,7 @@ def main():
             continue
 
         if msg.get("method") == "textDocument/diagnostic":
-            if script in {"stale", "slow_push"}:
+            if script in {"stale", "slow_push", "unknown_baseline", "warning"}:
                 # These scripts model push-only servers so the ghost
                 # can't be papered over by the pull channel.
                 write_message(

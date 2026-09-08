@@ -1007,7 +1007,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         path = self._expand_path(path)
         denied = get_write_denied_error(path, verb="Delete")
         if denied:
-            return WriteResult(error=denied)
+            return self._unchecked_lsp_result(WriteResult(error=denied), path, "write_failed")
         # Path baked in via repr() for shell-independent quoting; no
         # ``unlink(missing_ok=True)`` (a 3.7 remote interpreter lacks it).
         snippet = (
@@ -1037,7 +1037,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         for p in (src, dst):
             denied = get_write_denied_error(p, verb="Move")
             if denied:
-                return WriteResult(error=denied)
+                return self._unchecked_lsp_result(WriteResult(error=denied), path, "write_failed")
         result = self._exec(f"mv {self._escape_shell_arg(src)} {self._escape_shell_arg(dst)}")
         if result.exit_code != 0:
             return WriteResult(error=f"Failed to move {src} -> {dst}: {result.stdout}")
@@ -1204,14 +1204,14 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
         if denied:
-            return WriteResult(error=denied)
+            return self._unchecked_lsp_result(WriteResult(error=denied), path, "write_failed")
         refused = self._reject_unencodable(path, content)
         if refused is not None:
-            return refused
+            return self._unchecked_lsp_result(refused, path, "write_failed")
         ext = os.path.splitext(path)[1].lower()
         refused = self._fail_closed_syntax_error(path, ext, content)
         if refused is not None:
-            return refused
+            return self._unchecked_lsp_result(refused, path, "syntax_failed")
 
         # Pre-content is read only for extensions in the UNION of in-process lint and
         # LSP coverage (keeps the hot path fast for binaries).
@@ -1234,20 +1234,23 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         content_bytes = content.encode("utf-8", "surrogateescape")
         write_result = self._atomic_write(path, content)
         if write_result.exit_code != 0:
-            return WriteResult(error=f"Failed to write file: {write_result.stdout}")
+            return self._unchecked_lsp_result(WriteResult(error=f"Failed to write file: {write_result.stdout}"), path, "write_failed")
         content_verified, verify_error = self._verify_written_hash(path, content_bytes)
         if verify_error is not None:
-            return verify_error
+            return self._unchecked_lsp_result(verify_error, path, "verification_failed")
 
         lint_result = self._check_lint_delta(path, pre_content=pre_content, post_content=content)
         # LSP diagnostics are a separate channel, fired only when the syntax tier is
         # clean (no point asking an LSP about a file that won't parse).
-        lsp_diagnostics: Optional[str] = None
+        from agent.lsp.outcome import operation_outcome, verification
+        lsp_diagnostics = None
+        lsp_verification = verification([operation_outcome(path, "write", "syntax_failed")])
         if lint_result.success or lint_result.skipped:
-            lsp_diagnostics = self._maybe_lsp_diagnostics(path, pre_content=pre_content, post_content=content) or None
+            lsp_diagnostics, lsp_verification = self._lsp_feedback(path, pre_content=pre_content, post_content=content)
         return WriteResult(
             bytes_written=len(content_bytes), dirs_created=dirs_created, verified=content_verified,
-            lint=lint_result.to_dict() if lint_result else None, lsp_diagnostics=lsp_diagnostics)
+            lint=lint_result.to_dict() if lint_result else None, lsp_diagnostics=lsp_diagnostics,
+            lsp_verification=lsp_verification)
 
     # --- PATCH (replace mode) -----------------------------------------------
 
@@ -1258,9 +1261,11 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         and a success-shaped no-op stops the model burning turns on re-reads.
         Otherwise attach a best-effort "Did you mean?" snippet to the error."""
         from tools.fuzzy_match import format_no_match_hint, is_already_applied
+        from agent.lsp.outcome import operation_outcome, verification
         if is_already_applied(content, old_string, new_string):
             return PatchResult(
                 success=True, no_change=True,
+                lsp_verification=verification([operation_outcome(path, "replace", "no_change")]),
                 note=(
                     f"File already contains the target text — the edit "
                     f"appears to be already applied to {path}. No write "
@@ -1270,7 +1275,7 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             err_msg += format_no_match_hint(err_msg, match_count, old_string, content)
         except Exception:
             pass
-        return PatchResult(error=err_msg)
+        return self._unchecked_lsp_result(PatchResult(error=err_msg), path, "validation_failed", "replace")
 
     def _verify_patch_persisted(self, path: str, new_content: str) -> Optional[PatchResult]:
         """Re-read ``path`` and confirm the intended bytes landed; error result or None.
@@ -1300,10 +1305,10 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
         path = self._expand_path(path)
         denied = get_write_denied_error(path)
         if denied:
-            return PatchResult(error=denied)
+            return self._unchecked_lsp_result(PatchResult(error=denied), path, "write_failed", "replace")
         read_result = self._cat(path)
         if read_result.exit_code != 0:
-            return PatchResult(error=f"Failed to read file: {path}")
+            return self._unchecked_lsp_result(PatchResult(error=f"Failed to read file: {path}"), path, "validation_failed", "replace")
         # Match and diff on BOM-stripped content (a phantom U+FEFF defeats an exact
         # first-line match); the raw read becomes write_file's pre_content.
         raw_content = read_result.stdout
@@ -1321,16 +1326,17 @@ class ShellFileOperations(LintMixin, SearchMixin, FileOperations):
             new_content = _normalize_line_endings(new_content, file_ending)
         write_result = self.write_file(path, new_content, pre_content=raw_content)
         if write_result.error:
-            return PatchResult(error=f"Failed to write changes: {write_result.error}")
+            return PatchResult(error=f"Failed to write changes: {write_result.error}",
+                               lsp_verification=write_result.lsp_verification)
         verify_error = self._verify_patch_persisted(path, new_content)
         if verify_error is not None:
-            return verify_error
+            return self._unchecked_lsp_result(verify_error, path, "verification_failed")
         lint_result = self._check_lint_delta(path, pre_content=content, post_content=new_content)
         return PatchResult(
             success=True, diff=self._unified_diff(content, new_content, path), files_modified=[path],
             lint=lint_result.to_dict() if lint_result else None,
             # From the internal write_file call, whose baseline was the pre-patch content.
-            lsp_diagnostics=write_result.lsp_diagnostics)
+            lsp_diagnostics=write_result.lsp_diagnostics, lsp_verification=write_result.lsp_verification)
 
     def patch_v4a(self, patch_content: str) -> PatchResult:
         """Apply a V4A format patch (``*** Begin Patch`` / ``*** Update File:`` /

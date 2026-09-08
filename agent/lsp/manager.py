@@ -19,6 +19,7 @@ import time
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
 from agent.lsp import eventlog
+from agent.lsp.outcome import DiagnosticOutcome, normalized_text, failure_reason
 from agent.lsp.client import DIAGNOSTICS_DOCUMENT_WAIT, LSPClient, _diagnostic_key as _diag_key
 from agent.lsp.servers import ServerContext, ServerDef, find_server_for_file, language_id_for
 from agent.lsp.workspace import clear_cache, resolve_workspace_for_file
@@ -126,7 +127,8 @@ class LSPService:
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
         # abs file path → diagnostics snapshot taken immediately before a write.
-        self._delta_baseline: Dict[str, _Diags] = {}
+        self._delta_baseline: Dict[str, DiagnosticOutcome] = {}
+        self._spawn_failures: Dict[_Key, str] = {}
 
         if self._enabled and self._idle_timeout > 0:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
@@ -196,80 +198,88 @@ class LSPService:
         key = self._broken_key(srv, file_path)
         return key is not None and key not in self._broken
 
+    def _ineligible_outcome(self, file_path: str) -> Optional[DiagnosticOutcome]:
+        if not self._enabled:
+            return DiagnosticOutcome("not_checked", "disabled")
+        srv = find_server_for_file(file_path)
+        if srv is None:
+            return DiagnosticOutcome("not_checked", "unsupported_file")
+        if srv.server_id in self._disabled_servers:
+            return DiagnosticOutcome("not_checked", "server_disabled")
+        ws, gated = resolve_workspace_for_file(file_path)
+        if not (ws and gated):
+            return DiagnosticOutcome("not_checked", "no_project")
+        root = srv.resolve_root(file_path, ws)
+        if root is None:
+            return DiagnosticOutcome("not_checked", "server_excluded")
+        key = (srv.server_id, root)
+        if key in self._broken:
+            return DiagnosticOutcome("no_verdict", self._spawn_failures.get(key, "server_error"))
+        return None
+
     def snapshot_baseline(self, file_path: str) -> None:
-        """Snapshot current diagnostics for ``file_path`` as the delta baseline (call BEFORE a write).
-        Best-effort: failures are swallowed so a flaky server can't break a write, but they mark the pair broken."""
-        if not self.enabled_for(file_path):
-            return
+        """Best-effort pre-write evidence. Missing data is not a clean baseline."""
         try:
-            # Outer budget must exceed the inner wait or a slow-but-alive server gets falsely marked broken.
-            t = max(8.0, self._wait_timeout + 3.0)
-            diags = self._loop.run(self._snapshot_async(file_path), timeout=t)
-        except Exception as e:  # noqa: BLE001
-            logger.debug("baseline snapshot failed for %s: %s", file_path, e)
-            self._mark_broken_for_file(file_path, e)
-            diags = []
-        self._delta_baseline[os.path.abspath(file_path)] = diags or []
+            result = self._ineligible_outcome(file_path)
+            if result is None:
+                result = self._loop.run(self._query_outcome_async(file_path, snapshot=True),
+                                        timeout=max(8.0, self._wait_timeout + 3.0))
+        except Exception as exc:
+            self._mark_broken_for_file(file_path, exc)
+            result = DiagnosticOutcome("no_verdict", failure_reason(exc))
+        self._delta_baseline[os.path.abspath(file_path)] = result
 
     def get_diagnostics_sync(
         self, file_path: str, *, delta: bool = True, timeout: Optional[float] = None,
         line_shift: Optional[Callable[[int], Optional[int]]] = None,
     ) -> _Diags:
-        """Synchronously open ``file_path``, wait for diagnostics, return them.  Never raises.
+        """Compatibility list API; missing evidence still returns an empty list."""
+        result = self.get_diagnostic_outcome_sync(file_path, delta=delta, timeout=timeout, line_shift=line_shift)
+        return result.delta if result.delta is not None else result.diagnostics
 
-        With ``delta`` (default) the result excludes the :meth:`snapshot_baseline`; ``line_shift`` (from
-        :func:`agent.lsp.range_shift.build_line_shift`) remaps that baseline into post-edit coordinates
-        first, so pre-existing diagnostics that merely moved don't look introduced by this edit.
-        ``[]`` when LSP is disabled, nothing matches, or the server can't be spawned.
-        """
-        if not self.enabled_for(file_path):
-            return []
-        server_id = find_server_for_file(file_path).server_id  # enabled_for guarantees a match
+    def get_diagnostic_outcome_sync(
+        self, file_path: str, *, delta: bool = True, timeout: Optional[float] = None,
+        line_shift: Optional[Callable[[int], Optional[int]]] = None,
+        pre_content: Optional[str] = None, post_content: Optional[str] = None,
+    ) -> DiagnosticOutcome:
+        """Return one source-attributed full result and optional known-baseline delta."""
+        baseline = self._delta_baseline.get(os.path.abspath(file_path)) if delta else None
         try:
-            t = timeout if timeout is not None else self._wait_timeout + 2.0
-            diags = self._loop.run(self._open_and_wait_async(file_path), timeout=t)
-        except Exception as e:  # noqa: BLE001
-            if isinstance(e, asyncio.TimeoutError):
-                eventlog.log_timeout(server_id, file_path)
-                logger.debug("LSP diagnostics timeout for %s: %s", file_path, e)
-            else:
-                eventlog.log_server_error(server_id, file_path, e)
-                logger.debug("LSP diagnostics fetch failed for %s: %s", file_path, e)
-            self._mark_broken_for_file(file_path, e)
-            return []
-        if diags is None:
-            # Server alive but no verdict on the post-edit content in budget (common for tsserver on big
-            # projects).  Report "no data" rather than stale stores — that would be the ghost-diagnostics
-            # bug.  Not marked broken: slow is not dead.
-            eventlog.log_timeout(server_id, file_path, kind="fresh diagnostics")
-            return []
-        if delta:
-            diags = self._apply_delta(file_path, diags, line_shift)
-        if diags:
-            eventlog.log_diagnostics(server_id, file_path, len(diags))
-        else:
-            eventlog.log_clean(server_id, file_path)
-        return diags
-
-    def _apply_delta(self, file_path: str, diags: _Diags, line_shift: Optional[Callable[[int], Optional[int]]]) -> _Diags:
-        """Drop diagnostics present in the pre-write baseline, then roll the baseline forward."""
-        abs_path = os.path.abspath(file_path)
-        baseline = self._delta_baseline.get(abs_path) or []
-        if baseline:
+            result = self._ineligible_outcome(file_path)
+            if result is None:
+                result = self._loop.run(self._query_outcome_async(file_path),
+                    timeout=timeout if timeout is not None else self._wait_timeout + 2.0)
+        except Exception as exc:
+            self._mark_broken_for_file(file_path, exc)
+            result = DiagnosticOutcome("no_verdict", failure_reason(exc))
+        known = baseline is not None and baseline.status == "fresh"
+        if known and pre_content is not None and baseline.text != normalized_text(pre_content):
+            known = False
+        result.baseline = ("available" if known else "unavailable") if delta else "not_requested"
+        if delta and not known:
+            result.baseline_reason = (baseline.reason if baseline and baseline.status != "fresh" else
+                                      "source_changed" if baseline else "no_fresh_diagnostics")
+        if result.status != "fresh":
+            return result
+        if post_content is not None and result.text != normalized_text(post_content):
+            return DiagnosticOutcome("no_verdict", "source_changed", baseline=result.baseline,
+                                     baseline_reason=result.baseline_reason)
+        if known:
+            previous = baseline.diagnostics
             if line_shift is not None:
-                # Entries that map into a deleted region drop out — they no longer apply.
                 from agent.lsp.range_shift import shift_baseline
-                baseline = shift_baseline(baseline, line_shift)
-            seen = {_diag_key(d) for d in baseline}
-            diags = [d for d in diags if _diag_key(d) not in seen]
-        # Roll the baseline forward so the next call is a delta against this state.
-        try:
-            fresh = self._loop.run(self._current_diags_async(file_path), timeout=2.0) or []
-        except Exception:  # noqa: BLE001
-            fresh = []
-        if fresh:
-            self._delta_baseline[abs_path] = fresh
-        return diags
+                previous = shift_baseline(previous, line_shift)
+            seen = {_diag_key(d) for d in previous}
+            result.delta = [d for d in result.diagnostics if _diag_key(d) not in seen]
+        # Roll forward the SAME full snapshot, including a fresh empty repair.
+        if delta:
+            self._delta_baseline[os.path.abspath(file_path)] = result
+        if result.diagnostics:
+            eventlog.log_diagnostic_outcome(result.server_id, file_path, len(result.diagnostics),
+                                           len(result.delta) if result.delta is not None else None)
+        else:
+            eventlog.log_clean(result.server_id, file_path)
+        return result
 
     def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
         """Mark the file's ``(server_id, root)`` pair broken after an outer timeout/error.
@@ -323,44 +333,32 @@ class LSPService:
 
     # ---- async internals ----
 
-    async def _snapshot_async(self, file_path: str) -> _Diags:
-        # No fresh data for the pre-edit content → empty baseline.  Safe: the delta
-        # filter then removes less, never more.  Never seed from stale stores.
-        return await self._open_and_wait_async(file_path, snapshot=True) or []
-
-    async def _open_and_wait_async(self, file_path: str, *, snapshot: bool = False) -> Optional[_Diags]:
-        """Open + wait for FRESH diagnostics: ``[]`` = checked clean, ``None`` = no verdict in budget.
-
-        Callers must not substitute stale data for either.  ``snapshot`` mode
-        (pre-write baseline) skips didSave and uses the default wait budget.
-        """
+    async def _query_outcome_async(self, file_path: str, *, snapshot: bool = False) -> DiagnosticOutcome:
         client = await self._get_or_spawn(file_path)
         if client is None:
-            return None
+            srv = find_server_for_file(file_path)
+            key = self._broken_key(srv, file_path) if srv else None
+            return DiagnosticOutcome("no_verdict", self._spawn_failures.get(key, "no_fresh_diagnostics"))
+        connection = client._proc
         try:
             version = await client.open_file(file_path, language_id=language_id_for(file_path))
             if not snapshot:
                 await client.save_file(file_path)
-            fresh = await client.wait_for_diagnostics(
-                file_path, version, mode=self._wait_mode, timeout=None if snapshot else self._wait_timeout,
-            )
-        except Exception as e:  # noqa: BLE001
-            if snapshot:
-                logger.debug("snapshot open/wait failed: %s", e)
-            else:
-                logger.debug("open/wait failed for %s: %s", file_path, e)
-            return None
+            fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode,
+                timeout=None if snapshot else self._wait_timeout)
+        except Exception:
+            return DiagnosticOutcome("no_verdict", "server_error" if client.is_running else "disconnected")
         self._touch(client)
-        return list(client.diagnostics_for(file_path, fresh_only=True)) if fresh else None
-
-    async def _current_diags_async(self, file_path: str) -> _Diags:
-        ws, gated = resolve_workspace_for_file(file_path)
-        srv = find_server_for_file(file_path)
-        if not (ws and gated and srv):
-            return []
-        with self._state_lock:
-            client = self._clients.get(_client_key(srv, ws))
-        return list(client.diagnostics_for(file_path, fresh_only=True)) if client else []
+        if not fresh:
+            return DiagnosticOutcome("no_verdict", "timeout" if client.is_running else "disconnected")
+        # No await between capture and attribution: diagnostics and source share a generation.
+        captured = client.diagnostic_snapshot(file_path)
+        if captured is None or client._proc is not connection or captured["version"] < version:
+            return DiagnosticOutcome("no_verdict", "no_fresh_diagnostics")
+        diags = captured["diagnostics"]
+        return DiagnosticOutcome("fresh", "diagnostics_present" if diags else "clean",
+            diagnostics=diags, server_id=client.server_id,
+            document_version=captured["version"], text=captured["text"])
 
     async def _get_or_spawn(self, file_path: str) -> Optional[LSPClient]:
         srv = find_server_for_file(file_path)
@@ -428,10 +426,12 @@ class LSPService:
             spec = srv.build_spawn(root, ctx)
         except ValueError as exc:
             eventlog.log_spawn_failed(srv.server_id, root, exc)
+            self._spawn_failures[(srv.server_id, root)] = "server_unavailable"
             return None
         if spec is None:
             # Binary not locatable (auto-install off, manual-only, or install failed) — surface once.
             eventlog.log_server_unavailable(srv.server_id, srv.server_id)
+            self._spawn_failures[(srv.server_id, root)] = "server_unavailable"
             return None
         client = LSPClient(
             server_id=srv.server_id, workspace_root=spec.workspace_root, command=spec.command, env=spec.env,
@@ -442,6 +442,7 @@ class LSPService:
             await client.start()
         except Exception as e:  # noqa: BLE001
             eventlog.log_spawn_failed(srv.server_id, root, e)
+            self._spawn_failures[(srv.server_id, root)] = "server_error"
             return None
         return client
 

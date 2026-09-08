@@ -701,6 +701,14 @@ class LSPClient:
                 continue
             await self._await_push(min(remaining, 0.5))
 
+    def diagnostic_snapshot(self, path: str) -> Optional[Dict[str, Any]]:
+        """Observe one current generation without yielding; call on the client loop."""
+        doc = self._docs.get(os.path.abspath(path))
+        if not self.is_running or doc is None or not doc.fresh():
+            return None
+        return {"diagnostics": list(self.diagnostics_for(path, fresh_only=True)),
+                "text": doc.text, "version": doc.version}
+
     def diagnostics_for(self, path: str, *, fresh_only: bool = False) -> List[Dict[str, Any]]:
         """Merged + deduped push/pull diagnostics for one file.  With ``fresh_only=True`` a store only
         contributes once its version tag has caught up to the document's — report paths must use this
