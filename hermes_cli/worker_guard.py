@@ -19,7 +19,7 @@ import stat
 import subprocess
 import sys
 import time
-from typing import Any
+from typing import Any, Callable
 
 
 class GuardError(RuntimeError):
@@ -81,7 +81,9 @@ def _verify_runtime_witnesses(witnesses: list[tuple], deadline: float) -> None:
 
 
 def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tuple[Path, ...],
-                           credential_roots: tuple[Path, ...], deadline: float) -> list[tuple]:
+                           credential_roots: tuple[Path, ...], deadline: float,
+                           *, defer_readback: bool = False,
+                           node_budget: list[int] | None = None) -> list[tuple]:
     """Inspect nested nodes without following directory aliases or hiding I/O errors.
 
     Exact interpreter trees already carry executable-equivalent trust and uv may
@@ -90,6 +92,8 @@ def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tup
     """
     count = 0
     witnesses = []
+    if node_budget is None:
+        node_budget = [100000]
 
     def walk(fd: int, directory: Path, depth: int) -> None:
         nonlocal count
@@ -100,7 +104,8 @@ def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tup
         with os.scandir(fd) as entries:
             for entry in entries:
                 count += 1
-                if count > 100000 or time.monotonic() >= deadline:
+                node_budget[0] -= 1
+                if node_budget[0] < 0 or time.monotonic() >= deadline:
                     raise GuardError("runtime credential inspection bound exceeded")
                 if entry.name in _CREDENTIAL_NAMES:
                     raise GuardError("runtime mount contains nested credential material")
@@ -140,7 +145,7 @@ def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tup
                         raise GuardError("unsafe nested runtime symlink target")
                 else:
                     raise GuardError("unsafe nested runtime node type")
-                if not stat.S_ISDIR(info.st_mode):
+                if stat.S_ISLNK(info.st_mode):
                     witnesses.append((path, _mount_node_identity(info), target, target_identity))
                 if _mount_node_identity(os.stat(entry.name, dir_fd=fd, follow_symlinks=False)) != _mount_node_identity(info):
                     raise GuardError("runtime node changed during credential inspection")
@@ -154,7 +159,8 @@ def _validate_runtime_tree(root: Path, trusted_runtime: bool, runtime_roots: tup
             walk(fd, root, 0)
         finally:
             os.close(fd)
-        _verify_runtime_witnesses(witnesses, deadline)
+        if not defer_readback:
+            _verify_runtime_witnesses(witnesses, deadline)
         return witnesses
     except (OSError, RuntimeError) as error:
         if isinstance(error, GuardError):
@@ -272,12 +278,16 @@ class GuardSpec:
         protected = tuple(root for _, lexical, physical in credential_roots for root in (lexical, physical))
         inspection_deadline = min(self.deadline_monotonic, time.monotonic() + 10)
         witnesses = []
+        node_budget = [100000]
         for directory, trusted in directory_mounts:
-            witnesses.extend(_validate_runtime_tree(directory, trusted, runtime_roots, protected, inspection_deadline))
+            witnesses.extend(_validate_runtime_tree(directory, trusted, runtime_roots, protected, inspection_deadline,
+                                                    defer_readback=True, node_budget=node_budget))
             if len(witnesses) > 100000:
                 raise GuardError("runtime credential inspection bound exceeded")
         # A later sibling or mount may change an already-completed subtree.
-        # Retain all witnesses until every selected tree has been inspected.
+        # Retain structural witnesses until every selected tree is inspected.
+        # Replacing a regular node changes its parent directory. File-content
+        # attestation belongs to the caller's approved source/configuration proof.
         _verify_runtime_witnesses(witnesses, inspection_deadline)
         executable = Path(self.command[0]).resolve(strict=True)
         if not any(executable == p.resolve() or executable.is_relative_to(p.resolve()) for p in paths):
@@ -374,12 +384,25 @@ def reconcile_guard(spec: GuardSpec, receipt_path: str | Path) -> dict[str, Any]
     return value
 
 
-def launch_guard(spec: GuardSpec, broker_fd: int) -> GuardHandle:
+def launch_guard(spec: GuardSpec, broker_fd: int, *,
+                 after_validation: Callable[[GuardSpec], None] | None = None) -> GuardHandle:
     """Launch only a contained subprocess; the supplied FD must be connected."""
     import socket
+    validated_identity = digest(asdict(spec))
     spec.validate()
-    if not lease_valid(spec):
-        raise GuardError("fresh canonical-authority lease required")
+
+    def check_authority() -> None:
+        if after_validation is not None:
+            # Only the fixed host callback rechecks canonical authority and
+            # renews. The guard itself never grants or extends a lease.
+            if after_validation(spec) is not None:
+                raise GuardError("authority callback must return None")
+        if digest(asdict(spec)) != validated_identity:
+            raise GuardError("guardian specification changed after validation")
+        if not lease_valid(spec):
+            raise GuardError("fresh canonical-authority lease required")
+
+    check_authority()
     probe = socket.fromfd(broker_fd, socket.AF_UNIX, socket.SOCK_STREAM)
     try:
         if (probe.getsockopt(socket.SOL_SOCKET, getattr(socket, "SO_DOMAIN", 39)) != socket.AF_UNIX
@@ -399,23 +422,42 @@ def launch_guard(spec: GuardSpec, broker_fd: int) -> GuardHandle:
     helper = Path(__file__).with_name("worker_guard_child.py")
     error_log = open(run / "stderr.log", "xb")
     try:
+        check_authority()
         process = subprocess.Popen(
             [sys.executable, "-I", str(helper), "supervise", str(spec_path), str(broker_fd), str(ready_write)],
             pass_fds=(broker_fd, ready_write), stdin=subprocess.DEVNULL,
             stdout=subprocess.DEVNULL, stderr=error_log,
             env={"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8"}, start_new_session=True,
         )
+    except BaseException:
+        os.close(ready_read)
+        raise
     finally:
         error_log.close()
         os.close(ready_write)
     try:
         identity = ProcessIdentity.capture(process.pid)
-        readable, _, _ = select.select([ready_read], [], [], min(10, max(0.1, spec.deadline_monotonic - time.monotonic())))
-        result = os.read(ready_read, 65536) if readable else b""
+        startup_deadline = min(time.monotonic() + 10, spec.deadline_monotonic)
+        result = b""
+        while time.monotonic() < startup_deadline:
+            check_authority()
+            remaining = startup_deadline - time.monotonic()
+            if remaining <= 0:
+                break
+            readable, _, _ = select.select([ready_read], [], [], min(0.5, remaining))
+            if readable:
+                result = os.read(ready_read, 65536)
+                break
         if not result or json.loads(result).get("state") != "contained":
-            process.kill()
-            process.wait(timeout=5)
             raise GuardError("containment failed: " + (run / "stderr.log").read_text(encoding="utf-8", errors="replace")[-3000:])
+        check_authority()
+        if time.monotonic() >= startup_deadline:
+            raise GuardError("containment startup deadline exceeded")
         return GuardHandle(process, identity, receipt, stop)
+    except BaseException:
+        if process.poll() is None:
+            process.kill()
+        process.wait(timeout=5)
+        raise
     finally:
         os.close(ready_read)

@@ -337,7 +337,7 @@ def test_nested_credential_names_are_refused_before_launch(tmp_path, relative):
 
 
 @pytest.mark.linux_only
-@pytest.mark.parametrize("kind", ["symlink", "fifo", "late_credential", "completed_child", "completed_mount", "unreadable"])
+@pytest.mark.parametrize("kind", ["symlink", "fifo", "late_credential", "completed_child", "completed_child_hardlink", "completed_mount", "unreadable"])
 def test_recursive_runtime_inspection_fails_closed_on_unsafe_nodes_and_changes(tmp_path, monkeypatch, kind):
     mount = tmp_path / "selected-runtime"
     nested = mount / "package"
@@ -353,8 +353,8 @@ def test_recursive_runtime_inspection_fails_closed_on_unsafe_nodes_and_changes(t
     else:
         original = os.scandir
         target_identity = (nested.stat().st_dev, nested.stat().st_ino)
-        if kind in {"completed_child", "completed_mount"}:
-            later = (mount if kind == "completed_child" else tmp_path) / "later"
+        if kind in {"completed_child", "completed_child_hardlink", "completed_mount"}:
+            later = (tmp_path if kind == "completed_mount" else mount) / "later"
             later.mkdir()
             (later / "ordinary.data").write_text("later sibling", encoding="utf-8")
             target_identity = (later.stat().st_dev, later.stat().st_ino)
@@ -370,7 +370,13 @@ def test_recursive_runtime_inspection_fails_closed_on_unsafe_nodes_and_changes(t
             def __exit__(self, *args):
                 self.scan.close()
                 if self.mutate:
-                    (nested / "auth.json").write_text("late inert credential", encoding="utf-8")
+                    if kind == "completed_child_hardlink":
+                        secret = tmp_path / "unmounted-credential"
+                        secret.write_text("inert hidden credential", encoding="utf-8")
+                        safe.unlink()
+                        os.link(secret, safe)
+                    else:
+                        (nested / "auth.json").write_text("late inert credential", encoding="utf-8")
 
         def changing_scan(fd):
             info = os.fstat(fd)
@@ -548,6 +554,171 @@ def test_actual_trusted_runtime_directory_remains_usable(tmp_path, namespace_cap
         if handle.process.poll() is None:
             handle.stop()
             handle.wait()
+
+
+@pytest.mark.linux_only
+def test_first_pass_copied_native_mount_validation_preserves_startup_lease_margin(tmp_path, namespace_capability):
+    from hermes_cli.worker_guard import lease_valid
+
+    copied = tmp_path / "copied-source"
+    shutil.copytree(Path(__file__).parents[2], copied,
+                    ignore=shutil.ignore_patterns(".git", ".venv", "venv", "node_modules", "__pycache__",
+                                                 ".pytest_cache", ".ruff_cache", "outputs"))
+    policy = tmp_path / "policy.json"
+    policy.write_text("{}", encoding="utf-8")
+    spec = make_spec(tmp_path, "pass", seconds=30)
+    spec = replace(spec, command=(sys.executable, "/workspace/probe.py"),
+                   read_only_paths=(*spec.read_only_paths, str(Path(sys.base_prefix).resolve().parent),
+                                    str(Path(sys.prefix)), str(copied), str(policy)))
+    # First traversal of fresh source inodes, with no cached validation receipt.
+    # Slow pre-authorization I/O must not consume the actual five-second lease.
+    authorized_at = []
+
+    def revalidate_authority(current):
+        assert current.controller == ProcessIdentity.capture(os.getpid())
+        assert current.scope == spec.scope
+        authorized_at.append(time.monotonic())
+        renew_lease(current.lease_path, current, ttl=5)
+
+    server, worker = socket.socketpair()
+    handle = None
+    try:
+        handle = launch_guard(spec, worker.fileno(), after_validation=revalidate_authority)
+        elapsed = time.monotonic() - authorized_at[-1]
+        assert lease_valid(spec), f"contained startup consumed canonical lease: {elapsed:.3f}s"
+        assert elapsed < 4, f"contained startup lacks one-second lease margin: {elapsed:.3f}s"
+        expires = json.loads(Path(spec.lease_path).read_text(encoding="utf-8"))["expires_monotonic"]
+        assert expires - time.monotonic() >= 1, "durable startup lease lacks one-second margin"
+        receipt = handle.wait()
+        assert receipt["exit_verified"] and receipt["artifacts_exported"]
+    finally:
+        server.close()
+        worker.close()
+        if handle is not None and handle.process.poll() is None:
+            handle.stop()
+            handle.wait()
+
+
+@pytest.mark.linux_only
+def test_slow_validation_requires_fresh_host_callback_before_launch(tmp_path, monkeypatch, namespace_capability):
+    from hermes_cli.worker_guard import lease_valid
+
+    spec = make_spec(tmp_path, "from pathlib import Path\nPath('/workspace/callback-ok').write_text('done')", seconds=20)
+    original = GuardSpec.validate
+    validated = []
+
+    def slow_validation(current):
+        original(current)
+        # Model a cold filesystem without replacing any containment check.
+        time.sleep(5.1)
+        validated.append(current.scope_sha256)
+
+    monkeypatch.setattr(GuardSpec, "validate", slow_validation)
+    renew_lease(spec.lease_path, spec, ttl=5)
+    callbacks = []
+
+    def revalidate_authority(current):
+        assert validated == [current.scope_sha256]
+        if not callbacks:
+            assert not lease_valid(current), "pre-scan lease must expire in this regression"
+        callbacks.append(current.scope_sha256)
+        assert current.controller == ProcessIdentity.capture(os.getpid())
+        assert current.scope == spec.scope
+        renew_lease(current.lease_path, current, ttl=5)
+
+    server, worker = socket.socketpair()
+    handle = None
+    try:
+        handle = launch_guard(spec, worker.fileno(), after_validation=revalidate_authority)
+        receipt = handle.wait()
+        assert receipt["exit_verified"] and receipt["artifacts_exported"]
+        assert (Path(receipt["artifacts_path"]) / "callback-ok").read_text(encoding="utf-8") == "done"
+    finally:
+        server.close()
+        worker.close()
+        if handle is not None and handle.process.poll() is None:
+            handle.stop()
+            handle.wait()
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("callback_kind", ["omitted", "refused", "mutated_scope", "invalid_lease", "returned_false", "returned_value"])
+def test_after_validation_cannot_release_missing_authority_or_changed_spec(tmp_path, callback_kind):
+    spec = make_spec(tmp_path, "raise AssertionError('invalid callback must not launch')")
+    renew_lease(spec.lease_path, spec, ttl=5)
+    lease = Path(spec.lease_path)
+    stale = json.loads(lease.read_text(encoding="utf-8"))
+    stale["expires_monotonic"] = time.monotonic() - 1
+    lease.write_text(json.dumps(stale), encoding="utf-8")
+
+    def callback(current):
+        if callback_kind == "refused":
+            raise GuardError("canonical authority refused")
+        if callback_kind in {"returned_false", "returned_value"}:
+            renew_lease(current.lease_path, current, ttl=5)
+            return False if callback_kind == "returned_false" else "approved"
+        if callback_kind == "mutated_scope":
+            current.scope["generation"] += 1
+            renew_lease(current.lease_path, current, ttl=5)
+        # invalid_lease intentionally leaves the expired lease untouched.
+
+    with pytest.raises(GuardError, match="authority|specification changed|fresh canonical-authority lease|callback"):
+        # A bogus FD proves refusal precedes even broker duplication, not just
+        # process creation. No mock replaces socket or process enforcement.
+        launch_guard(spec, -1, after_validation=None if callback_kind == "omitted" else callback)
+    assert list(Path(spec.state_dir).iterdir()) == [lease]
+
+
+@pytest.mark.linux_only
+@pytest.mark.parametrize("refuse_after_spawn", [False, True])
+def test_startup_rechecks_authority_and_kills_helper_on_lost_fence(tmp_path, monkeypatch, namespace_capability, refuse_after_spawn):
+    spec = make_spec(tmp_path, "from pathlib import Path\nPath('/workspace/started').write_text('inert worker')", seconds=25)
+    original = subprocess.Popen
+    helpers = []
+    callbacks = []
+    expected_scope = spec.scope_sha256
+
+    def delayed_helper(command, **options):
+        # Delay the real helper's exec, not its containment implementation.
+        # No worker runs during this controlled startup pause.
+        wrapper = "import os,sys,time;time.sleep(6);os.execv(sys.argv[1],sys.argv[1:])"
+        process = original([sys.executable, "-I", "-c", wrapper, *command], **options)
+        helpers.append(process)
+        return process
+
+    def revalidate_authority(current):
+        assert current.scope_sha256 == expected_scope
+        assert current.controller == ProcessIdentity.capture(os.getpid())
+        if helpers and refuse_after_spawn:
+            raise GuardError("canonical fence lost during startup")
+        renew_lease(current.lease_path, current, ttl=5)
+        callbacks.append(time.monotonic())
+
+    monkeypatch.setattr(subprocess, "Popen", delayed_helper)
+    server, worker = socket.socketpair()
+    handle = None
+    try:
+        if refuse_after_spawn:
+            with pytest.raises(GuardError, match="canonical fence lost"):
+                launch_guard(spec, worker.fileno(), after_validation=revalidate_authority)
+            assert len(helpers) == 1 and helpers[0].poll() is not None
+            assert not (Path(spec.state_dir) / "artifacts").exists()
+        else:
+            handle = launch_guard(spec, worker.fileno(), after_validation=revalidate_authority)
+            assert callbacks[-1] - callbacks[0] >= 6
+            assert len(callbacks) > 4, "startup must repeatedly reread authority"
+            expires = json.loads(Path(spec.lease_path).read_text(encoding="utf-8"))["expires_monotonic"]
+            assert expires - time.monotonic() >= 1
+            receipt = handle.wait()
+            assert receipt["exit_verified"] and receipt["artifacts_exported"]
+            assert (Path(receipt["artifacts_path"]) / "started").read_text(encoding="utf-8") == "inert worker"
+    finally:
+        server.close()
+        worker.close()
+        for process in helpers:
+            if process.poll() is None:
+                process.kill()
+            process.wait(timeout=5)
 
 
 @pytest.mark.linux_only
