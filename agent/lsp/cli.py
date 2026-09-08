@@ -1,4 +1,4 @@
-"""``hermes lsp`` CLI subcommand: status / list / install / install-all / restart / which.
+"""``hermes lsp`` CLI subcommand: status / list / install / install-all / restart / which / check.
 
 Handlers live here (not in ``hermes_cli/main.py``) so the LSP module ships self-contained.
 """
@@ -24,6 +24,7 @@ _SUBCOMMANDS = [
      lambda a: _cmd_install_all(getattr(a, "include_manual", False))),
     ("restart", "Tear down running LSP clients (next edit re-spawns)", None, lambda a: _cmd_restart()),
     ("which", "Print binary path for a server", ("server", {"help": "Server id"}), lambda a: _cmd_which(a.server)),
+    ("check", "Check explicit files without modifying source", None, lambda a: _cmd_check(a)),
 ]
 _COMMANDS = {name: handler for name, _, _, handler in _SUBCOMMANDS}
 
@@ -40,6 +41,10 @@ def register_subparser(subparsers: argparse._SubParsersAction) -> None:
         p = sub.add_parser(name, help=help_text)
         if arg is not None:
             p.add_argument(arg[0], **arg[1])
+        if name == "check":
+            p.add_argument("files", nargs="+", help="Up to 16 explicit files, relative to the invocation directory")
+            p.add_argument("--root", help="Directory selecting the Git worktree (default: current directory)")
+            p.add_argument("--json", action="store_true", help="Emit bounded full diagnostic outcomes as JSON")
     parser.set_defaults(func=run_lsp_command)
 
 
@@ -54,6 +59,25 @@ def run_lsp_command(args: argparse.Namespace) -> int:
         return handler(args)
     except KeyboardInterrupt:
         return 130
+
+
+def _cmd_check(args: argparse.Namespace) -> int:
+    import json
+    from agent.lsp.check import check_files
+    result, code = check_files(args.files, root=args.root)
+    if args.json:
+        sys.stdout.write(json.dumps(result, ensure_ascii=True) + "\n")
+    else:
+        for row in result["files"]:
+            sys.stdout.write(f"{row['path']}: {row['status']} ({row['reason']})\n")
+            if row.get("total") is not None:
+                sys.stdout.write("  " + json.dumps(row["total"]) + "\n")
+            if row.get("lsp_diagnostics"):
+                sys.stdout.write(row["lsp_diagnostics"] + "\n")
+        if result["omitted_files"]:
+            sys.stdout.write(f"{result['omitted_files']} file results omitted by output bounds.\n")
+        sys.stdout.write(result["guidance"] + "\n")
+    return code
 
 
 def _status_for(server_id: str) -> str:

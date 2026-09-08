@@ -77,7 +77,7 @@ class _BackgroundLoop:
             raise RuntimeError("background loop not running")
         try:
             return fut.result(timeout=timeout)
-        except Exception:
+        except BaseException:
             fut.cancel()
             raise
 
@@ -95,7 +95,7 @@ class _BackgroundLoop:
 
 
 class LSPService:
-    """The process-wide LSP service; use :func:`agent.lsp.get_service` rather than constructing directly."""
+    """LSP lifecycle owner; normal writes use the singleton, explicit CLI checks own an instance."""
 
     def __init__(
         self, *, enabled: bool, wait_mode: str, wait_timeout: float, install_strategy: str,
@@ -123,6 +123,7 @@ class LSPService:
         self._clients: Dict[_Key, LSPClient] = {}
         self._broken: set = set()
         self._spawning: Dict[_Key, asyncio.Future] = {}
+        self._starting: Dict[LSPClient, asyncio.Task] = {}
         self._last_used: Dict[_Key, float] = {}
         self._state_lock = threading.Lock()
         self._idle_reaper_task: Optional[asyncio.Task] = None
@@ -134,8 +135,8 @@ class LSPService:
             self._loop.run(self._start_idle_reaper(), timeout=2.0)
 
     @classmethod
-    def create_from_config(cls) -> Optional["LSPService"]:
-        """Build a service from ``hermes_cli.config``; ``None`` if config can't load."""
+    def create_from_config(cls, *, install_strategy_override: Optional[str] = None) -> Optional["LSPService"]:
+        """Build from profile config; an owned check may disable acquisition without editing config."""
         try:
             from hermes_cli.config import load_config_readonly
             cfg = load_config_readonly()
@@ -158,7 +159,8 @@ class LSPService:
             enabled=bool(lsp_cfg.get("enabled", True)),
             wait_mode=lsp_cfg.get("wait_mode", "document"),
             wait_timeout=float(lsp_cfg.get("wait_timeout", DIAGNOSTICS_DOCUMENT_WAIT)),
-            install_strategy=lsp_cfg.get("install_strategy", "auto"),
+            install_strategy=(install_strategy_override if install_strategy_override is not None
+                              else lsp_cfg.get("install_strategy", "auto")),
             binary_overrides={n: c["command"] for n, c in servers.items()
                               if isinstance(c.get("command"), list) and c["command"]},
             env_overrides={n: {k: str(v) for k, v in c["env"].items()} for n, c in servers.items()
@@ -240,14 +242,20 @@ class LSPService:
     def get_diagnostic_outcome_sync(
         self, file_path: str, *, delta: bool = True, timeout: Optional[float] = None,
         line_shift: Optional[Callable[[int], Optional[int]]] = None,
-        pre_content: Optional[str] = None, post_content: Optional[str] = None,
+        pre_content: Optional[str] = None, post_content: Optional[str] = None, read_only: bool = False,
     ) -> DiagnosticOutcome:
-        """Return one source-attributed full result and optional known-baseline delta."""
+        """Return one source-attributed result. read_only requires supplied text and reports full counts."""
+        if read_only:
+            delta = False
+            if post_content is None:
+                return DiagnosticOutcome("not_checked", "invalid_input")
         baseline = self._delta_baseline.get(os.path.abspath(file_path)) if delta else None
         try:
             result = self._ineligible_outcome(file_path)
             if result is None:
-                result = self._loop.run(self._query_outcome_async(file_path),
+                query = (self._query_outcome_async(file_path, read_only_text=normalized_text(post_content))
+                         if read_only else self._query_outcome_async(file_path))
+                result = self._loop.run(query,
                     timeout=timeout if timeout is not None else self._wait_timeout + 2.0)
         except Exception as exc:
             self._mark_broken_for_file(file_path, exc)
@@ -333,7 +341,8 @@ class LSPService:
 
     # ---- async internals ----
 
-    async def _query_outcome_async(self, file_path: str, *, snapshot: bool = False) -> DiagnosticOutcome:
+    async def _query_outcome_async(self, file_path: str, *, snapshot: bool = False,
+                                   read_only_text: Optional[str] = None) -> DiagnosticOutcome:
         client = await self._get_or_spawn(file_path)
         if client is None:
             srv = find_server_for_file(file_path)
@@ -341,8 +350,15 @@ class LSPService:
             return DiagnosticOutcome("no_verdict", self._spawn_failures.get(key, "no_fresh_diagnostics"))
         connection = client._proc
         try:
-            version = await client.open_file(file_path, language_id=language_id_for(file_path))
-            if not snapshot:
+            if read_only_text is None:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path))
+            else:
+                version = await client.open_file(file_path, language_id=language_id_for(file_path), text=read_only_text)
+                if version == 0:
+                    # A first unversioned push remains quarantined. Establish an
+                    # edit generation for the existing bounded refresh mechanism.
+                    version = await client.open_file(file_path, language_id=language_id_for(file_path), text=read_only_text)
+            if not snapshot and read_only_text is None:
                 await client.save_file(file_path)
             fresh = await client.wait_for_diagnostics(file_path, version, mode=self._wait_mode,
                 timeout=None if snapshot else self._wait_timeout)
@@ -390,7 +406,7 @@ class LSPService:
                 spawning = self._spawning[key] = asyncio.get_running_loop().create_future()
         if not owner:
             try:
-                client = await spawning
+                client = await asyncio.shield(spawning)
             except Exception:  # noqa: BLE001
                 return None
             return await self._attach_root(srv, client, root) if client is not None else None
@@ -403,8 +419,13 @@ class LSPService:
                     self._clients[key] = client
                     self._last_used[key] = time.time()
                 eventlog.log_active(srv.server_id, root)
-            spawning.set_result(client)
+            if not spawning.done():
+                spawning.set_result(client)
             return client
+        except BaseException:
+            if not spawning.done():
+                spawning.cancel()
+            raise
         finally:
             with self._state_lock:
                 self._spawning.pop(key, None)
@@ -438,12 +459,20 @@ class LSPService:
             cwd=spec.cwd, initialization_options=spec.initialization_options,
             seed_diagnostics_on_first_push=spec.seed_diagnostics_on_first_push or srv.seed_first_push,
         )
+        self._starting[client] = asyncio.current_task()
         try:
             await client.start()
+        except asyncio.CancelledError:
+            # start() has not registered the client yet; retain ownership until
+            # its process is reaped, including cancelled initialization.
+            await client.shutdown()
+            raise
         except Exception as e:  # noqa: BLE001
             eventlog.log_spawn_failed(srv.server_id, root, e)
             self._spawn_failures[(srv.server_id, root)] = "server_error"
             return None
+        finally:
+            self._starting.pop(client, None)
         return client
 
     def _touch(self, client: LSPClient) -> None:
@@ -480,6 +509,12 @@ class LSPService:
             await asyncio.gather(*(client.shutdown() for client in clients), return_exceptions=True)
 
     async def _shutdown_async(self) -> None:
+        starting_tasks = set(self._starting.values())
+        for task in starting_tasks:
+            if not task.cancelling():
+                task.cancel()
+        if starting_tasks:
+            await asyncio.gather(*starting_tasks, return_exceptions=True)
         if (reaper := self._idle_reaper_task) is not None:
             self._idle_reaper_task = None
             reaper.cancel()

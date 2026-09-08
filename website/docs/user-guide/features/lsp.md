@@ -10,8 +10,9 @@ Hermes runs full language servers — pyright, gopls, rust-analyzer,
 typescript-language-server, clangd, and ~20 more — as background
 subprocesses and feeds their semantic diagnostics into the post-write
 lint check used by `write_file` and `patch`. When the agent edits a
-file, it sees exactly the errors that edit introduced — not just
-syntax errors, but **type errors, undefined names, missing imports,
+file, it receives structured diagnostic outcomes and, when a baseline
+is available, the new diagnostics introduced by that edit. These include
+**type errors, undefined names, missing imports,
 and project-wide semantic issues** the language server detects.
 
 This is the same architecture top-tier coding agents use. Hermes
@@ -131,6 +132,7 @@ hermes lsp install <id>    # eagerly install one server
 hermes lsp install-all     # try every server with a known recipe
 hermes lsp restart         # tear down running clients
 hermes lsp which <id>      # print resolved binary path
+hermes lsp check --json src/example.py src/example.ts  # explicit current-file checks
 ```
 
 `hermes lsp status` shows binary availability and process-local client state.
@@ -140,6 +142,49 @@ active profile. `prerequisites-present` means `tsserver.js` and SDK version meta
 were found; it does **not** run initialization or validate a diagnostic response.
 `sdk-unavailable` includes a repair hint. JSON output includes this information in
 the TypeScript registry row's `backend` field.
+
+### Checking externally edited files or reviewing without writes
+
+After a terminal script, generator, or external editor changes a known file set:
+
+```bash
+hermes lsp check --json src/example.py src/example.ts
+hermes lsp check --root /path/to/worktree /path/to/worktree/src/example.py
+```
+
+Paths are relative to the invocation directory, even with `--root`. The selected
+root must be a real Git worktree. The command accepts up to 16 explicit arguments,
+deduplicates canonical paths within that batch, and checks existing regular files
+inside that worktree. It rejects external/nested repositories, symlink escapes,
+nonregular or unreadable files, files over 1 MiB and batches over 8 MiB before
+starting a language server. Deleted paths remain `not_checked/missing_file`; a
+moved file can be supplied at both its old and new paths.
+
+This command does not write source files, perform a no-op edit or install managed
+dependencies. It starts a profile-configured server when available and synchronizes
+the supplied source in memory. The server may write its own metadata/cache; this
+is not a sandbox for configured commands. It does not automatically verify every
+shell edit or run repository-native tests.
+
+JSON contains per-file `fresh`, `no_verdict` or `not_checked` results, full severity
+counts, and bounded diagnostic text. Explicit checks use `baseline: not_requested`
+and `delta: null`. A fresh result includes the checked normalized text hash, client
+document version and server id. These are client-tracked snapshots, not a causal
+attestation for arbitrary delayed unversioned messages. Source or Git context drift
+during a check invalidates the verdict. There is no text-only cache across checks:
+dependency changes can alter diagnostics without changing the target file.
+
+Exit code 0 requires every requested unique file to have a fresh total of zero;
+1 means fresh diagnostics are present; 2 means invalid, unverified or omitted
+results; interruption returns 130. Output is capped at 20,000 serialized characters
+and reports omissions. Full severity counts include diagnostic text filtered by the
+normal reporter, whose rendered/truncated metadata remains explicit.
+
+The request budget is 30 seconds across validation and checks, followed by separate
+bounded server cleanup. Existing per-document waits (five seconds by default) stay
+unchanged. Cold startup can return `no_verdict/timeout`; absence of diagnostic text
+is not a clean result. Use the repository's documented type checks/tests for files
+without fresh evidence. Semantic checks do not replace tests.
 
 ### TypeScript SDK compatibility
 

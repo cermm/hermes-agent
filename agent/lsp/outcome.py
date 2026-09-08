@@ -64,7 +64,8 @@ class DiagnosticOutcome:
                 "document_version": self.document_version, "text_sha256": text_hash(self.text),
                 "freshness": "client_tracked"}
         selected = self.delta if self.delta is not None else self.diagnostics
-        text, report = render_diagnostics(path, selected, baseline_known=self.baseline == "available")
+        text, report = render_diagnostics(path, selected, baseline_known=self.baseline == "available",
+                                          baseline_requested=self.baseline != "not_requested")
         record["report"] = report
         return text, record
 
@@ -90,14 +91,16 @@ def verification(records: list[dict], *, omitted: int = 0) -> dict:
     return result
 
 
-def render_diagnostics(path: str, diagnostics: list[dict], *, baseline_known: bool) -> tuple[str, dict]:
+def render_diagnostics(path: str, diagnostics: list[dict], *, baseline_known: bool,
+                       baseline_requested: bool = True) -> tuple[str, dict]:
     eligible = [d for d in diagnostics if type(d.get("severity") or 1) is int
                 and (d.get("severity") or 1) in reporter.DEFAULT_SEVERITIES]
     meta = {"eligible": len(eligible), "rendered": 0, "truncated": False}
     if not eligible:
         return "", meta
     prefix = ("LSP diagnostics introduced by this edit:\n" if baseline_known else
-              "Current LSP diagnostics (baseline unavailable):\n")
+              "Current LSP diagnostics (baseline unavailable):\n" if baseline_requested else
+              "Current LSP diagnostics:\n")
     safe_path = reporter._sanitize_field(path, limit=512).replace('"', "&quot;")
     header, footer = f'<diagnostics file="{safe_path}">\n', "\n</diagnostics>"
     lines = []
