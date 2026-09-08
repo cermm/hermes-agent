@@ -306,7 +306,7 @@ class LSPService:
         return result
 
     def _mark_broken_for_file(self, file_path: str, exc: BaseException) -> None:
-        """Mark the file's ``(server_id, root)`` pair broken after an outer timeout/error.
+        """Mark failed startup/transport pairs broken, preserving live clients on query timeout.
         The outer ``_loop.run`` timeout cancels the in-flight spawn before ``_get_or_spawn`` could record
         the failure; without this every later write would re-pay the full timeout.  Also kills any
         half-initialized client and logs the failure once."""
@@ -314,10 +314,15 @@ class LSPService:
         key = self._broken_key(srv, file_path) if srv is not None else None
         if key is None:
             return
-        already_broken = key in self._broken
-        self._broken.add(key)
         ckey = _client_key(srv, key[1])
         with self._state_lock:
+            client = self._clients.get(ckey)
+            # Registration follows successful initialization. An outer query
+            # deadline cancels that operation, not an otherwise live connection.
+            if isinstance(exc, TimeoutError) and client is not None and client.is_running:
+                return
+            already_broken = key in self._broken
+            self._broken.add(key)
             client = self._clients.pop(ckey, None)
             self._last_used.pop(ckey, None)
         if client is not None:
