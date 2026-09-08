@@ -1,0 +1,616 @@
+{
+  "schema": "semantic-worker-usefulness-results-v1",
+  "issue": "https://github.com/cermm/hermes-agent/issues/41",
+  "measurement_date": "2026-09-09",
+  "design": "Three synthetic tasks, one cold process run per arm, descriptive whole-stack comparison. No repeated samples or tool quotas.",
+  "sources": {
+    "baseline": "78b0188daaa477a67014d75e99ee4d45a18e0778",
+    "candidate": "b446d3f47f8f883f59b9201b5506a47ddcd4aca9",
+    "candidate_infrastructure": "06f8d9bcdef9d920c351dc037f14c3923d979a9f",
+    "later_unmeasured_published_Hermes": "47b9adb1f13886286237268d61fb41daec5407d0"
+  },
+  "model": {
+    "name": "gpt-5.6-sol",
+    "provider": "openai-codex",
+    "effort": "medium",
+    "role": "builder-medium",
+    "settings_equal_across_arms": true
+  },
+  "runtime_versions": {
+    "Node": "22.22.3",
+    "Pyright": "1.1.409",
+    "typescript-language-server": "5.3.0",
+    "TypeScript": "6.0.3",
+    "Serena": "1.7.0"
+  },
+  "order": [
+    "B-P",
+    "B-T",
+    "B-F",
+    "C-T",
+    "C-F",
+    "C-P"
+  ],
+  "budgets": {
+    "per_case": {
+      "physical_requests": 8,
+      "wall_seconds": 480,
+      "serialized_input_bytes": 1200000,
+      "observed_input_tokens": 225000,
+      "observed_output_tokens": 16384
+    },
+    "max_total_physical_requests": 48,
+    "usage_limits_are_prospective": true,
+    "one_inflight_response_can_overshoot": true,
+    "usd_limit_or_savings_claim": null
+  },
+  "workloads": {
+    "P": {
+      "prompt": "Fix invoice_total in a5_fixture so each active invoice line contributes unit_cents multiplied by quantity, with shipping added once. Trace the actual imported implementation and preserve unrelated similarly named functions. Change only a5_fixture/pricing.py; leave the domain, callers, archive, analytics, tests and configuration unchanged. Verify representative quantities, including zero, and report what your evidence establishes without treating unavailable diagnostics as clean.",
+      "prompt_sha256": "600c00320f1d723147cd3b2090220145450ec5684874fb487e69c370eb0dcb01",
+      "source_hashes": {
+        "a5_fixture/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/domain.py": "bc7d109337e7ce6087731b81fffbd675b408bf2bdd0e3521eba30f7aab70117b",
+        "a5_fixture/pricing.py": "7643352a4383c170870f51f5bce3590106a323a2329500d49afd325b615a5834",
+        "a5_fixture/invoice.py": "ef65e056349ee6b00f6837ae6cbbbfc20f5ba6d3da339bd1b68ea8dc84a06d50",
+        "a5_fixture/archive/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/archive/pricing.py": "eb2c3d138183b4c019dab7b45e89d44121801577f444c86fe0fe647a47f0c58a",
+        "a5_fixture/analytics.py": "65dba84a09ea3b3838a4aa00fffb75ac1f3cf58f3a455aa5deeebbf5323d4918",
+        "a5_fixture/test_invoice.py": "38cc4c07c96d64b44b74b904019e825b23e4b29572da8b23cfdc0b450cf3356b",
+        "pyrightconfig.json": "b5129125324a54877e85b266b1de98f0f48b4f225c11d2770aa1a650ed936366",
+        "a5_fixture/README.md": "05e54196c2cab58cfc4738e0211f203e227a4787a1911754033eb6641fc5ab05"
+      },
+      "allowed_changes": [
+        "a5_fixture/pricing.py"
+      ],
+      "prohibited_hashes": {
+        "a5_fixture/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/domain.py": "bc7d109337e7ce6087731b81fffbd675b408bf2bdd0e3521eba30f7aab70117b",
+        "a5_fixture/invoice.py": "ef65e056349ee6b00f6837ae6cbbbfc20f5ba6d3da339bd1b68ea8dc84a06d50",
+        "a5_fixture/archive/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/archive/pricing.py": "eb2c3d138183b4c019dab7b45e89d44121801577f444c86fe0fe647a47f0c58a",
+        "a5_fixture/analytics.py": "65dba84a09ea3b3838a4aa00fffb75ac1f3cf58f3a455aa5deeebbf5323d4918",
+        "a5_fixture/test_invoice.py": "38cc4c07c96d64b44b74b904019e825b23e4b29572da8b23cfdc0b450cf3356b",
+        "pyrightconfig.json": "b5129125324a54877e85b266b1de98f0f48b4f225c11d2770aa1a650ed936366",
+        "a5_fixture/README.md": "05e54196c2cab58cfc4738e0211f203e227a4787a1911754033eb6641fc5ab05"
+      },
+      "decoy_hashes": {
+        "a5_fixture/archive/pricing.py": "eb2c3d138183b4c019dab7b45e89d44121801577f444c86fe0fe647a47f0c58a",
+        "a5_fixture/analytics.py": "65dba84a09ea3b3838a4aa00fffb75ac1f3cf58f3a455aa5deeebbf5323d4918"
+      }
+    },
+    "T": {
+      "prompt": "In a5_fixture, refactor the active DeliveryPlan contract from deliveryDate: string to deliveryAt: Date and update its genuine scheduling and rendering consumers. Fix the scheduler so leadDays is added exactly once without an extra day, keeping the input Date unchanged and the rendered YYYY-MM-DD output stable. Diagnose and repair the active typed mismatch as part of this change. Only contracts.ts, schedule.ts and render.ts may change. ArchivedDeliveryPlan, legacy_audit.ts, all tests and configuration must remain unchanged. legacy_audit.ts intentionally contains the pre-existing legacyBatchSize number/string TS2322 error; do not repair or suppress it, and do not claim the entire fixture is type-clean while it remains. Verify behavior and distinguish remaining diagnostics from the task repair and unavailable evidence.",
+      "prompt_sha256": "6a490d8d0ddf985ecc5e6b97fd3dded2f5d6a65ea07929cdb0dd61a257f343fa",
+      "source_hashes": {
+        "a5_fixture/package.json": "7d38de102f9d211b8a221ab5943610473c4b23aeee36e9a9cf0e22848e04b9d4",
+        "a5_fixture/tsconfig.json": "ff4ce315798e54520ee87b7bca58ac02e7e360972539ce345016754ec0a51aa8",
+        "a5_fixture/contracts.ts": "d30d4b7ac72d1fbac54b7945c65a774891ebc918efe44871a057cc88170cc449",
+        "a5_fixture/schedule.ts": "5d53bcdc51d8391aad633fb0b986979e37259aca70531d76b0f3e15d229ef263",
+        "a5_fixture/render.ts": "e35137d55d6094699b5edaa4397ca7d4ea9cceea5fb52260ffc9b297da5a2b80",
+        "a5_fixture/legacy_audit.ts": "a3eeda149ca1057c780e7d492c266ee9d55c4bb3b5c9c024ebc6b68cf5c7d991",
+        "a5_fixture/archive_contracts.ts": "e864c9030034953b6f6b39fc182c4283ff7afecda18f99f6d0f3acfeb92a96f8",
+        "a5_fixture/archive_render.ts": "d5fa8dd51d4a7afe72c2c09119c372f8a624257ce613965c70d188d872150ee4",
+        "a5_fixture/test_delivery.cjs": "932e9079df0c9885878f251efcf052bb35800b7ffe33389932124afb8843ce33",
+        "a5_fixture/README.md": "edf4cc58dd582feec4b036ab4fde721752ec33f6e533590803a0cb509542964d"
+      },
+      "allowed_changes": [
+        "a5_fixture/contracts.ts",
+        "a5_fixture/schedule.ts",
+        "a5_fixture/render.ts"
+      ],
+      "prohibited_hashes": {
+        "a5_fixture/package.json": "7d38de102f9d211b8a221ab5943610473c4b23aeee36e9a9cf0e22848e04b9d4",
+        "a5_fixture/tsconfig.json": "ff4ce315798e54520ee87b7bca58ac02e7e360972539ce345016754ec0a51aa8",
+        "a5_fixture/legacy_audit.ts": "a3eeda149ca1057c780e7d492c266ee9d55c4bb3b5c9c024ebc6b68cf5c7d991",
+        "a5_fixture/archive_contracts.ts": "e864c9030034953b6f6b39fc182c4283ff7afecda18f99f6d0f3acfeb92a96f8",
+        "a5_fixture/archive_render.ts": "d5fa8dd51d4a7afe72c2c09119c372f8a624257ce613965c70d188d872150ee4",
+        "a5_fixture/test_delivery.cjs": "932e9079df0c9885878f251efcf052bb35800b7ffe33389932124afb8843ce33",
+        "a5_fixture/README.md": "edf4cc58dd582feec4b036ab4fde721752ec33f6e533590803a0cb509542964d"
+      },
+      "decoy_hashes": {
+        "a5_fixture/archive_contracts.ts": "e864c9030034953b6f6b39fc182c4283ff7afecda18f99f6d0f3acfeb92a96f8",
+        "a5_fixture/archive_render.ts": "d5fa8dd51d4a7afe72c2c09119c372f8a624257ce613965c70d188d872150ee4"
+      }
+    },
+    "F": {
+      "prompt": "Fix bounded_index in a5_fixture/bounds.py so it clamps an integer to the inclusive lower/upper interval and still rejects reversed bounds with ValueError. Change only bounds.py and preserve the tests and configuration. Semantic navigation and native diagnostics are deliberately unavailable for this fixture; complete the task using available repository checks and state explicitly that semantic verification remains unavailable. Do not install, reconfigure, or bypass unavailable capabilities.",
+      "prompt_sha256": "11c6292eb44f195e218dcf66d01154831193ec76235d54755bbab1b628800ec6",
+      "source_hashes": {
+        "a5_fixture/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/bounds.py": "823fa8bea616d0c0ee1a9844bb8e903d597feddc12c44b7619efb0ea6bc2d6bd",
+        "a5_fixture/test_bounds.py": "762063353863f52f69d8073650b5b14a5cf92b0b1f5e502fb033094228fdd602",
+        "pyrightconfig.json": "b5129125324a54877e85b266b1de98f0f48b4f225c11d2770aa1a650ed936366",
+        "a5_fixture/README.md": "b04e75b6b50b6fc29a396b79484543b32a976bbe7dd1044039c9420e995c470f"
+      },
+      "allowed_changes": [
+        "a5_fixture/bounds.py"
+      ],
+      "prohibited_hashes": {
+        "a5_fixture/__init__.py": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+        "a5_fixture/test_bounds.py": "762063353863f52f69d8073650b5b14a5cf92b0b1f5e502fb033094228fdd602",
+        "pyrightconfig.json": "b5129125324a54877e85b266b1de98f0f48b4f225c11d2770aa1a650ed936366",
+        "a5_fixture/README.md": "b04e75b6b50b6fc29a396b79484543b32a976bbe7dd1044039c9420e995c470f"
+      },
+      "decoy_hashes": {}
+    }
+  },
+  "runs": [
+    {
+      "id": "B-P",
+      "arm": "baseline",
+      "workload": "P",
+      "attempts": 1,
+      "model_completed": true,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": true,
+      "source_sha": "78b0188daaa477a67014d75e99ee4d45a18e0778",
+      "fixture_commit": "d13c62bbd71ca6e52bf8e3e585b1bd82b55f7940",
+      "metrics": {
+        "physical_dispatched_calls": 6,
+        "observed_input_tokens": 227392,
+        "observed_output_tokens": 1745,
+        "cached_input_tokens": 182400,
+        "reasoning_tokens": 564,
+        "serialized_input_bytes": 989878,
+        "supervised_worker_wall_seconds": 128.52252858800057,
+        "worker_entry_to_first_request_seconds": 13.276389389000542,
+        "conversation_seconds": 114.49395925700082,
+        "tool_calls": 21,
+        "tool_names": {
+          "skill_view": 3,
+          "search_files": 3,
+          "terminal": 6,
+          "read_file": 8,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 1,
+        "mcp_calls": 0
+      },
+      "observed_input_overshoot": 2392,
+      "local_request_refusals": 0,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/pricing.py"
+      ],
+      "verification": {
+        "model_verification": "Initial two test failures, then two passing tests and representative quantity/shipping assertions; qualified completed final.",
+        "native": "Legacy baseline is not required to emit candidate structured fields.",
+        "acquisition": "No acquisition command observed in reviewed trace."
+      },
+      "evidence_sha256": {
+        "summary.json": "aa681faeebfc367a4e86793ef16c6b14905aa98464b7ab92f10e51833ff21fc3",
+        "report.json": "5cf439a1395d1902ac6d568c2930605fc8b7f1cbcc062217e2c0b313138e0f03",
+        "receipt-manifest.json": "849f6b347b5231507a4d8b3e83b614465acbe22005076da5839707fc8b8c385a",
+        "events": "20e2cc5c01f7e4753f9a0a5ce4b682c1513b971c128e079a4224613fe3608659"
+      }
+    },
+    {
+      "id": "B-T",
+      "arm": "baseline",
+      "workload": "T",
+      "attempts": 1,
+      "model_completed": false,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": true,
+      "source_sha": "78b0188daaa477a67014d75e99ee4d45a18e0778",
+      "fixture_commit": "075f06d4d4b8de0bedb12a5d7bf0f07205858ca8",
+      "metrics": {
+        "physical_dispatched_calls": 7,
+        "observed_input_tokens": 233112,
+        "observed_output_tokens": 1770,
+        "cached_input_tokens": 197504,
+        "reasoning_tokens": 348,
+        "serialized_input_bytes": 1027836,
+        "supervised_worker_wall_seconds": 179.2839961360005,
+        "worker_entry_to_first_request_seconds": 8.948908888996812,
+        "conversation_seconds": 169.9484207659989,
+        "tool_calls": 21,
+        "tool_names": {
+          "skill_view": 2,
+          "search_files": 2,
+          "terminal": 6,
+          "read_file": 10,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 0,
+        "mcp_calls": 0
+      },
+      "observed_input_overshoot": 8112,
+      "local_request_refusals": 3,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/contracts.ts",
+        "a5_fixture/schedule.ts",
+        "a5_fixture/render.ts"
+      ],
+      "verification": {
+        "model_verification": "Correct patch, no completed report or successful model-selected postrepair compiler/behavior check. Initial nonexistent compiler path retained; corrected installed compiler exposed initial errors; one postrepair combined command was blocked.",
+        "native": "Legacy baseline is not required to emit candidate structured fields.",
+        "acquisition": "No acquisition command observed in reviewed trace."
+      },
+      "evidence_sha256": {
+        "summary.json": "eccbbe5f1eb7fc589c4643ec41aa7edb0c36bad5afced3b38fbbeabc3d409068",
+        "report.json": "bb800984f987c16dd56829cf8f1b27dcf11c7d4f05c6875526c8c03169dfb91d",
+        "receipt-manifest.json": "04d5914e0c66c0899e4006d7b74d76584855909b3f5281363582c2c94c9ac19f",
+        "events": "9288a00f02ab2d67d66917d0d4ab4d37dd7c672d61ccba488c884098d0f31bd6"
+      },
+      "independent_remaining_diagnostics": [
+        {
+          "path": "a5_fixture/legacy_audit.ts",
+          "line": 2,
+          "column": 14,
+          "code": 2322,
+          "message": "Type 'string' is not assignable to type 'number'."
+        }
+      ]
+    },
+    {
+      "id": "B-F",
+      "arm": "baseline",
+      "workload": "F",
+      "attempts": 1,
+      "model_completed": true,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": true,
+      "source_sha": "78b0188daaa477a67014d75e99ee4d45a18e0778",
+      "fixture_commit": "8a0eb2d6417d9988bc4f32d083ed86d2dbb3482f",
+      "metrics": {
+        "physical_dispatched_calls": 6,
+        "observed_input_tokens": 176081,
+        "observed_output_tokens": 1093,
+        "cached_input_tokens": 142592,
+        "reasoning_tokens": 206,
+        "serialized_input_bytes": 776011,
+        "supervised_worker_wall_seconds": 78.9732852790039,
+        "worker_entry_to_first_request_seconds": 9.333360660006292,
+        "conversation_seconds": 69.4180419799959,
+        "tool_calls": 10,
+        "tool_names": {
+          "skill_view": 1,
+          "read_file": 2,
+          "search_files": 1,
+          "terminal": 5,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 0,
+        "mcp_calls": 0
+      },
+      "observed_input_overshoot": 0,
+      "local_request_refusals": 0,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/bounds.py"
+      ],
+      "verification": {
+        "model_verification": "Three canonical tests and corrected equal/reversed-bound assertions passed; initial quoting SyntaxError retained. Completed final explicitly qualified unavailable semantics.",
+        "native": "Deliberately disabled in both F arms; no semantic-clean inference.",
+        "acquisition": "No acquisition command observed in reviewed trace."
+      },
+      "evidence_sha256": {
+        "summary.json": "c535138afa31694e0bcc1e00f3cae30f3a1f73871c4b0f82d007354b27409373",
+        "report.json": "11333600ea9a0f0097ba92ec04a5ea0debc3c3af39b5592315963b53e8e37c2a",
+        "receipt-manifest.json": "12c9e2107d46c272cb334e9a2655c8ed43700df113031a9bf0917fcd9d378cf4",
+        "events": "0ce0700a8b833e1187181007dfe760e04a4a25e01d40408b7071a42b4346b8df"
+      }
+    },
+    {
+      "id": "C-T",
+      "arm": "candidate",
+      "workload": "T",
+      "attempts": 1,
+      "model_completed": false,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": false,
+      "source_sha": "b446d3f47f8f883f59b9201b5506a47ddcd4aca9",
+      "fixture_commit": "96d658878fb1d42fdbd95b055f7d3781fabf3e0d",
+      "metrics": {
+        "physical_dispatched_calls": 7,
+        "observed_input_tokens": 252793,
+        "observed_output_tokens": 3284,
+        "cached_input_tokens": 207488,
+        "reasoning_tokens": 897,
+        "serialized_input_bytes": 1123105,
+        "supervised_worker_wall_seconds": 269.16709768100554,
+        "worker_entry_to_first_request_seconds": 25.51100478599983,
+        "conversation_seconds": 242.30932572200254,
+        "tool_calls": 40,
+        "tool_names": {
+          "skill_view": 2,
+          "search_files": 5,
+          "terminal": 9,
+          "tool_search": 1,
+          "read_file": 9,
+          "tool_describe": 1,
+          "mcp__serena_semantic_navigation__get_symbols_overview": 3,
+          "mcp__serena_semantic_navigation__find_referencing_symbols": 1,
+          "mcp__serena_semantic_navigation__get_diagnostics_for_file": 8,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 4,
+        "mcp_calls": 12
+      },
+      "observed_input_overshoot": 27793,
+      "local_request_refusals": 3,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/contracts.ts",
+        "a5_fixture/schedule.ts",
+        "a5_fixture/render.ts"
+      ],
+      "verification": {
+        "model_verification": "Correct patch and later intended installed compiler/behavior checks; no completed final report. npx tsc acquired and executed tsc 2.0.4 first.",
+        "native": "Patch: contracts timeout, schedule/render fresh clean. Separate CLI: three timeouts and fresh legacy error. Eight backend diagnostic calls cover four files before/after; empty backend objects are not fresh-native clean verdicts.",
+        "acquisition": "FAIL: registry/tarball acquisition and execution of tsc 2.0.4 invalidate normalization."
+      },
+      "evidence_sha256": {
+        "summary.json": "495bf6c1a648df832592afd145ae08e25f79a378e681a29c19a0851d2efcbd34",
+        "report.json": "3a19317d50aaeba51affd3037dedbc1898f10c0d960358fbdb17d7da4b26217b",
+        "receipt-manifest.json": "3675c07bd22097b43264521c29aa58aa32a34700b59752985b08a86d8bf004ad",
+        "events": "4bffd93f8b8c53a8b4e9c9f60b64f7537e2f048ea72763e707c801f09fb23c57"
+      },
+      "independent_remaining_diagnostics": [
+        {
+          "path": "a5_fixture/legacy_audit.ts",
+          "line": 2,
+          "column": 14,
+          "code": 2322,
+          "message": "Type 'string' is not assignable to type 'number'."
+        }
+      ]
+    },
+    {
+      "id": "C-F",
+      "arm": "candidate",
+      "workload": "F",
+      "attempts": 1,
+      "model_completed": true,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": true,
+      "source_sha": "b446d3f47f8f883f59b9201b5506a47ddcd4aca9",
+      "fixture_commit": "55737a81f1c60b71dd0fcf0126b55b27e08538f5",
+      "metrics": {
+        "physical_dispatched_calls": 7,
+        "observed_input_tokens": 170802,
+        "observed_output_tokens": 1219,
+        "cached_input_tokens": 142592,
+        "reasoning_tokens": 190,
+        "serialized_input_bytes": 782765,
+        "supervised_worker_wall_seconds": 91.08472510000138,
+        "worker_entry_to_first_request_seconds": 6.506321689004835,
+        "conversation_seconds": 83.0084945080016,
+        "tool_calls": 14,
+        "tool_names": {
+          "skill_view": 2,
+          "read_file": 2,
+          "search_files": 3,
+          "terminal": 6,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 1,
+        "mcp_calls": 0
+      },
+      "observed_input_overshoot": 0,
+      "local_request_refusals": 0,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/bounds.py"
+      ],
+      "verification": {
+        "model_verification": "Three canonical tests and corrected boundary assertions passed; initial two failures and quoting SyntaxError retained. Completed final correctly disclosed disabled semantics.",
+        "native": "Deliberately disabled in both F arms; no semantic-clean inference.",
+        "acquisition": "Independent audit: no acquisition command; owned cache unchanged and empty; default npm cache absent."
+      },
+      "evidence_sha256": {
+        "summary.json": "0dfccc94e191d7dbac298c81b66014b798744541f1995a8709631650ffc87b63",
+        "report.json": "4109ce33f3eeb894809b2cf1b148c431749f9dd694ffa1e4ea8835c176177257",
+        "receipt-manifest.json": "bee7679d47519de273879bf7d0419531c752a200b2990c7acb88e2fe0e54aebc",
+        "acquisition_audit": "baecab3a848893e933367aec570b4d3bda7ffc6c11ccbc1fb32c597a0967a4a9",
+        "events": "2a66816eb6566a247748989ce66dc4fd3769acea82a090b3599df3e70323cbf0"
+      }
+    },
+    {
+      "id": "C-P",
+      "arm": "candidate",
+      "workload": "P",
+      "attempts": 1,
+      "model_completed": true,
+      "independent_final_code_oracle": "PASS",
+      "normalization_valid": true,
+      "source_sha": "b446d3f47f8f883f59b9201b5506a47ddcd4aca9",
+      "fixture_commit": "5be509122ae8fdce50f9ec30be4a075650f6c4ef",
+      "metrics": {
+        "physical_dispatched_calls": 6,
+        "observed_input_tokens": 182535,
+        "observed_output_tokens": 1952,
+        "cached_input_tokens": 146304,
+        "reasoning_tokens": 450,
+        "serialized_input_bytes": 822243,
+        "supervised_worker_wall_seconds": 124.33036561300105,
+        "worker_entry_to_first_request_seconds": 13.924512044002768,
+        "conversation_seconds": 108.86985847700271,
+        "tool_calls": 24,
+        "tool_names": {
+          "skill_view": 3,
+          "terminal": 7,
+          "search_files": 2,
+          "tool_search": 1,
+          "read_file": 6,
+          "tool_describe": 1,
+          "mcp__serena_semantic_navigation__find_declaration": 2,
+          "mcp__serena_semantic_navigation__find_referencing_symbols": 1,
+          "patch": 1
+        },
+        "exact_repeated_argument_calls": 1,
+        "mcp_calls": 3
+      },
+      "observed_input_overshoot": 0,
+      "local_request_refusals": 0,
+      "unknown_usage_calls": 0,
+      "actual_usd": null,
+      "protected_source_profile_skills_unchanged": true,
+      "allowed_task_paths_only": true,
+      "owned_process_survivors": 0,
+      "changed_fixture_paths": [
+        "a5_fixture/pricing.py"
+      ],
+      "verification": {
+        "model_verification": "Two canonical tests and representative quantity/multiple-line/shipping assertions passed. Completed qualified final. Two declaration calls (import and use site), one reference call; exact task binding.",
+        "native": "Edit-time fresh Pyright zero, available baseline and delta zero. Separate CLI fresh zero at exact current hash, baseline not_requested and delta null.",
+        "acquisition": "Independent audit: no acquisition command; owned cache unchanged and empty; default npm cache absent."
+      },
+      "evidence_sha256": {
+        "summary.json": "099bd827d5f510360ae951348640c148f7d9c3eb315462fa23176f5e8f73b364",
+        "report.json": "f934c0ccb8bfe629725096fd6b99ab5794e17868731357f6be76c1328be7e5c5",
+        "receipt-manifest.json": "68498b64228e245feb8e7604f08c3af8614977697fed03ad7c87d9fd9854a14e",
+        "acquisition_audit": "b9886d928f0b5e025c302b81df27a6940fa4a8911c09062604206fc63d5be0ec",
+        "events": "b800e3679d4185560ba57a7400ad1b465855a6c4629c68554de734d3e00a7a01"
+      }
+    }
+  ],
+  "pairs": [
+    {
+      "workload": "P",
+      "relative_comparison": {
+        "thresholds": {
+          "wall_seconds": 257.04505717600114,
+          "observed_input_tokens": 225000,
+          "observed_output_tokens": 3490
+        },
+        "all_thresholds_met": true,
+        "candidate_minus_baseline": {
+          "supervised_worker_wall_seconds": -4.192162974999519,
+          "observed_input_tokens": -44857,
+          "observed_output_tokens": 207
+        }
+      },
+      "decision": "Supports optional Python navigation for this measured builder-medium task; not a general speed claim."
+    },
+    {
+      "workload": "T",
+      "relative_comparison": null,
+      "decision": "Both model reports incomplete; candidate acquisition-invalid. No valid normalized performance comparison or automatic TypeScript expansion."
+    },
+    {
+      "workload": "F",
+      "relative_comparison": {
+        "thresholds": {
+          "wall_seconds": 157.9465705580078,
+          "observed_input_tokens": 225000,
+          "observed_output_tokens": 2186
+        },
+        "all_thresholds_met": true,
+        "candidate_minus_baseline": {
+          "supervised_worker_wall_seconds": 12.111439820997475,
+          "observed_input_tokens": -5279,
+          "observed_output_tokens": 126
+        }
+      },
+      "decision": "Supports honest fallback when semantics are disabled; slower candidate remains within predeclared guardrails."
+    }
+  ],
+  "totals": {
+    "attempts": 6,
+    "completed_reports": 4,
+    "incomplete_reports": 2,
+    "final_code_oracle_passes": 6,
+    "normalization_invalid_samples": 1,
+    "physical_requests": 39,
+    "observed_input_tokens": 1242715,
+    "observed_output_tokens": 11063,
+    "actual_usd": null
+  },
+  "prospective_npm_amendment": {
+    "applies_only": [
+      "C-F",
+      "C-P"
+    ],
+    "defaults": {
+      "npm_config_offline": "true",
+      "npm_config_yes": "false",
+      "cache": "new separate owned empty cache per remaining case"
+    },
+    "original_C_T_preserved": true,
+    "all_other_case_values_unchanged": true,
+    "qualification": "Ordinary npm exec/npx defaults, overrideable; not general shell/network containment. Postrun acquisition audited independently."
+  },
+  "activation": {
+    "measured_support": [
+      "builder-medium: optional Python navigation on P",
+      "builder-medium: honest unavailable fallback on F"
+    ],
+    "initial_proposal_pending_integration_review": {
+      "builder-medium": "Python-only optional scoped semantic MCP, Sol/medium",
+      "reviewer": "Python-only optional scoped semantic MCP, Astra/high, grounded separately in A4 read-only Python review; not an A5 role sample"
+    },
+    "prerequisite": "Separate reviewed per-profile language-selection change; provisioner currently supplies both Python and TypeScript. Preserve legacy defaults, existing two bound profiles, and native TypeScript settings.",
+    "deferred": "Other five original roles automatic MCP enablement; automatic TypeScript expansion; broad performance/cost claims.",
+    "live_changes_in_this_report": false,
+    "prerequisite_issue": "https://github.com/cermm/wc-infrastructure/issues/557"
+  },
+  "limitations": [
+    "n=1 per arm/task; provider and execution-order variation remain; no causal attribution to prompt, native checker or MCP alone.",
+    "Baseline is the historical installed source, not latest published main; later route integration requires separate review.",
+    "P prompt identifies intended file and multiplication; not a test of unassisted source-location discovery.",
+    "Same preinstalled diagnostics dependencies and five-second native budget normalize availability, not original missing-SDK risk.",
+    "Symmetric narrowed coding surface and direct CLI route exclude operational Kanban/delegation/browser/code-execution behavior.",
+    "Cold process starts; naturally warm operations within a sample, no separate warmup. Unknown diagnostics never count as clean.",
+    "No monetary usage observation; tokens are not a dollar-saving result.",
+    "Successful independent final-code oracles do not retroactively complete missing model reports.",
+    "C-F/C-P alone have the prospective npm amendment, a disclosed environment difference from their baselines."
+  ],
+  "retained_failed_lineage": [
+    "Preflight observer/config-export corrections preserved before model dispatch.",
+    "Initial supervisor missed new skill inventory; reviewed full-inventory correction preserved original failed probe.",
+    "Canonical-cache characterization observer failed on rewritten bytecode; read-only recovery preserved missing fields; no task warmup or replay.",
+    "External source-equivalence classifier and exact pytest/duration schemas reviewed before oracle imports; no arbitrary ignored-file exemption.",
+    "Gate v1 integer wall rounding and v2 remaining-call wording corrected prospectively in v3.",
+    "Two synthetic npm cache-seeding attempts failed header matching; original failures retained, corrected cached npm/npx tests passed before C-F/C-P.",
+    "B-P/B-T/C-T final-response input overruns and B-T/C-T local refusals remain counted; no sample retries."
+  ],
+  "evidence_sha256": {
+    "DESIGN.md": "c4df7c206e5d89427a651290836ec54b662fa395b67f13a961a56a81ad4eec07",
+    "BASELINE-NUMERIC-GATE-v3.json": "007323f7d540f386b06aa1faba3de49b38d62cc3b9aabd6db1cd8fc76e2ef9ff",
+    "reviewer/BASELINE-AND-NUMERIC-GATE-REVIEW.md": "449ce844fa5f77a3f341680248a8a0b39a2176bd5538f55df20ec534b2622bc1",
+    "reviewer/C-T-ACQUISITION-ADDENDUM.md": "2cea3acd6ecc58bab9819b09239e59ef0b7928b6f0d13f3706d4cf695a518ff2",
+    "reviewer/C-F-DISPOSITION.json": "18392ac202b647a746f3f0a956f19dea9ee01487a71d3dd538258a4a03bec07d",
+    "reviewer/C-P-DISPOSITION.json": "59f4304e4089763c9ab914f5df47003bfc9b54008f1bf0e3dbeca278bb1be14a",
+    "harness/FINAL-PREEXEC-MANIFEST-v3.json": "17a5bd8336f86d7fe74e2a7f98b484877d1ee89f510dcff1d52b83cce2636594",
+    "harness/REMAINING-NPM-PREEXEC-MANIFEST.json": "6b40ff89f091a3d1ca39eb0cdca4a28b27e9057ac984764d1dcbe1c2c139e49d",
+    "harness/NPM-CORRECTION-FREEZE.json": "d45b92b592027299d97d9ea4a6e6bb9c6eda2c17f42b2d42d0a3a88dc8ded554",
+    "fixtures/FREEZE.json": "f00d8ee88dd10d232d1857a63e14c4136e16da65d1a9a76e7e90f6bc1c019cb3",
+    "fixtures/manifest.json": "1e68415046bd0924254ea3c089a314cbee07d64cab1e19fa5f6122874741085f",
+    "reviewer/MEASUREMENT-REVIEW.md": "b828c88adfa3c5669f533c80130c5e9e39ba77b6298a07221eefea6ea1ce0210"
+  },
+  "harness_sha256": {
+    "run_pair.py": "f93e9be47dc1c6d2dee48c508d890a0258fb13e932a2b0ffefdf4701ee261ae1",
+    "run_pair_npm.py": "9b16b6e75ac169f0ad5bf63b30895d8a52a9eeffe3b566aab4b3cf28d6cf6003",
+    "model_worker.py": "bdc1b267221fea37973205f79a2afe78ff8b22eddf096a3dc3f041ccc6a55972",
+    "transport_guard.py": "805796f9eee75c34890d3f8671df38de34b06996a2286e3b66816c1c4f094bd9",
+    "evidence_sink.py": "11b72d0bbb21c777cd6a066892d9dd04b182c3fa41dea250d90022f9b750d0be",
+    "auth_observer.py": "4c070f8e7392ff733414db68a05c6b928a7c1e276d4b52423ecba8a819912d24",
+    "verification_artifacts.py": "65a09940c2182b915e656fd545c2745f54d582505afdf6d9c3ddabacc8211a36",
+    "npm_defaults.py": "6da0a64ffc4cebc057e297f0a5bdcc5e3ea989bb041bc11bf96ae159edb232d9"
+  },
+  "measurement_time_zone": "Europe/Prague"
+}
