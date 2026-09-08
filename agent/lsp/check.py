@@ -119,7 +119,11 @@ def _preflight(paths: list[str], root: str | None, deadline: float):
         entry = {"path": path, "aliases": [alias]}
         entries.append(entry)
         seen[path] = entry
-        if not path.exists():
+        try:
+            exists = path.exists()
+        except OSError as exc:
+            raise CheckInputError("unreadable_file") from exc
+        if not exists:
             entry["reason"] = "missing_file"
             continue
         source = _read_source(path, deadline)
@@ -219,7 +223,10 @@ def check_files(paths: list[str], *, root: str | None = None) -> tuple[dict, int
                 break
     finally:
         checked_at = time.monotonic()
-        if service is not None:
-            service.shutdown()
+        try:
+            if service is not None:
+                service.shutdown()
+        except KeyboardInterrupt:
+            cancelled = True
         cleanup = time.monotonic() - checked_at
     return _result(records, context, len(paths), duplicates, checked_at - start, cleanup, cancelled=cancelled)

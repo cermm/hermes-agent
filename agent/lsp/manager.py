@@ -66,8 +66,8 @@ class _BackgroundLoop:
             except Exception:  # noqa: BLE001
                 pass
 
-    def run(self, coro, *, timeout: Optional[float] = None) -> Any:
-        """Submit a coroutine to the loop and block for its result (or raise)."""
+    def run(self, coro, *, timeout: Optional[float] = None, finish_on_interrupt: bool = False) -> Any:
+        """Wait for a result; shutdown may defer interruption within its original deadline."""
         from agent.async_utils import safe_schedule_threadsafe
         if self._loop is None:
             if asyncio.iscoroutine(coro):
@@ -75,11 +75,27 @@ class _BackgroundLoop:
             raise RuntimeError("background loop not started")
         if (fut := safe_schedule_threadsafe(coro, self._loop)) is None:
             raise RuntimeError("background loop not running")
+        interrupted = False
+        deadline = time.monotonic() + timeout if timeout is not None else None
         try:
-            return fut.result(timeout=timeout)
+            while True:
+                try:
+                    result = fut.result(timeout=max(0, deadline - time.monotonic()) if deadline is not None else None)
+                    break
+                except KeyboardInterrupt:
+                    if not finish_on_interrupt:
+                        raise
+                    # Keep the same shutdown future alive so its owned process
+                    # cleanup finishes before stopping this loop. Never restart
+                    # the timeout, even if another interrupt arrives.
+                    interrupted = True
         except BaseException:
             fut.cancel()
             raise
+        finally:
+            if interrupted:
+                raise KeyboardInterrupt
+        return result
 
     def stop(self) -> None:
         loop, self._loop = self._loop, None
@@ -318,11 +334,12 @@ class LSPService:
         if not self._enabled:
             return
         try:
-            self._loop.run(self._shutdown_async(), timeout=10.0)
+            self._loop.run(self._shutdown_async(), timeout=10.0, finish_on_interrupt=True)
         except Exception as e:  # noqa: BLE001
             logger.debug("LSP shutdown error: %s", e)
-        self._loop.stop()
-        clear_cache()
+        finally:
+            self._loop.stop()
+            clear_cache()
 
     def get_status(self) -> Dict[str, Any]:
         """Return a snapshot of the service for ``hermes lsp status``."""
