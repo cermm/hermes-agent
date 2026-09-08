@@ -440,6 +440,9 @@ def test_safe_home_sibling_remains_mountable(tmp_path, monkeypatch):
 @pytest.mark.linux_only
 @pytest.mark.parametrize("mutation", ["child", "file", "alias", "wrong_command", "other_credential_root"])
 def test_hermes_runtime_exception_is_exact_and_cannot_overlap_other_credentials(tmp_path, monkeypatch, mutation):
+    import pwd
+    from types import SimpleNamespace
+
     home = tmp_path / "synthetic-home"
     runtime = home / ".hermes" / "hermes-agent" / "venv"
     runtime.mkdir(parents=True)
@@ -447,6 +450,7 @@ def test_hermes_runtime_exception_is_exact_and_cannot_overlap_other_credentials(
     executable.symlink_to(sys.executable)
     spec = replace(make_spec(tmp_path, "pass"), command=(str(executable), "-c", "pass"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
     monkeypatch.setattr(sys, "prefix", str(runtime))
     monkeypatch.setattr(sys, "executable", str(executable))
     mount = runtime
@@ -471,6 +475,9 @@ def test_hermes_runtime_exception_is_exact_and_cannot_overlap_other_credentials(
 @pytest.mark.linux_only
 @pytest.mark.parametrize("mutation", ["parent", "child", "alias", "wrong_command", "other_credential_root", "interpreter_outside_base"])
 def test_bundled_runtime_exception_is_exact(tmp_path, monkeypatch, mutation):
+    import pwd
+    from types import SimpleNamespace
+
     home = tmp_path / "synthetic-home"
     runtime = home / ".hermes" / "hermes-agent" / "venv"
     runtime.mkdir(parents=True)
@@ -483,6 +490,7 @@ def test_bundled_runtime_exception_is_exact(tmp_path, monkeypatch, mutation):
     executable.symlink_to(binary)
     spec = replace(make_spec(tmp_path, "pass"), command=(str(executable), "-c", "pass"))
     monkeypatch.setattr(Path, "home", classmethod(lambda cls: home))
+    monkeypatch.setattr(pwd, "getpwuid", lambda uid: SimpleNamespace(pw_dir=str(home)))
     monkeypatch.setattr(sys, "prefix", str(runtime))
     monkeypatch.setattr(sys, "base_prefix", str(base))
     monkeypatch.setattr(sys, "executable", str(executable))
@@ -508,12 +516,28 @@ def test_bundled_runtime_exception_is_exact(tmp_path, monkeypatch, mutation):
 
 
 @pytest.mark.linux_only
-def test_actual_trusted_runtime_directory_remains_usable(tmp_path, namespace_capability):
+@pytest.mark.parametrize("home_source", ["account", "environment", "path_home"])
+def test_actual_trusted_runtime_directory_remains_usable(tmp_path, namespace_capability, monkeypatch, home_source):
     code = "from pathlib import Path\nPath('/workspace/runtime-ok').write_text('trusted runtime executed', encoding='utf-8')"
     spec = make_spec(tmp_path, code)
     spec = replace(spec, command=(sys.executable, "/workspace/probe.py"),
                    read_only_paths=(*spec.read_only_paths, str(Path(sys.prefix)),
                                     str(Path(sys.base_prefix).resolve().parent)))
+    if home_source != "account":
+        alternate = tmp_path / "alternate-home"
+        secret = alternate / ".ssh" / "custom_key"
+        secret.parent.mkdir(parents=True)
+        secret.write_text("inert alternate-home credential", encoding="utf-8")
+        fake_runtime = alternate / ".hermes" / "hermes-agent" / "venv"
+        fake_runtime.mkdir(parents=True)
+        monkeypatch.setenv("HERMES_HOME", str(alternate / ".hermes"))
+        if home_source == "environment":
+            monkeypatch.setenv("HOME", str(alternate))
+        else:
+            monkeypatch.setattr(Path, "home", classmethod(lambda cls: alternate))
+        for forbidden in (secret, fake_runtime):
+            with pytest.raises(GuardError, match="credential"):
+                replace(spec, read_only_paths=(*spec.read_only_paths, str(forbidden))).validate()
     handle, server = run_probe(spec)
     try:
         receipt = handle.wait()

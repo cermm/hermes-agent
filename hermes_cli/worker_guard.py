@@ -187,6 +187,8 @@ class GuardSpec:
     def validate(self) -> None:
         if sys.platform != "linux":
             raise GuardError("Linux pidfd and namespace containment required")
+        import pwd
+
         if not self.permit_id or not self.scope or not self.controller.alive():
             raise GuardError("missing permit, scope, or current controller")
         remaining = self.deadline_monotonic - time.monotonic()
@@ -214,8 +216,13 @@ class GuardSpec:
             raise GuardError("guardian state must be owned and private")
         forbidden = {"/", "/home", "/root", "/proc", "/sys", "/dev", "/run", "/tmp", "/etc", "/mnt", "/media"}
         paths = [Path(p).absolute() for p in self.read_only_paths]
-        home = Path.home().absolute()
-        credential_roots = [(name, home / name, (home / name).resolve())
+        # HOME and profile helpers may select disposable/configured state. They
+        # cannot relocate the account's installed interpreter or credential roots.
+        account_home = Path(pwd.getpwuid(os.getuid()).pw_dir).absolute()  # windows-footgun: ok — validate rejects non-Linux before account lookup.
+        home = account_home.resolve(strict=True)
+        homes = tuple(dict.fromkeys((account_home, home, Path.home().absolute())))
+        credential_roots = [(name, location / name, (location / name).resolve())
+                            for location in homes
                             for name in (".hermes", ".ssh", ".aws", ".azure", ".config")]
         # The already-running trusted interpreter is the sole supported runtime
         # exception below .hermes, together with its bundled CPython generation.
@@ -242,7 +249,7 @@ class GuardSpec:
                 raise GuardError("broad host mount forbidden")
             if path.is_symlink() or resolved == state or state.is_relative_to(resolved):
                 raise GuardError("symlink or guardian state mount forbidden")
-            if home.is_relative_to(path) or home.resolve().is_relative_to(resolved):
+            if any(location.is_relative_to(path) or location.resolve().is_relative_to(resolved) for location in homes):
                 raise GuardError("host home or credential root mount forbidden")
             runtime_mount = (trusted_interpreter and path.is_dir() and resolved == path
                              and (path == runtime or (bundled_generation and path == generation)))
