@@ -125,6 +125,7 @@ If a skill is missing from this list but present in the repo, the catalog is reg
 | [`systematic-debugging`](/docs/user-guide/skills/bundled/software-development/software-development-systematic-debugging) | 4-phase root cause debugging: understand bugs before fixing. | `software-development\systematic-debugging` |
 | [`test-driven-development`](/docs/user-guide/skills/bundled/software-development/software-development-test-driven-development) | TDD: enforce RED-GREEN-REFACTOR, tests before code. | `software-development\test-driven-development` |
 
+| [`semantic-code-intelligence`](/docs/user-guide/skills/bundled/software-development/software-development-semantic-code-intelligence) | Navigate code and verify edits with semantic evidence. | `software-development/semantic-code-intelligence` |
 ## web
 
 | Skill | Description | Path |

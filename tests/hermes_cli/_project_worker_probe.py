@@ -64,6 +64,22 @@ def chat(args):
         env={k: os.environ.get(k) for k in ("HERMES_HOME", "HERMES_PROFILE", "TERMINAL_CWD",
              "HERMES_KANBAN_TASK", "HERMES_KANBAN_DB", "HERMES_KANBAN_BOARD")},
         binding=core._servers[cfg["routing_fixture"]["server"]]._config["_project_binding"])
+    # Capture the actual shared prompt after production CLI/profile resolution.
+    # Only the unused provider client is replaced; there is no model call here.
+    from run_agent import AIAgent
+    from unittest.mock import patch
+    with patch("agent.process_bootstrap.OpenAI"):
+        agent = AIAgent(model=args.model, provider=args.provider, api_key="fixture-key",
+                        base_url="https://example.invalid/v1", enabled_toolsets=selected,
+                        disabled_toolsets=denied, platform="cli", quiet_mode=True,
+                        skip_memory=True, skip_context_files=True)
+    try:
+        report["system_prompt"] = agent._build_system_prompt()
+        report["agent_schemas"] = agent.tools
+        assert "lsp_verification" in report["system_prompt"]
+        assert ("hermes lsp check" in report["system_prompt"]) == ("terminal" in agent.valid_tool_names)
+    finally:
+        agent.close()
     return 0
 main.cmd_chat = chat
 try:

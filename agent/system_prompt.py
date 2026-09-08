@@ -269,6 +269,43 @@ def _profile_name_for_home(home: Path) -> str:
         return "default"
 
 
+def _semantic_guidance_block(agent: Any) -> Optional[str]:
+    """Session-local coding policy; the search bridge does not imply a semantic server exists."""
+    names = set(agent.valid_tool_names or ())
+    navigation = sorted(name for name in names if name.startswith("mcp__") and name.endswith((
+        "__get_symbols_overview", "__find_symbol", "__find_referencing_symbols", "__find_declaration")))
+    if not navigation and not names.intersection({"read_file", "search_files", "write_file", "patch", "terminal"}):
+        return None
+    parts = ["Code navigation and verification (when working on source files):"]
+    if navigation:
+        parts.append("Use available symbol navigation for unfamiliar code and relationships: "
+                     + ", ".join(f"`{name}`" for name in navigation[:4]) + ".")
+    elif "tool_search" in names:
+        parts.append("Use `tool_search` to look for relevant symbol navigation in this session's catalog; "
+                     "use it only if offered, following its current schema.")
+    if navigation or "tool_search" in names:
+        parts.append("Check returned worktree/HEAD/profile provenance; a fixed-project result is not proof "
+                     "about the task worktree. Do not repeat known unsupported implementation lookup. "
+                     "An empty backend diagnostic response is not evidence of clean code.")
+    if "search_files" in names:
+        parts.append("Use `search_files` for literal text; semantic relationships need symbol-aware evidence when available.")
+    editors = [name for name in ("patch", "write_file") if name in names]
+    if editors:
+        parts.append("Prefer applicable file edits with " + " or ".join(f"`{name}`" for name in editors) + ".")
+    parts.append("Inspect `lsp_verification`: current totals differ from introduced deltas; unchanged errors "
+                 "remain present, and an unavailable baseline/null delta cannot establish introduction. "
+                 "Fix task-caused errors and verify the repair. Timeout/no verdict is unverified. "
+                 "Content-hash `verified`, syntax lint, semantic diagnostics and repository tests are separate evidence; "
+                 "diagnostics do not replace tests.")
+    if "terminal" in names:
+        parts.append("After shell/generator edits or during read-only review on the local Hermes host, use `terminal` "
+                     "with `hermes lsp check --root <worktree> --json <explicit files>` when that command checks "
+                     "the same source environment. Do not make a no-op edit or repeatedly check an unchanged generation.")
+    parts.append("If no permitted semantic checker is available, use applicable permitted repository checks "
+                 "or report semantic verification unavailable; do not bypass tool restrictions.")
+    return " ".join(parts)
+
+
 def _tool_guidance_block(agent: Any) -> Optional[str]:
     """Tool-aware behavioral guidance, injected only when the tools are loaded."""
     names = agent.valid_tool_names
@@ -291,6 +328,7 @@ def _tool_guidance_block(agent: Any) -> Optional[str]:
         SESSION_SEARCH_GUIDANCE if "session_search" in names else None,
         SKILLS_GUIDANCE if "skill_manage" in names else None,
         _kanban_guidance,
+        _semantic_guidance_block(agent),
     ]
     return " ".join(g for g in tool_guidance if g) or None
 
@@ -607,6 +645,11 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # in the rendered index (pure string check — inherits the index's stability).
     if "skill_view" in (agent.valid_tool_names or set()) and "- hermes-agent:" in skills_prompt:
         stable_parts[_help_guidance_slot] = HERMES_AGENT_HELP_GUIDANCE
+    # Refer only to a skill actually visible in this profile's filtered index.
+    if ("skill_view" in (agent.valid_tool_names or set()) and _semantic_guidance_block(agent)
+            and re.search(r"^\s*- semantic-code-intelligence(?::|$)", skills_prompt, re.MULTILINE)):
+        stable_parts.append("For this coding workflow, load `skill_view(name=\"semantic-code-intelligence\")` "
+                            "when relevant; keep its instructions conditional on the tools available here.")
     stable_parts.extend(_alibaba_identity_part(agent))
     stable_parts.append(_pb.build_environment_hints())
     # Coding posture: operating brief stays in the stable prefix; the live

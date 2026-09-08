@@ -72,6 +72,9 @@ def test_real_dispatch_preserves_roles_and_binds_each_worker(projects, monkeypat
             "root": str(root), "commit": git(root, "rev-parse", "HEAD"), "mode": "workspace", "matches_task": True}
         assert receipt["binding"]["profile"] == str(profile)
         assert receipt["cleanup"]["remaining"] == []
+        assert "lsp_verification" in receipt["system_prompt"]
+        agent_names = {schema["function"]["name"] for schema in receipt["agent_schemas"]}
+        assert ("hermes lsp check" in receipt["system_prompt"]) == ("terminal" in agent_names)
         assert all(s["cwd"] == s["effective_cwd"] == str(root) for s in receipt["startup"])
         assert all(configs[role]["routing_fixture"]["server"] in s["filter"] for s in receipt["startup"])
     assert len({r["pid"] for r in receipts}) == 2

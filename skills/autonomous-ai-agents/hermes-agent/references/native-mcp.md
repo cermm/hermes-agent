@@ -1,6 +1,6 @@
 # Native MCP Client
 
-Hermes Agent has a built-in MCP client that connects to MCP servers at startup, discovers their tools, and makes them available as first-class tools the agent can call directly. No bridge CLI needed -- tools from MCP servers appear alongside built-in tools like `terminal`, `read_file`, etc.
+Hermes Agent has a built-in MCP client that discovers configured MCP tools and makes eligible tools available within the current session. Connections may be eager or deferred; project-scoped servers bind to the active task worktree. No bridge CLI needed -- directly offered MCP tools appear alongside permitted built-in tools. When `tool_search` is offered, it can discover eligible deferred tools from the session catalog.
 
 ## When to Use
 
@@ -9,7 +9,7 @@ Use this whenever you want to:
 - Add external capabilities (filesystem access, GitHub, databases, APIs) via MCP
 - Run local stdio-based MCP servers (npx, uvx, or any command)
 - Connect to remote HTTP/StreamableHTTP MCP servers
-- Have MCP tools auto-discovered and available in every conversation
+- Discover MCP tools allowed by the active profile and session
 
 For ad-hoc, one-off MCP tool calls from the terminal without configuring anything, see the `mcporter` skill instead.
 
@@ -41,8 +41,8 @@ mcp_servers:
 Restart Hermes Agent. On startup it will:
 1. Connect to the server
 2. Discover available tools
-3. Register them with the prefix `mcp_time_*`
-4. Inject them into all platform toolsets
+3. Register eligible names using the prefix `mcp__time__`
+4. Expose them according to the session toolsets, exclusions, and direct/deferred discovery policy
 
 You can then use the tools naturally -- just ask the agent to get the current time.
 
@@ -95,29 +95,29 @@ Note: A server config must have either `command` (stdio) or `url` (HTTP), not bo
 
 When Hermes Agent starts, `discover_mcp_tools()` is called during tool initialization:
 
-1. Reads `mcp_servers` from `~/.hermes/config.yaml`
-2. For each server, spawns a connection in a dedicated background event loop
-3. Initializes the MCP session and calls `list_tools()` to discover available tools
-4. Registers each tool in the Hermes tool registry
+1. Reads `mcp_servers` from the active profile configuration
+2. Applies server/tool exclusions and task scope before connecting
+3. Uses eager connection or eligible deferred discovery; a live connection initializes the MCP session and calls `list_tools()`
+4. Registers eligible tools for the current session; configured or cached tools are not proof of semantic readiness
 
 ### Tool Naming Convention
 
 MCP tools are registered with the naming pattern:
 
 ```
-mcp_{server_name}_{tool_name}
+mcp__{server_name}__{tool_name}
 ```
 
 Hyphens and dots in names are replaced with underscores for LLM API compatibility.
 
 Examples:
-- Server `filesystem`, tool `read_file` → `mcp_filesystem_read_file`
-- Server `github`, tool `list-issues` → `mcp_github_list_issues`
-- Server `my-api`, tool `fetch.data` → `mcp_my_api_fetch_data`
+- Server `filesystem`, tool `read_file` → `mcp__filesystem__read_file`
+- Server `github`, tool `list-issues` → `mcp__github__list_issues`
+- Server `my-api`, tool `fetch.data` → `mcp__my_api__fetch_data`
 
-### Auto-Injection
+### Session Availability
 
-After discovery, MCP tools are automatically injected into all `hermes-*` platform toolsets (CLI, Discord, Telegram, etc.). This means MCP tools are available in every conversation without any additional configuration.
+Use only names actually offered in the current session or returned by its available `tool_search` catalog. Profile configuration, server filters, toolset exclusions and delegated-worker restrictions can remove MCP tools. A discovery bridge does not imply that a particular server is accessible. Project-scoped tools must report the intended task worktree; a fixed-project result is not evidence for another checkout. Preserve denied MCP access rather than recreating it through another tool.
 
 ### Connection Lifecycle
 
@@ -224,7 +224,7 @@ pip install --upgrade mcp
 - Check that the server is listed under `mcp_servers` (not `mcp` or `servers`)
 - Ensure the YAML indentation is correct
 - Look at Hermes Agent startup logs for connection messages
-- Tool names are prefixed with `mcp_{server}_{tool}` -- look for that pattern
+- Tool names are prefixed with `mcp__{server}__{tool}` -- look for that pattern
 
 ### Connection keeps dropping
 
@@ -241,7 +241,7 @@ mcp_servers:
     args: ["mcp-server-time"]
 ```
 
-Registers tools like `mcp_time_get_current_time`.
+Registers tools like `mcp__time__get_current_time`.
 
 ### Filesystem Server (npx)
 
@@ -253,7 +253,7 @@ mcp_servers:
     timeout: 30
 ```
 
-Registers tools like `mcp_filesystem_read_file`, `mcp_filesystem_write_file`, `mcp_filesystem_list_directory`.
+Registers tools like `mcp__filesystem__read_file`, `mcp__filesystem__write_file`, `mcp__filesystem__list_directory`.
 
 ### GitHub Server with Authentication
 
@@ -267,7 +267,7 @@ mcp_servers:
     timeout: 60
 ```
 
-Registers tools like `mcp_github_list_issues`, `mcp_github_create_pull_request`, etc.
+Registers tools like `mcp__github__list_issues`, `mcp__github__create_pull_request`, etc.
 
 ### Remote HTTP Server
 
@@ -307,7 +307,7 @@ mcp_servers:
     timeout: 300
 ```
 
-All tools from all servers are registered and available simultaneously. Each server's tools are prefixed with its name to avoid collisions.
+Eligible tools can be registered from multiple servers. Each name includes its server prefix; actual availability remains session scoped.
 
 ## Sampling (Server-Initiated LLM Requests)
 
@@ -340,5 +340,5 @@ Disable sampling for untrusted servers with `sampling: { enabled: false }`.
 - MCP tools are called synchronously from the agent's perspective but run asynchronously on a dedicated background event loop
 - Tool results are returned as JSON with either `{"result": "..."}` or `{"error": "..."}`
 - The native MCP client is independent of `mcporter` -- you can use both simultaneously
-- Server connections are persistent and shared across all conversations in the same agent process
-- Adding or removing servers requires restarting the agent (no hot-reload currently)
+- Connection reuse follows the configured server and project scope; never assume every conversation shares the same project binding
+- Configuration and discovery changes follow the existing fresh-session or explicit reload workflow; do not mutate another session's prompt or bypass its exclusions
