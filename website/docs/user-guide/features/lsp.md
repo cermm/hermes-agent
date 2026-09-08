@@ -330,6 +330,18 @@ project-wide index before they emit per-file diagnostics; the first
 edit after server start may complete with no diagnostics, with
 subsequent edits picking them up.
 
+For TypeScript, an initial diagnostic notification without a document version
+may describe the pre-edit baseline. If it arrives after that baseline wait
+expires, Hermes keeps it unverified and makes one refresh attempt within the
+existing post-edit deadline. This does not change the file on disk or increase
+the configured timeout. A server can suppress a repeated empty notification;
+if no fresh result follows, the result remains **no verdict**, not checked clean.
+
+Explicit diagnostic versions prevent older generations from satisfying a
+newer edit. Servers that omit versions still rely on the existing assumption
+that subsequent notifications describe the current document: a refresh request
+is not a protocol barrier and cannot identify every delayed, unversioned result.
+
 **Server crashed**
 
 A crashed server is added to the broken-set and won't be retried for
