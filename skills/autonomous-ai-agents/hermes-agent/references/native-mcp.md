@@ -1,6 +1,6 @@
 # Native MCP Client
 
-Hermes Agent has a built-in MCP client that discovers configured MCP tools and makes eligible tools available within the current session. Connections may be eager or deferred; project-scoped servers bind to the active task worktree. No bridge CLI needed -- directly offered MCP tools appear alongside permitted built-in tools. When `tool_search` is offered, it can discover eligible deferred tools from the session catalog.
+Hermes Agent has a built-in MCP client that discovers configured MCP tools and makes eligible tools available within the current session. Connections may be eager or deferred; workspace-scoped servers bind to the active task worktree; fixed-project servers retain their configured project. No bridge CLI needed -- directly offered MCP tools appear alongside permitted built-in tools. When `tool_search` is offered, it can discover eligible deferred tools from the session catalog.
 
 ## When to Use
 
@@ -96,8 +96,8 @@ Note: A server config must have either `command` (stdio) or `url` (HTTP), not bo
 When Hermes Agent starts, `discover_mcp_tools()` is called during tool initialization:
 
 1. Reads `mcp_servers` from the active profile configuration
-2. Applies server/tool exclusions and task scope before connecting
-3. Uses eager connection or eligible deferred discovery; a live connection initializes the MCP session and calls `list_tools()`
+2. Applies server launch/selection policy and prepares task scope before connecting
+3. Uses eager connection or eligible deferred discovery; a live connection initializes the MCP session and calls `list_tools()`, then applies per-tool registration filters and session exposure policy
 4. Registers eligible tools for the current session; configured or cached tools are not proof of semantic readiness
 
 ### Tool Naming Convention
