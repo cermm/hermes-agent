@@ -85,18 +85,36 @@ def _cmd_dispatch(args: argparse.Namespace) -> int:
         res = kbd.dispatch_once(
             conn,
             dry_run=args.dry_run,
+            board=kb.get_current_board(),
             max_spawn=max_spawn,
             max_in_progress=max_in_progress,
             failure_limit=getattr(args, "failure_limit", kbd.DEFAULT_FAILURE_LIMIT),
             default_assignee=default_assignee,
             max_in_progress_per_profile=max_in_progress_per_profile,
+            task_id=getattr(args, "task_id", None),
+            lane=getattr(args, "lane", None),
+            expected_task_event_id=getattr(args, "expected_task_event_id", None),
+            expected_board_identity=getattr(args, "expected_board_identity", None),
+            expected_assignee=getattr(args, "expected_assignee", None),
         )
+        from hermes_cli.kanban_db_identity import board_identity
+        identity = board_identity(conn)
     if getattr(args, "json", False):
         _print_json({
+            "schema_version": "kanban-dispatch-receipt-v2",
+            "board_identity": identity,
+            "selection": {key: getattr(args, key, None) for key in (
+                "task_id", "lane", "expected_task_event_id", "expected_board_identity", "expected_assignee",
+            )},
+            "effect_status": "unknown" if res.effect_unknown else ("spawned" if res.spawned else "not_spawned"),
+            "effect_unknown": res.effect_unknown,
+            "no_spawn_reason": "dispatch_locked" if res.skipped_locked else res.no_spawn_reason,
+            "board": kb.get_current_board(),
+            "selection_rejected": res.selection_rejected,
             **{k: getattr(res, k)
                for k in ("reclaimed", "crashed", "timed_out", "stale", "auto_blocked", "promoted")},
             "spawned": [
-                {"task_id": tid, "assignee": who, "workspace": ws} for (tid, who, ws) in res.spawned
+                {"task_id": tid, "assignee": who, "workspace": ws, "run_id": res.spawned_run_ids.get(tid)} for (tid, who, ws) in res.spawned
             ],
             "skipped_unassigned": res.skipped_unassigned,
             "skipped_nonspawnable": res.skipped_nonspawnable,

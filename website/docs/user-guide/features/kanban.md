@@ -1175,3 +1175,47 @@ Kanban is deliberately single-host. `~/.hermes/kanban.db` is a local SQLite file
 ## Design spec
 
 The complete design — architecture, concurrency correctness, comparison with other systems, implementation plan, risks, open questions — lives in `docs/hermes-kanban-v1-spec.pdf`. Read that before filing any behavior-change PR.
+
+
+### Dispatching one observed task
+
+A controller can restrict a dispatch pass to one observed task:
+
+```bash
+hermes kanban --board my-board dispatch --task-id t_example --lane ready --expected-task-event-id 42 --expected-assignee qa --expected-board-identity <identity-from-show> --max 1 --json
+```
+
+Read `task_generation`, `board_identity` and `task.assignee` from
+`hermes kanban show TASK --json`. All five selector arguments are required.
+The generation is the latest task event ID. Any intervening task event
+invalidates the selection. The profile and board witness are also checked
+inside the atomic claim transaction.
+
+A targeted pass does not reclaim or promote the board, does not assign an
+unassigned task, and never falls back to a competing task. Immediately before
+entering the spawn callback, it rechecks the claimed task/run and unexpired lease, profile, board
+witness, dependencies, review enablement, respawn protection, capacity and memory
+pressure under the board write transaction. Task changes while resolving a
+workspace therefore cannot release stale execution.
+
+All mutating controller executions require a version 2 receipt; unversioned
+source-run echoes cannot prove a dispatch. Board wakes verify the same exact
+spawned run, profile and board identity as targeted actions.
+
+The versioned JSON receipt distinguishes `effect_status: not_spawned` (a
+definite refusal such as capacity or the dispatch lock), `spawned`, and
+`unknown`. A successful receipt includes the exact new `run_id` and assignee.
+The receipt echoes all five inputs in `selection`; targeted consumers require
+an exact match so a prior dispatch receipt cannot satisfy a newer generation.
+Readback must find that run in the same board identity with the same profile;
+the run may already have completed. An exception after entering the process
+boundary requires reconciliation and parks the task for input; it is never
+evidence that starting another worker is safe.
+
+The read-only board identity uses the connected database path, device/inode and
+first-event witness. It detects ordinary file replacement and changed lineage,
+but cannot distinguish an exact historical restore into the same inode.
+It is not a lifecycle-owned incarnation or an artifact approval token. Unmanaged
+restore/replacement and cross-board resource admission remain outside this local
+transaction guarantee. Install compatible paired controller/dispatcher versions
+before enabling a controller that sends these flags.
