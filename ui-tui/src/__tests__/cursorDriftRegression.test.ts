@@ -46,9 +46,7 @@ const USER_REPORT_MESSAGE =
   'and you can see its multiline, new session. on a new bb/<xxx> branch investigate'
 
 describe('cursor-drift regression — composer cursorLayout matches Ink rendering', () => {
-  it(
-    'agrees with wrap-ansi at every typing-prefix of the user-reported message',
-    () => {
+  it('agrees with wrap-ansi at every typing-prefix of the user-reported message', () => {
     // Walks the message char-by-char (mirroring what the TUI sees when a
     // user types). At every prefix, cursorLayout must place the cursor
     // exactly where wrap-ansi would render the end of the text.

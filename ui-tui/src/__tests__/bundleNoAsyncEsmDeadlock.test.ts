@@ -50,7 +50,6 @@ function bundleIsFresh(): boolean {
 
     return bundleMtime >= sourceMtime
   } catch {
-
     return false
   }
 }
