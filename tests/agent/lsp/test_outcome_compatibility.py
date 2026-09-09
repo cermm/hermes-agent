@@ -66,4 +66,3 @@ def test_legacy_write_override_inherited_replace(ops, tmp_path, monkeypatch, err
     else:
         assert result.success and source.read_text() == 'after\n'
         assert result.lsp_verification['files'][0]['reason'] == 'legacy_provider'
-
