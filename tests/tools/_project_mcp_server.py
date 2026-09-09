@@ -13,6 +13,12 @@ for line in sys.stdin:
     method = req["method"]
     params = req.get("params", {})
     if method == "initialize":
+        if os.environ.get("PROJECT_FIXTURE_INIT_GATE"):
+            gate = Path(os.environ["PROJECT_FIXTURE_INIT_GATE"])
+            gate.with_suffix(".entered").touch()
+            deadline = time.monotonic() + 15
+            while not gate.exists() and time.monotonic() < deadline:
+                time.sleep(.01)
         result = {"protocolVersion": "2024-11-05", "capabilities": {
             "tools": {}, "resources": {}, "prompts": {}},
             "serverInfo": {"name": "project-fixture", "version": "1"}}

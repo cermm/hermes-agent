@@ -26,7 +26,7 @@ def _reset():
 
 
 
-def test_maybe_lsp_diagnostics_returns_empty_for_non_local(monkeypatch):
+def test_lsp_feedback_returns_not_checked_for_non_local(monkeypatch):
     from tools.file_operations import ShellFileOperations
 
     fake_env = MagicMock()
@@ -44,10 +44,11 @@ def test_maybe_lsp_diagnostics_returns_empty_for_non_local(monkeypatch):
             called.append(("get_diagnostics_sync", path))
             return [{"severity": 1, "message": "should not see this"}]
 
-    monkeypatch.setattr("agent.lsp.get_service", lambda: FakeService())
+    monkeypatch.setattr("agent.lsp.get_service", lambda **kwargs: FakeService())
 
-    result = fops._maybe_lsp_diagnostics("/sandbox/x.py")
-    assert result == ""
+    text, evidence = fops._lsp_feedback("/sandbox/x.py")
+    assert text is None
+    assert evidence["files"][0]["reason"] == "non_local_backend"
     assert called == [], "service must not be queried for non-local backends"
 
 
@@ -63,7 +64,7 @@ def test_snapshot_baseline_called_for_local_env(tmp_path, monkeypatch):
         def snapshot_baseline(self, path):
             snapshot_called.append(path)
 
-    monkeypatch.setattr("agent.lsp.get_service", lambda: FakeService())
+    monkeypatch.setattr("agent.lsp.get_service", lambda **kwargs: FakeService())
 
     fops._snapshot_lsp_baseline(str(tmp_path / "x.py"))
     assert snapshot_called == [str(tmp_path / "x.py")]

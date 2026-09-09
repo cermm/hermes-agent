@@ -111,10 +111,10 @@ def test_snapshot_failure_marks_broken_via_outer_timeout(tmp_path, monkeypatch):
     )
     try:
         # Force the inner snapshot coroutine to raise.
-        async def boom(_path):
+        async def boom(_path, **kwargs):
             raise RuntimeError("outer-timeout simulated")
 
-        with patch.object(svc, "_snapshot_async", boom):
+        with patch.object(svc, "_query_outcome_async", boom):
             assert svc.enabled_for(str(src)) is True
             svc.snapshot_baseline(str(src))
 

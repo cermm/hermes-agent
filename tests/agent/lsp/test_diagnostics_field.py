@@ -58,7 +58,7 @@ def test_lint_and_lsp_diagnostics_are_separate_channels():
 
 
 # ---------------------------------------------------------------------------
-# write_file populates the field via _maybe_lsp_diagnostics
+# write_file populates the field via _lsp_feedback
 # ---------------------------------------------------------------------------
 
 
@@ -73,7 +73,7 @@ def test_write_file_skips_lsp_when_syntax_failed(tmp_path):
     fops = ShellFileOperations(LocalEnvironment(cwd=str(tmp_path)))
     target = tmp_path / "broken.py"
 
-    with patch.object(fops, "_maybe_lsp_diagnostics") as mock_lsp:
+    with patch.object(fops, "_lsp_feedback") as mock_lsp:
         res = fops.write_file(str(target), "def x(:\n")  # syntax error
     assert mock_lsp.call_count == 0
     assert res.lsp_diagnostics is None
@@ -94,7 +94,7 @@ def test_patch_replace_propagates_lsp_diagnostics(tmp_path):
 
     block = "<diagnostics>ERROR [1:5] semantic issue</diagnostics>"
 
-    with patch.object(fops, "_maybe_lsp_diagnostics", return_value=block):
+    with patch.object(fops, "_lsp_feedback", return_value=(block, {"files": [], "omitted_files": 0})):
         res = fops.patch_replace(str(target), "x = 1", "x = 2")
 
     assert res.success is True

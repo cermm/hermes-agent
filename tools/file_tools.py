@@ -729,7 +729,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                "Strip read_file line-number prefixes or reconstruct the intended "
                "file contents before writing.")
     if err:
-        return tool_error(err)
+        from agent.lsp.outcome import unchecked_verification
+        return tool_error(err, lsp_verification=unchecked_verification([path], "write", "validation_failed"))
     try:
         # Resolution failure falls back to the legacy unlocked path (the write
         # still proceeds; the per-task staleness check still runs).
@@ -742,6 +743,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
                 _lock.enter_context(file_state.lock_path(_resolved))
             warnings = _edit_warnings([path], path_to_resolved, task_id)
             result_dict = _get_file_ops(task_id).write_file(_resolved or path, content).to_dict()
+            from agent.lsp.outcome import ensure_verification
+            ensure_verification(result_dict, [_resolved or path], "write")
             if warnings:
                 result_dict["_warning"] = warnings[0]
             if _resolved:
@@ -760,7 +763,8 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             logger.debug("write_file expected denial: %s: %s", type(e).__name__, e)
         else:
             logger.error("write_file error: %s: %s", type(e).__name__, e, exc_info=True)
-        return tool_error(str(e))
+        from agent.lsp.outcome import unchecked_verification
+        return tool_error(str(e), lsp_verification=unchecked_verification([path], "write", "write_failed"))
 
 
 def _collect_v4a_header_paths(patch: str) -> tuple[list[str], list[str]] | str:
@@ -810,7 +814,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
         _content_write_paths += collected[1]
     precheck_err = _write_precheck_error(_paths_to_check, _content_write_paths, task_id, cross_profile)
     if precheck_err:
-        return tool_error(precheck_err)
+        from agent.lsp.outcome import unchecked_verification
+        return tool_error(precheck_err, lsp_verification=unchecked_verification(_paths_to_check, mode, "validation_failed"))
     try:
         # Lock paths in sorted, deduplicated order so concurrent callers with
         # overlapping multi-file patches can't deadlock (every caller locks in
@@ -839,6 +844,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                 return tool_error(f"Unknown mode: {mode}")
 
             result_dict = result.to_dict()
+            from agent.lsp.outcome import ensure_verification
+            ensure_verification(result_dict, [_path_to_resolved.get(p) or p for p in _paths_to_check], mode)
             if stale_warnings:
                 result_dict["_warning"] = " | ".join(stale_warnings)
             if not result_dict.get("error"):
@@ -873,7 +880,8 @@ def patch_tool(mode: str = "replace", path: str = None, old_string: str = None,
                     "content, or search_files to locate the text.")
         return json.dumps(result_dict, ensure_ascii=False)
     except Exception as e:
-        return tool_error(str(e))
+        from agent.lsp.outcome import unchecked_verification
+        return tool_error(str(e), lsp_verification=unchecked_verification(_paths_to_check, mode, "write_failed"))
 
 
 def search_tool(pattern: str, target: str = "content", path: str = ".",
@@ -987,7 +995,7 @@ READ_FILE_SCHEMA = {
 
 WRITE_FILE_SCHEMA = {
     "name": "write_file",
-    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed.",
+    "description": "Write content to a file, completely replacing existing content. Use this instead of echo/cat heredoc in terminal. Creates parent directories automatically. OVERWRITES the entire file — use 'patch' for targeted edits. Auto-runs syntax checks on .py/.json/.yaml/.toml and other linted languages; only NEW errors introduced by this write are surfaced (pre-existing errors are filtered out). The result's verified:true means the on-disk content hash was confirmed — do NOT re-read the file to check the write landed. LSP verification is separate: lsp_verification reports fresh diagnostic totals, known-baseline deltas, or no verdict/not checked; an empty delta is not a clean file. Content-hash verification and syntax checks do not certify semantic correctness.",
     "parameters": {
         "type": "object",
         "properties": {
@@ -1016,7 +1024,7 @@ PATCH_SCHEMA = {
     "description": (
         "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
         "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
-        "Returns a unified diff. Auto-runs syntax checks after editing. "
+        "Returns a unified diff. Auto-runs syntax checks after editing. LSP verification is separate: lsp_verification reports fresh diagnostic totals, known-baseline deltas, or no verdict/not checked; an empty delta is not a clean file. Content-hash verification and syntax checks do not certify semantic correctness. "
         "Finds a unique string and replaces it."
     ),
     "parameters": {
@@ -1054,7 +1062,7 @@ PATCH_SCHEMA = {
 _PATCH_V4A_DESCRIPTION = (
     "Targeted find-and-replace edits in files. Use this instead of sed/awk in terminal. "
     "Uses fuzzy matching (9 strategies) so minor whitespace/indentation differences won't break it. "
-    "Returns a unified diff. Auto-runs syntax checks after editing.\n\n"
+    "Returns a unified diff. Auto-runs syntax checks after editing. LSP verification is separate: lsp_verification reports fresh diagnostic totals, known-baseline deltas, or no verdict/not checked; an empty delta is not a clean file. Content-hash verification and syntax checks do not certify semantic correctness.\n\n"
     "REPLACE MODE (mode='replace', default): find a unique string and replace it. "
     "REQUIRED PARAMETERS: mode, path, old_string, new_string.\n"
     "PATCH MODE (mode='patch'): apply V4A multi-file patches for bulk changes. "

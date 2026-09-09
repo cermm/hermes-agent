@@ -173,7 +173,7 @@ class LintMixin:
                           post_content: Optional[str] = None) -> LintResult:
         """Post-write lint; when it fails and ``pre_content`` is known, report only
         errors this edit introduced (pre-existing lines filtered out). Semantic
-        (LSP) diagnostics are a separate channel — see ``_maybe_lsp_diagnostics``."""
+        (LSP) diagnostics are a separate channel — see ``_lsp_feedback``."""
         post = self._check_lint(path, content=post_content)
         if post.success or post.skipped or pre_content is None:
             return post
@@ -211,7 +211,7 @@ class LintMixin:
             return None
         try:
             from agent.lsp import get_service
-            return get_service()
+            return get_service(include_disabled=True)
         except Exception:  # noqa: BLE001
             return None
 
@@ -265,31 +265,41 @@ class LintMixin:
         """Capture pre-edit LSP diagnostics so the post-write delta is correct. Silent on failure."""
         self._lsp_call("snapshot_baseline", path, None)
 
-    def _maybe_lsp_diagnostics(self, path: str, *, pre_content: Optional[str] = None,
-                               post_content: Optional[str] = None) -> str:
-        """Formatted LSP diagnostics introduced by this edit, or "" when LSP is
-        unavailable/disabled/clean. With both pre and post content a line-shift map
-        remaps baseline diagnostics into post-edit coordinates; otherwise every
-        pre-existing diagnostic below an inserted line would look new."""
+    def _unchecked_lsp_result(self, result, path: str, reason: str, operation: str = "write"):
+        from agent.lsp.outcome import operation_outcome, verification
+        result.lsp_verification = verification([operation_outcome(path, operation, reason)])
+        return result
+
+    def _lsp_feedback(self, path: str, *, pre_content: Optional[str] = None,
+                      post_content: Optional[str] = None):
+        """One semantic query, preserving no-verdict and legacy provider boundaries."""
+        from agent.lsp.outcome import DiagnosticOutcome, operation_outcome, verification
+        if not self._lsp_local_only():
+            return None, verification([operation_outcome(path, "write", "non_local_backend")])
         svc = self._lsp_service()
-        if svc is None or not svc.enabled_for(path):
-            return ""
-        line_shift = None
-        if pre_content is not None and post_content is not None and pre_content != post_content:
-            try:
+        if svc is None:
+            result = DiagnosticOutcome("no_verdict", "service_unavailable")
+        else:
+            line_shift = None
+            if pre_content is not None and post_content is not None and pre_content != post_content:
                 from agent.lsp.range_shift import build_line_shift
                 line_shift = build_line_shift(pre_content, post_content)
-            except Exception:  # noqa: BLE001
-                line_shift = None
+            try:
+                query = getattr(svc, "get_diagnostic_outcome_sync", None)
+                if callable(query):
+                    result = query(path, delta=True, line_shift=line_shift,
+                                   pre_content=pre_content, post_content=post_content)
+                else:
+                    # One old query only. Neither a list nor its absence proves freshness.
+                    eligible = getattr(svc, "enabled_for", None)
+                    diags = (svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
+                             if not callable(eligible) or eligible(path) else [])
+                    result = DiagnosticOutcome("not_checked", "legacy_provider", diagnostics=diags or [])
+            except Exception:
+                result = DiagnosticOutcome("no_verdict", "server_error")
         try:
-            diagnostics = svc.get_diagnostics_sync(path, delta=True, line_shift=line_shift)
-        except Exception:  # noqa: BLE001
-            return ""
-        if not diagnostics:
-            return ""
-        try:
-            from agent.lsp.reporter import report_for_file, truncate
-            block = report_for_file(path, diagnostics)
-            return truncate("LSP diagnostics introduced by this edit:\n" + block) if block else ""
-        except Exception:  # noqa: BLE001
-            return ""
+            text, record = result.as_file(path)
+            return text or None, verification([record])
+        except Exception:
+            # Malformed provider data must not turn the completed write into a failure.
+            return None, verification([operation_outcome(path, "write", "server_error", status="no_verdict")])

@@ -498,19 +498,20 @@ class LSPClient:
 
     # ---- public file-sync API ----
 
-    async def open_file(self, path: str, *, language_id: str = "plaintext") -> int:
-        """Send didOpen (first time) or didChange (subsequent); return the new document version."""
+    async def open_file(self, path: str, *, language_id: str = "plaintext", text: Optional[str] = None) -> int:
+        """Synchronize source and return its version; explicit checks may supply already validated text."""
         async with self._document_sync_lock:
-            return await self._open_file_locked(path, language_id=language_id)
+            return await self._open_file_locked(path, language_id=language_id, text=text)
 
-    async def _open_file_locked(self, path: str, *, language_id: str) -> int:
+    async def _open_file_locked(self, path: str, *, language_id: str, text: Optional[str] = None) -> int:
         if not self.is_running:
             raise LSPProtocolError("client not running")
         abs_path = os.path.abspath(path)
-        try:
-            text = Path(abs_path).read_text(encoding="utf-8", errors="replace")
-        except OSError as e:
-            raise LSPProtocolError(f"cannot read {abs_path}: {e}") from e
+        if text is None:
+            try:
+                text = Path(abs_path).read_text(encoding="utf-8", errors="replace")
+            except OSError as e:
+                raise LSPProtocolError(f"cannot read {abs_path}: {e}") from e
         uri = file_uri(abs_path)
         doc = self._docs.get(abs_path)
         if doc is not None and doc.version < 0:
@@ -700,6 +701,14 @@ class LSPClient:
                 baseline = self._push_counter
                 continue
             await self._await_push(min(remaining, 0.5))
+
+    def diagnostic_snapshot(self, path: str) -> Optional[Dict[str, Any]]:
+        """Observe one current generation without yielding; call on the client loop."""
+        doc = self._docs.get(os.path.abspath(path))
+        if not self.is_running or doc is None or not doc.fresh():
+            return None
+        return {"diagnostics": list(self.diagnostics_for(path, fresh_only=True)),
+                "text": doc.text, "version": doc.version}
 
     def diagnostics_for(self, path: str, *, fresh_only: bool = False) -> List[Dict[str, Any]]:
         """Merged + deduped push/pull diagnostics for one file.  With ``fresh_only=True`` a store only
