@@ -17,6 +17,34 @@ class ProjectBindingError(ValueError):
     pass
 
 
+def workspace_bound_toolsets() -> list[str]:
+    """Current profile's workspace MCP names, including discovery still in flight.
+
+    A delegate must freeze canonical denials before its first schema snapshot;
+    waiting for a registered tool misses eager connections that finish later.
+    This reads lifecycle metadata only, never reloads config or credentials.
+    """
+    from hermes_constants import get_hermes_home
+    from tools.mcp_tool_common import _core
+    profile = str(get_hermes_home().resolve())
+    scope = _core._mcp_registry_scope()
+    with _core._lock:
+        modes = dict(_core._server_project_modes)
+        # Already-connected/lazy descriptors also cover integrations that
+        # populated those lifecycle ledgers before declarations were introduced.
+        for name, cfg in {
+            **{n: getattr(server, "_config", {}) for n, server in _core._servers.items()},
+            **_core._lazy_server_configs,
+        }.items():
+            binding = cfg.get("_project_binding") or {}
+            if name not in modes and binding:
+                modes[name] = (_core._server_scope_keys.get(name),
+                               binding.get("profile"), binding.get("mode"))
+        return sorted(f"mcp-{name}" for name, (owner_scope, owner_profile, mode) in modes.items()
+                      if mode == "workspace" and owner_profile == profile
+                      and owner_scope in (None, scope))
+
+
 def _identity(path: str) -> dict:
     from hermes_cli._subprocess_compat import harden_git_argv, noninteractive_git_env
     env = {k: v for k, v in noninteractive_git_env().items() if not k.startswith("GIT_")}

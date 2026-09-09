@@ -387,6 +387,9 @@ _servers: Dict[str, MCPServerTask] = {}
 # /reload-mcp tears down only its own profile's servers.
 _server_scope_keys: Dict[str, Optional[str]] = {}
 _server_connecting: set[str] = set()
+# name -> (registry scope, profile home, project mode), declared BEFORE a
+# connection/cache can publish tools. Contains no launch config or credentials.
+_server_project_modes: Dict[str, tuple[Optional[str], str, Optional[str]]] = {}
 _server_connect_errors: Dict[str, str] = {}
 # Lazy startup: servers registered from the schema cache without connecting; popped on
 # first real connection.

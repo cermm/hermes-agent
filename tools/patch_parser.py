@@ -229,18 +229,18 @@ def _validate_operations(operations: List[PatchOperation], file_ops: Any) -> Lis
 
 
 # Every _apply_* returns (success, diff_or_error, lsp_diagnostics, lint_result).
-ApplyResult = Tuple[bool, str, Optional[str], Optional[dict]]
+ApplyResult = Tuple[bool, str, Optional[str], Optional[dict], Optional[dict]]
 
 
 def _fail(error: str) -> ApplyResult:
-    return False, error, None, None
+    return False, error, None, None, None
 
 
 def _written(result: Any, diff: str) -> ApplyResult:
     """Outcome of a write: its error, else success with LSP/lint propagated from the WriteResult."""
     if result.error:
-        return _fail(result.error)
-    return True, diff, getattr(result, "lsp_diagnostics", None), getattr(result, "lint", None)
+        return False, result.error, None, None, getattr(result, "lsp_verification", None)
+    return True, diff, getattr(result, "lsp_diagnostics", None), getattr(result, "lint", None), getattr(result, "lsp_verification", None)
 
 
 def _unified_diff(path: str, old: str, new: Optional[str]) -> str:
@@ -255,6 +255,8 @@ def apply_v4a_operations(operations: List[PatchOperation], file_ops: Any) -> 'Pa
     failure (validate/apply race) carries a ``git diff`` note since state may be inconsistent.
     ``file_ops`` needs read_file_raw/write_file/delete_file/move_file."""
     from tools.file_operations_common import PatchResult  # avoid circular import
+    from agent.lsp.outcome import operation_outcome, verification
+    from agent.lsp.reporter import MAX_TOTAL_CHARS
 
     def _bullets(errs: List[str]) -> str:
         return "\n".join(f"  • {e}" for e in errs)
@@ -262,18 +264,36 @@ def apply_v4a_operations(operations: List[PatchOperation], file_ops: Any) -> 'Pa
     if errors := _validate_operations(operations, file_ops):
         return PatchResult(
             success=False,
-            error="Patch validation failed (no files were modified):\n" + _bullets(errors))
+            error="Patch validation failed (no files were modified):\n" + _bullets(errors),
+            lsp_verification=verification([operation_outcome(op.file_path, op.operation.value, "validation_failed") for op in operations]))
     files: Dict[str, List[str]] = {"created": [], "deleted": [], "modified": []}
     all_diffs: List[str] = []
     # V4A bypasses write_file's WriteResult plumbing: LSP diagnostics and lint propagate per file.
     lsp_blocks: List[str] = []
     lint_results: Dict[str, dict] = {}
+    outcomes: List[dict] = []
+    omitted = 0
     for op in operations:
         handler, verb, bucket = _APPLY_DISPATCH[op.operation]
         try:
-            ok, payload, lsp, lint = handler(op, file_ops)
+            ok, payload, lsp, lint, evidence = handler(op, file_ops)
         except Exception as e:
-            ok, payload = None, str(e)
+            ok, payload, lsp, lint, evidence = None, str(e), None, None, None
+        records = list((evidence or {}).get("files", []))
+        omitted += (evidence or {}).get("omitted_files", 0)
+        if not records:
+            reason = ("write_failed" if not ok else
+                      {OperationType.DELETE: "deleted", OperationType.MOVE: "moved"}.get(op.operation, "legacy_provider"))
+            records = [operation_outcome(op.new_path if op.operation is OperationType.MOVE else op.file_path,
+                                         op.operation.value, reason)]
+        else:
+            records = [dict(row, operation=op.operation.value) for row in records]
+        if lsp and len("\n\n".join([*lsp_blocks, lsp])) > MAX_TOTAL_CHARS:
+            lsp = None
+            for row in records:
+                if "report" in row:
+                    row["report"] = dict(row["report"], rendered=0, truncated=True)
+        outcomes.extend(records)
         if not ok:
             prefix = f"Failed to {verb}" if ok is False else "Error processing"
             errors.append(f"{prefix} {op.file_path}: {payload}")
@@ -292,7 +312,8 @@ def apply_v4a_operations(operations: List[PatchOperation], file_ops: Any) -> 'Pa
                + _bullets(errors)) if errors else None,
         diff='\n'.join(all_diffs),
         files_modified=files["modified"], files_created=files["created"], files_deleted=files["deleted"],
-        lint=lint_results or None, lsp_diagnostics="\n\n".join(lsp_blocks) or None)
+        lint=lint_results or None, lsp_diagnostics="\n\n".join(lsp_blocks) or None,
+        lsp_verification=verification(outcomes, omitted=omitted))
 
 
 def _write_file_accepts_pre_content(file_ops: Any) -> bool:
@@ -321,13 +342,13 @@ def _apply_delete(op: PatchOperation, file_ops: Any) -> ApplyResult:
         return _fail(f"Cannot delete {op.file_path}: file not found")
     result = file_ops.delete_file(op.file_path)
     diff = _unified_diff(op.file_path, read_result.content, None) or f"# Deleted: {op.file_path}"
-    return _fail(result.error) if result.error else (True, diff, None, None)
+    return _fail(result.error) if result.error else (True, diff, None, None, None)
 
 
 def _apply_move(op: PatchOperation, file_ops: Any) -> ApplyResult:
     result = file_ops.move_file(op.file_path, op.new_path)
     return _fail(result.error) if result.error else (
-        True, f"# Moved: {op.file_path} -> {op.new_path}", None, None)
+        True, f"# Moved: {op.file_path} -> {op.new_path}", None, None, None)
 
 
 def _insert_addition_only(new_content: str, hunk: Hunk, insert_text: str) -> Tuple[Optional[str], Optional[str]]:

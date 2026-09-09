@@ -142,10 +142,25 @@ def _build_child_agent(
 
     delegation_cfg = _load_config()
     child_toolsets, child_disabled_toolsets = _resolve_child_toolsets(parent_agent, toolsets, effective_role)
+    # Isolated worktrees are seeded only after construction. Freeze exclusions
+    # now, before AIAgent takes its first prompt/schema snapshot; canonical
+    # disabled names also survive late discovery and composite/alias expansion.
+    workspace_denials = []
+    if _get_worktree_isolation():
+        from tools.mcp_tool_project import workspace_bound_toolsets
+        workspace_denials = workspace_bound_toolsets()
+        child_disabled_toolsets = list(dict.fromkeys(child_disabled_toolsets + workspace_denials))
     child_prompt = _build_child_system_prompt(
         goal, context, workspace_path=_resolve_workspace_hint(parent_agent), role=effective_role,
         max_spawn_depth=max_spawn, child_depth=child_depth,
     )
+    if workspace_denials:
+        child_prompt += (
+            "\n\nWorkspace-bound MCP navigation is unavailable in this isolated same-process "
+            "delegate: its inherited connections remain bound to the parent worktree. "
+            "Use native diagnostics, file or terminal verification only where your existing "
+            "tool permissions allow. A fresh project worker is required for a new MCP binding."
+        )
     parent_api_key = getattr(parent_agent, "api_key", None)
     if (not parent_api_key) and hasattr(parent_agent, "_client_kwargs"):
         parent_api_key = parent_agent._client_kwargs.get("api_key")

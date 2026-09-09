@@ -53,7 +53,7 @@ def _emit_once(bucket: set, key: Tuple, server_id: str, level: int, first: str, 
 
 
 def log_clean(server_id: str, file_path: str) -> None:
-    """No diagnostics emitted for *file_path*.  DEBUG."""
+    """A fresh full diagnostic set is empty. DEBUG."""
     _emit(server_id, logging.DEBUG, f"clean ({_short_path(file_path)})")
 
 
@@ -71,6 +71,11 @@ def log_active(server_id: str, workspace_root: str) -> None:
 def log_diagnostics(server_id: str, file_path: str, count: int) -> None:
     """Diagnostics arrived for a file.  INFO every time — rare per edit and what users grep for."""
     _emit(server_id, logging.INFO, f"{count} diags ({_short_path(file_path)})")
+
+
+def log_diagnostic_outcome(server_id: str, file_path: str, total: int, delta: int | None) -> None:
+    """Full fresh counts are independent of baseline/report filtering."""
+    _emit(server_id, logging.INFO, f"{total} diags, delta={delta if delta is not None else 'unknown'} ({_short_path(file_path)})")
 
 
 def log_no_project_root(server_id: str, file_path: str) -> None:

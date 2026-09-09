@@ -10,6 +10,7 @@ import os
 import shutil
 import subprocess
 import time
+import threading
 from pathlib import Path
 
 import pytest
@@ -110,26 +111,86 @@ def test_real_typescript_cold_warm_write_and_repair(tmp_path, monkeypatch, sdk_s
     good = "export const count: number = 1;\n"
     bad = 'export const count: number = "bad";\n'
     source.write_text(good)
-    timings = {}
+    # Cold server indexing has no universal five-second latency guarantee. Keep
+    # the first write unprewarmed and retain its verdict before any readiness wait.
+    from agent.lsp.client import LSPClient
+    from agent.lsp.outcome import text_hash
+    traffic = []
+    error_published = threading.Event()
+    original_write, original_dispatch = LSPClient._write, LSPClient._dispatch
+
+    async def observe_write(client, message):
+        traffic.append({"direction": "out", "at": time.monotonic(), "message": message})
+        await original_write(client, message)
+
+    def observe_dispatch(client, message):
+        original_dispatch(client, message)
+        traffic.append({"direction": "in", "at": time.monotonic(), "message": message})
+        params = message.get("params", {})
+        if (message.get("method") == "textDocument/publishDiagnostics"
+                and params.get("uri") == source.as_uri()
+                and any(str(d.get("code")) == "2322" for d in params.get("diagnostics", []))):
+            error_published.set()
+
+    monkeypatch.setattr(LSPClient, "_write", observe_write)
+    monkeypatch.setattr(LSPClient, "_dispatch", observe_dispatch)
+    receipt = {"sdk_selection": sdk_selection, "writes": [], "traffic": traffic}
     try:
         status = backend_status(str(project), [binary], init_options)
         assert status["status"] == "prerequisites-present"
         for label, content, expected_error in [("cold-error", bad, True), ("repair", good, False), ("warm-error", bad, True), ("repair-again", good, False)]:
             start = time.monotonic()
             result = operations.write_file(str(source), content)
-            timings[label] = round(time.monotonic() - start, 3)
-            assert result.verified and not result.error
-            assert ("2322" in (result.lsp_diagnostics or "")) == expected_error, result.to_dict()
+            returned = time.monotonic()
+            record = {"label": label, "started": start, "returned": returned,
+                      "whole_write_seconds": returned - start, "result": result.to_dict()}
+            receipt["writes"].append(record)
+            assert result.verified and not result.error and source.read_text() == content, receipt
             svc = get_service()
             client = next(iter(svc._clients.values()))
-            assert client.is_running
+            assert client.is_running and svc._wait_timeout == 5, receipt
+            assert client._command == [binary, "--stdio"], receipt
+            assert Path(client._init_options["tsserver"]["path"]).resolve() == sdk.resolve(), receipt
+            outcome = result.lsp_verification["files"][0]
+            if label == "cold-error" and outcome["status"] == "no_verdict":
+                assert outcome["reason"] == "timeout", receipt
+                assert outcome["total"] is None and outcome["delta"] is None, receipt
+                assert "source" not in outcome and not result.lsp_diagnostics, receipt
+                # Explicit startup precondition AFTER returning the cold timeout.
+                # Observe the real publication only: no write/query/sync retry.
+                ready_start = time.monotonic()
+                ready = error_published.wait(30)
+                record["separate_startup_readiness"] = {
+                    "seconds": time.monotonic() - ready_start, "published_2322": ready}
+                assert ready, receipt
+                continue
+            assert outcome["status"] == "fresh", receipt
+            assert outcome["reason"] == ("diagnostics_present" if expected_error else "clean"), receipt
+            assert outcome["total"] == {"count": int(expected_error), "error": int(expected_error),
+                "warning": 0, "information": 0, "hint": 0, "unknown": 0}, receipt
+            if outcome["baseline"] == "available":
+                assert outcome["delta"] == outcome["total"], receipt
+            else:
+                assert outcome["baseline"] == "unavailable" and outcome["delta"] is None, receipt
+                if expected_error:
+                    assert "baseline unavailable" in result.lsp_diagnostics, receipt
+            assert ("2322" in (result.lsp_diagnostics or "")) == expected_error, receipt
             doc = client._docs[str(source)]
-            assert doc.fresh(), "absence of errors must be an actual fresh verdict"
-            assert bool(client.diagnostics_for(str(source), fresh_only=True)) == expected_error
-        assert get_service().get_status()["broken"] == []
-        print("Real TypeScript write timings:", json.dumps(timings, sort_keys=True))
+            assert doc.fresh(), receipt
+            assert bool(client.diagnostics_for(str(source), fresh_only=True)) == expected_error, receipt
+            assert outcome["source"]["document_version"] == doc.version, receipt
+            assert outcome["source"]["text_sha256"] == text_hash(content), receipt
+        requests = [row["message"] for row in traffic if row["direction"] == "out"
+                    and row["message"].get("method") == "textDocument/diagnostic"]
+        assert len(requests) == 1, receipt
+        responses = [row["message"] for row in traffic if row["direction"] == "in"
+                     and "method" not in row["message"] and row["message"].get("id") == requests[0]["id"]]
+        assert len(responses) == 1 and responses[0].get("error", {}).get("code") == -32601, receipt
+        assert get_service().get_status()["broken"] == [], receipt
     finally:
         shutdown_service()
+        (tmp_path / "typescript-outcome-receipt.json").write_text(json.dumps(receipt, sort_keys=True))
+        print("Real TypeScript outcome receipt:", json.dumps(receipt, sort_keys=True))
 
 
 def test_status_and_spawn_agree_on_wrapper_and_supported_sdk_forms(tmp_path, monkeypatch):

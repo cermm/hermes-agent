@@ -27,7 +27,7 @@ These tests pin the contract:
     ``ext not in LINTERS`` branch) and adding one would have inherited
     ``.ts``'s broken ``tsc --noEmit FILE`` invocation for LSP-disabled
     users.  When LSP IS enabled, ``.tsx`` is still covered by
-    typescript-language-server via ``_maybe_lsp_diagnostics`` — the
+    typescript-language-server via ``_lsp_feedback`` — the
     diagnostics show up on ``lsp_diagnostics``, not ``lint``.
 """
 from __future__ import annotations
