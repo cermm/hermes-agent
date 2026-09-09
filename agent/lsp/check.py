@@ -72,7 +72,8 @@ def _read_source(path: Path, deadline: float) -> dict:
             raise CheckInputError("not_regular_file")
         if info.st_size > MAX_FILE_BYTES:
             raise CheckInputError("file_too_large")
-        with os.fdopen(os.open(path, flags), "rb") as stream:
+        descriptor = os.open(path, flags)
+        with os.fdopen(descriptor, "rb") as stream:
             before = os.fstat(stream.fileno())
             if not stat.S_ISREG(before.st_mode):
                 raise CheckInputError("not_regular_file")
