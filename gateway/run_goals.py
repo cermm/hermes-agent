@@ -121,6 +121,11 @@ class GatewayGoalsMixin(GatewayGoalControlMixin):
 
     async def _heartbeat_poll_once(self, watch: dict) -> None:
         """One heartbeat poll pass: enqueue every due prompt of a non-busy watched session."""
+        from agent.estop import check_background_held, check_paused
+        if check_paused("heartbeat auto-continuation", logger) or check_background_held(
+            "heartbeat auto-continuation", logger
+        ):
+            return
         # Off-loop warm-up covers the degraded path where /heartbeat's own warm-up failed.
         await self._warm_goals_session_db("heartbeat poll")
         for quick_key, (source, session_id) in list(watch.items()):
@@ -341,6 +346,11 @@ class GatewayGoalsMixin(GatewayGoalControlMixin):
         generation-scoped control record until every status/continuation side
         effect is complete or cancellation removes the exact owner.
         """
+        from agent.estop import check_background_held, check_paused
+        if check_paused("goal auto-continuation", logger) or check_background_held(
+            "goal auto-continuation", logger
+        ):
+            return
         sid = getattr(session_entry, "session_id", None) or ""
         if not sid:
             return

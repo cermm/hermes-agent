@@ -316,6 +316,10 @@ def fire_overdue_jobs(
 def resolve_cron_scheduler() -> "CronScheduler":
     """Resolve ``cron.provider``; missing/failing/unavailable providers fall back to the built-in
     with a warning — cron must never be left without a trigger."""
+    from agent.estop import is_background_held
+    if is_background_held():
+        # Do not import/configure an external provider while installation autonomous work is held.
+        return InProcessCronScheduler()
     name = ""
     try:
         from hermes_cli.config import cfg_get, load_config
@@ -368,6 +372,10 @@ class InProcessCronScheduler(CronScheduler):
         self, stop_event, *, adapters=None, loop=None, interval=60, can_dispatch=None,
         profile_homes=None, profile_adapters=None, default_profile=None, profile_gate=None,
     ):
+        from agent.estop import check_background_held
+        if check_background_held("cron scheduler", logger):
+            logger.info("Cron scheduler held by BACKGROUND_HOLD")
+            return
         from cron.scheduler import CronTickYielded
         from cron.scheduler import tick as cron_tick
         from cron.jobs import clear_ticker_error, record_ticker_error, record_ticker_heartbeat

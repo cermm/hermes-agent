@@ -5008,7 +5008,10 @@ async def _start_gateway_start_control_socket(runner):
                 "pid": os.getpid(), "drain_timeout": _drain}
 
         _control_server = GatewayControlServer(
-            verb_handlers={"pause-for-update": _pause_for_update_handler})
+            verb_handlers={
+                "pause-for-update": _pause_for_update_handler,
+                "held-installation-status": runner._held_installation_status,
+            })
         if not await _control_server.start():
             _control_server = None
         else:
@@ -5022,6 +5025,11 @@ async def _start_gateway_start_control_socket(runner):
 def _start_gateway_start_cron_and_housekeeping(runner):
     """Start the cron scheduler thread + gateway housekeeping thread; returns
     ``(cron_stop, cron_provider, cron_thread, housekeeping_thread)``."""
+    from agent.estop import check_background_held
+    if (getattr(runner, "_background_services_held_at_start", False) is True
+            or check_background_held("gateway cron/housekeeping", logger)):
+        runner._background_services_held_at_start = True
+        return threading.Event(), None, None, None
     # The event loop is passed so cron delivery can use live adapters (E2EE support).
     from cron.scheduler_provider import (
         InProcessCronScheduler, resolve_cron_scheduler, scheduler_for_profile_mode)
@@ -5096,7 +5104,7 @@ def _exit_with_failure_verdict(runner) -> bool:
 
 async def _start_gateway_shutdown_tail(
     runner, _control_server, cron_stop: threading.Event, cron_provider,
-    cron_thread: threading.Thread, housekeeping_thread: threading.Thread,
+    cron_thread: Optional[threading.Thread], housekeeping_thread: Optional[threading.Thread],
     _planned_stop_watcher_stop: threading.Event, _planned_stop_watcher_thread: threading.Thread,
     _signal_initiated_shutdown: list) -> bool:
     """Post-``wait_for_shutdown`` teardown; returns the process exit verdict (True = exit 0)."""
@@ -5275,6 +5283,10 @@ async def start_gateway(config: Optional[GatewayConfig] = None, replace: bool = 
         return False
 
     def _recover_pending() -> None:
+        from agent.estop import check_background_held
+        if (getattr(runner, "_background_services_held_at_start", False) is True
+                or check_background_held("gateway pending-message recovery", logger)):
+            return
         from gateway.shutdown_flush import recover_pending_to_db
         recovered = recover_pending_to_db()
         if recovered:

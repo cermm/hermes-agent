@@ -204,6 +204,9 @@ def recover_pending_to_db(session_db=None) -> int:
     ``session_db=None`` opens (and afterwards releases) the shared default ``state.db``.
     Returns the number of messages recovered.
     """
+    from agent.estop import check_background_held
+    if check_background_held("pending-message recovery", logger):
+        return 0
     flush_files = sorted(_get_flush_dir().glob("*.json"))
     if not flush_files:
         return 0
@@ -214,10 +217,17 @@ def recover_pending_to_db(session_db=None) -> int:
     recovered = 0
     try:
         for path in flush_files:
+            # Database acquisition may block while the operator engages the hold.
+            if check_background_held("pending-message recovery", logger):
+                break
             payload = json.loads(path.read_text(encoding="utf-8"))
             # Agent-history snapshots are for manual operator recovery, not automatic DB insertion.
             if payload.get("reason") == "shutdown-with-unpersisted-agent-history":
                 continue
+            # Reading the spool can block too; admit effects only with a fresh hold observation.
+            # Once admitted, append plus unlink finish together to avoid replaying an appended row.
+            if check_background_held("pending-message recovery", logger):
+                break
             if _recover_one_payload(session_db, path, payload):
                 recovered += 1
                 path.unlink(missing_ok=True)

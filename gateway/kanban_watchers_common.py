@@ -104,10 +104,10 @@ def _kanban_dispatch_allowed() -> bool:
     in-flight workers are never touched. Fails open if estop is unimportable.
     """
     try:
-        from agent.estop import check_paused
+        from agent.estop import check_background_held, check_paused
     except ImportError:
         return True
-    return not check_paused("kanban", logger)
+    return not (check_paused("kanban", logger) or check_background_held("kanban", logger))
 
 
 def _acquire_singleton_lock(lock_path) -> "tuple[Optional[object], str]":

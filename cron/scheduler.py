@@ -3743,10 +3743,10 @@ def tick(
         return 0
 
     try:
-        # `hermes pause` ESTOP: skip dispatch, never touch in-flight runs; check_paused logs once.
+        # ESTOP and BACKGROUND_HOLD both suppress recurring autonomous dispatch, never in-flight runs.
         with contextlib.suppress(ImportError):
-            from agent.estop import check_paused as _estop_check_paused
-            if _estop_check_paused("cron", logger):
+            from agent.estop import check_background_held, check_paused as _estop_check_paused
+            if _estop_check_paused("cron", logger) or check_background_held("cron", logger):
                 return 0
 
         if can_dispatch is not None and not can_dispatch():
