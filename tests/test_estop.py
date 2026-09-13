@@ -141,6 +141,7 @@ def test_background_hold_is_fail_safe_and_chat_is_not_paused(hermes_home, monkey
     assert estop.paused_reply() is None
 
 
+@pytest.mark.require_symlinks
 def test_background_hold_detects_dangling_symlink(hermes_home):
     marker = hermes_home / estop.BACKGROUND_HOLD_NAME
     marker.symlink_to(hermes_home / "missing-hold-target")
