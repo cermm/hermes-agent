@@ -22,15 +22,22 @@ from typing import Optional
 from agent.file_safety import _hermes_home_path as _hermes_home, _hermes_root_path as _canonical_root
 
 SENTINEL_NAME = "ESTOP"
+BACKGROUND_HOLD_NAME = "BACKGROUND_HOLD"
 
 # Per-component "logged already for this engagement" flags: log once per engagement, not per tick.
 _log_lock = threading.Lock()
 _logged_components: set[str] = set()
+_logged_background_components: set[str] = set()
 
 
 def sentinel_path() -> Path:
     """Path of the ESTOP sentinel this process would write on `hermes pause`."""
     return _hermes_home() / SENTINEL_NAME
+
+
+def background_hold_path() -> Path:
+    """Path of the installation-bound hold marker for autonomous work only."""
+    return _hermes_home() / BACKGROUND_HOLD_NAME
 
 
 def _candidate_sentinel_paths() -> list:
@@ -110,6 +117,34 @@ def get_state() -> Optional[dict]:
     return state if found else None
 
 
+def _candidate_background_hold_paths() -> list:
+    """Profile home first, then fleet root, matching ESTOP scope resolution."""
+    primary = background_hold_path()
+    try:
+        root = _canonical_root() / BACKGROUND_HOLD_NAME
+    except Exception:
+        return [primary]
+    try:
+        distinct = root.resolve() != primary.resolve()
+    except Exception:
+        distinct = root != primary
+    return [primary, root] if distinct else [primary]
+
+
+def is_background_held() -> bool:
+    """True when the background-only hold marker exists; stat errors fail safe."""
+    saw_stat_error = False
+    for path in _candidate_background_hold_paths():
+        try:
+            path.lstat()
+            return True
+        except FileNotFoundError:
+            continue
+        except OSError:
+            saw_stat_error = True
+    return saw_stat_error
+
+
 def paused_reply() -> Optional[str]:
     """Short user-facing notice for new gateway turns, or None if not paused."""
     state = get_state()
@@ -120,21 +155,39 @@ def paused_reply() -> Optional[str]:
 
 
 def check_paused(component: str, logger: logging.Logger) -> bool:
-    """Return True when engaged, logging once per engagement per component (re-armed after a resume)."""
-    if not is_engaged():
+    """Return True when the global ESTOP is engaged, logging once per engagement."""
+    if is_engaged():
         with _log_lock:
-            _logged_components.discard(component)
+            first = component not in _logged_components
+            _logged_components.add(component)
+        if first:
+            reason = (get_state() or {}).get("reason")
+            suffix = f" (reason: {reason})" if reason else ""
+            logger.info(
+                "%s dispatch paused by global emergency stop%s — remove with `hermes resume` (%s)",
+                component, suffix, sentinel_path(),
+            )
+        return True
+    with _log_lock:
+        _logged_components.discard(component)
+    return False
+
+
+def check_background_held(component: str, logger: logging.Logger) -> bool:
+    """Return True for the autonomous-work hold only, logging once per engagement.
+
+    Deliberately does not consult ESTOP: startup creation gates use this narrower
+    guard so a global pause remains resumable without requiring a gateway restart.
+    """
+    if not is_background_held():
+        with _log_lock:
+            _logged_background_components.discard(component)
         return False
     with _log_lock:
-        first = component not in _logged_components
-        _logged_components.add(component)
+        first = component not in _logged_background_components
+        _logged_background_components.add(component)
     if first:
-        reason = (get_state() or {}).get("reason")
-        suffix = f" (reason: {reason})" if reason else ""
-        logger.info(
-            "%s dispatch paused by global emergency stop%s — remove with `hermes resume` (%s)",
-            component, suffix, sentinel_path(),
-        )
+        logger.info("%s dispatch held by BACKGROUND_HOLD (%s)", component, background_hold_path())
     return True
 
 

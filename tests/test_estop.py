@@ -26,6 +26,7 @@ def hermes_home(tmp_path, monkeypatch):
     """Point HERMES_HOME at a temp dir and reset estop module log state."""
     monkeypatch.setenv("HERMES_HOME", str(tmp_path))
     estop._logged_components.clear()
+    estop._logged_background_components.clear()
     return tmp_path
 
 
@@ -119,6 +120,66 @@ def test_check_paused_logs_once_per_engagement(hermes_home, caplog):
         assert estop.check_paused("cron", logger) is True
     paused_logs = [r for r in caplog.records if "paused" in r.getMessage().lower()]
     assert len(paused_logs) == 1
+
+
+# ── background-only hold ────────────────────────────────────────────────────
+
+
+@pytest.mark.parametrize("marker_state", ["absent", "present", "corrupt", "error"])
+def test_background_hold_is_fail_safe_and_chat_is_not_paused(hermes_home, monkeypatch, marker_state):
+    marker = hermes_home / estop.BACKGROUND_HOLD_NAME
+    if marker_state == "present":
+        marker.touch()
+    elif marker_state == "corrupt":
+        marker.write_text("not json", encoding="utf-8")
+    elif marker_state == "error":
+        class _BoomPath:
+            def lstat(self):
+                raise OSError("permission denied")
+        monkeypatch.setattr(estop, "background_hold_path", lambda: _BoomPath())
+    assert estop.is_background_held() is (marker_state in {"present", "corrupt", "error"})
+    assert estop.paused_reply() is None
+
+
+def test_background_hold_detects_dangling_symlink(hermes_home):
+    marker = hermes_home / estop.BACKGROUND_HOLD_NAME
+    marker.symlink_to(hermes_home / "missing-hold-target")
+
+    assert marker.exists() is False
+    assert estop.is_background_held() is True
+    assert estop.paused_reply() is None
+
+
+def test_background_hold_stops_cron_and_kanban_but_estop_still_dominates(hermes_home, monkeypatch):
+    from cron import scheduler
+    from gateway.kanban_watchers_common import _kanban_dispatch_allowed
+
+    due_scans = []
+    monkeypatch.setattr(scheduler, "get_due_jobs", lambda: due_scans.append(True) or [])
+    (hermes_home / estop.BACKGROUND_HOLD_NAME).touch()
+    assert scheduler.tick(verbose=False) == 0
+    assert due_scans == []
+    assert _kanban_dispatch_allowed() is False
+    assert estop.paused_reply() is None
+
+    (hermes_home / estop.BACKGROUND_HOLD_NAME).unlink()
+    assert estop.check_background_held("cron", logging.getLogger("test")) is False
+    assert scheduler.tick(verbose=False) == 0
+    assert due_scans == [True]
+    assert _kanban_dispatch_allowed() is True
+
+    estop.engage(reason="global stop")
+    assert estop.check_background_held("cron", logging.getLogger("test")) is False
+    assert estop.check_paused("cron", logging.getLogger("test")) is True
+    assert scheduler.tick(verbose=False) == 0
+    assert due_scans == [True]
+    assert _kanban_dispatch_allowed() is False
+    assert estop.paused_reply() is not None
+
+    estop.disengage()
+    assert scheduler.tick(verbose=False) == 0
+    assert due_scans == [True, True]
+    assert _kanban_dispatch_allowed() is True
 
 
 # ── cron scheduler integration ──────────────────────────────────────────────

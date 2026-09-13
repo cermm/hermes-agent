@@ -10,10 +10,13 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import faulthandler
+import hashlib
+import json
 import logging
 import os
 import signal
 import time
+import types
 from contextlib import suppress
 from datetime import datetime
 from gateway.config import Platform
@@ -36,6 +39,98 @@ logger = logging.getLogger("gateway.run")
 
 class GatewayStartupMixin:
     """Startup sequence, resume/restore and handoff methods for GatewayRunner."""
+
+    _HELD_STATUS_FINGERPRINT_SCHEME = (
+        "python-code-v1: sha256 of canonical UTF-8 JSON (sort_keys, compact separators) over the loaded "
+        "__code__; includes name/qualname, argument counts, flags, stack size, bytecode, exception table, "
+        "names, varnames, freevars, cellvars and recursively typed constants; excludes filename and line tables"
+    )
+
+    @classmethod
+    def _normalize_loaded_code_value(cls, value: Any) -> Any:
+        """Canonicalize a code constant without source paths or process-specific object identities."""
+        if isinstance(value, types.CodeType):
+            return {
+                "type": "code",
+                "name": value.co_name,
+                "qualname": value.co_qualname,
+                "argcount": value.co_argcount,
+                "posonlyargcount": value.co_posonlyargcount,
+                "kwonlyargcount": value.co_kwonlyargcount,
+                "flags": value.co_flags,
+                "stacksize": value.co_stacksize,
+                "code_hex": value.co_code.hex(),
+                "exceptiontable_hex": value.co_exceptiontable.hex(),
+                "names": list(value.co_names),
+                "varnames": list(value.co_varnames),
+                "freevars": list(value.co_freevars),
+                "cellvars": list(value.co_cellvars),
+                "consts": [cls._normalize_loaded_code_value(item) for item in value.co_consts],
+            }
+        if value is None or isinstance(value, (bool, int, float, str)):
+            return {"type": type(value).__name__, "value": value}
+        if isinstance(value, bytes):
+            return {"type": "bytes", "hex": value.hex()}
+        if isinstance(value, tuple):
+            return {"type": "tuple", "items": [cls._normalize_loaded_code_value(item) for item in value]}
+        if isinstance(value, frozenset):
+            items = [cls._normalize_loaded_code_value(item) for item in value]
+            items.sort(key=lambda item: json.dumps(item, sort_keys=True, separators=(",", ":")))
+            return {"type": "frozenset", "items": items}
+        return {
+            "type": f"{type(value).__module__}.{type(value).__qualname__}",
+            "repr": repr(value),
+        }
+
+    @classmethod
+    def _fingerprint_loaded_callable(cls, callback) -> dict:
+        """Fingerprint the callable's in-memory code object, never its file on disk."""
+        target = getattr(callback, "__func__", callback)
+        code = target.__code__
+        normalized = cls._normalize_loaded_code_value(code)
+        encoded = json.dumps(
+            normalized, sort_keys=True, separators=(",", ":"), ensure_ascii=True,
+        ).encode("utf-8")
+        return {
+            "module": target.__module__,
+            "qualname": target.__qualname__,
+            "sha256": hashlib.sha256(encoded).hexdigest(),
+        }
+
+    def _held_installation_status(self) -> dict:
+        """Read-only live identity for verifying a held gateway over its control socket."""
+        from agent import estop
+        from cron.scheduler_provider import InProcessCronScheduler
+        from gateway import run as gateway_run
+
+        callables = {
+            "hold.is_background_held": estop.is_background_held,
+            "hold.check_background_held": estop.check_background_held,
+            "startup.start": self.start,
+            "cron.gateway_start": gateway_run._start_gateway_start_cron_and_housekeeping,
+            "cron.provider_start": InProcessCronScheduler.start,
+            "goal.post_turn_continuation": getattr(self, "_post_turn_goal_continuation_scoped"),
+            "goal.heartbeat_continuation": getattr(self, "_heartbeat_poll_once"),
+        }
+        adapters = getattr(self, "adapters", {}) or {}
+        connected_count = sum(
+            getattr(adapter, "is_connected", False) is True for adapter in adapters.values()
+        )
+        return {
+            "schema": 1,
+            "pid": os.getpid(),
+            "background_held": estop.is_background_held(),
+            "adapter_connected": connected_count > 0,
+            "connected_adapter_count": connected_count,
+            "inbound_startup_gate_ready": (
+                getattr(self, "_startup_restore_in_progress", None) is False
+            ),
+            "fingerprint_scheme": self._HELD_STATUS_FINGERPRINT_SCHEME,
+            "callables": {
+                name: self._fingerprint_loaded_callable(callback)
+                for name, callback in callables.items()
+            },
+        }
 
     async def _run_startup_resume_event(
         self, adapter: BasePlatformAdapter, event: MessageEvent, session_key: str,
@@ -260,6 +355,9 @@ class GatewayStartupMixin:
         re-paying for) a turn whose output we hold, regardless of how long the sends ahead of redelivery
         take (#91969).
         """
+        from agent.estop import check_background_held
+        if check_background_held("gateway startup delivery recovery", logger):
+            return []
         try:
             from gateway.delivery_ledger import ledger_enabled, sweep_recoverable
             if not await asyncio.to_thread(ledger_enabled):
@@ -440,6 +538,9 @@ class GatewayStartupMixin:
         ``_is_resume_pending`` injection path owns the wording). Sessions whose adapter is offline stay
         ``resume_pending`` for the reconnect watcher, which re-calls this scoped to that ``platform``;
         sessions with a running agent are skipped so none is resumed twice."""
+        from agent.estop import check_background_held
+        if check_background_held("gateway startup auto-resume", logger):
+            return 0
         from gateway.run import _AGENT_PENDING_SENTINEL, _auto_continue_freshness_window
         window = _auto_continue_freshness_window()
         candidates = self._resume_pending_candidates(platform)
@@ -1244,7 +1345,16 @@ class GatewayStartupMixin:
             return True
         if self._start_check_access_policy():
             return True
-        await self._start_recover_previous_run()
+        from agent.estop import check_background_held
+        # A held boot cannot activate skipped services just because the marker disappears
+        # between adapter startup and the outer cron phase. A fresh runner/restart is required.
+        background_held = (
+            getattr(self, "_background_services_held_at_start", False) is True
+            or check_background_held("gateway autonomous startup", logger)
+        )
+        self._background_services_held_at_start = background_held
+        if not background_held:
+            await self._start_recover_previous_run()
         # Serialize startup restore against inbound: adapters receive as soon as they connect, so inbound
         # queues until every synthetic resume turn has finished.
         self._startup_restore_in_progress = True
@@ -1252,7 +1362,8 @@ class GatewayStartupMixin:
         self._startup_restore_tasks = []
         # Fresh boot: the gate opens while the turn machinery is still cold (skeleton prompts). Warm NOW
         # to overlap the connects; _finish_startup_restore awaits it (bounded).
-        self._start_startup_warmup()
+        if not background_held:
+            self._start_startup_warmup()
         startup_nonretryable_errors: list[str] = []
         startup_retryable_errors: list[str] = []
         (
@@ -1286,8 +1397,16 @@ class GatewayStartupMixin:
         self._running = True
         self._install_plugin_message_injector()
         self._update_runtime_status("running")
-        await self._start_finish_wiring(connected_count)
-        self._start_spawn_background_watchers()
+        # Adapter connection awaits can outlive a newly engaged hold.
+        background_held = background_held or check_background_held("gateway autonomous startup", logger)
+        self._background_services_held_at_start = background_held
+        if background_held:
+            await self._finish_startup_restore()
+            self._start_loop_heartbeat_task()
+            logger.info("BACKGROUND_HOLD active: autonomous gateway startup held; chat remains available")
+        else:
+            await self._start_finish_wiring(connected_count)
+            self._start_spawn_background_watchers()
         logger.info("Press Ctrl+C to stop")
         return True
 
