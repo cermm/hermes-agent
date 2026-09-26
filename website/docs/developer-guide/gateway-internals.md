@@ -262,6 +262,14 @@ The gateway runs as a long-lived process, managed via:
 
 **Profile-scoped vs global**: `start_gateway()` uses profile-scoped PID files. `hermes gateway stop` stops only the current profile's gateway. `hermes gateway stop --all` uses global `ps aux` scanning to kill all gateway processes (used during updates).
 
+### Read-only loaded hook identity
+
+The local control socket verb `held-installation-status` includes `plugin_hooks`, a profile-scoped snapshot of callbacks already registered for plugin lifecycle hooks. It does not discover plugins, create a manager, invoke callbacks, or choose a required plugin.
+
+The nested schema is version 2. A complete response has `status: ready`, `reason: null`, `manager_scope`, and a `hooks` mapping that preserves callback registration order and duplicates. Supported Python functions and bound methods expose their loaded-code fingerprint (`module`, `qualname`, `sha256`) and `registered_module_identity: true`, which means the function globals belong to the currently loaded module. Opaque callables or missing module identity produce explicit unsupported records. This proves registered code identity, not plugin ownership or mutable globals.
+
+The snapshot allows at most 64 hook names and 256 callbacks. Missing managers, busy registration, changed registrations, or excess entries return `status: unavailable`, a short reason, and no partial hook inventory. Consumers must select their required hooks, reject unsupported or ambiguous selected entries, and compare fingerprints against independently admitted source. Existing gateway readiness and callable fields retain their meaning.
+
 ## Related Docs
 
 - [Session Storage](./session-storage.md)
