@@ -85,7 +85,7 @@ class GatewayStartupMixin:
     @classmethod
     def _fingerprint_loaded_callable(cls, callback) -> dict:
         """Fingerprint the callable's in-memory code object, never its file on disk."""
-        target = getattr(callback, "__func__", callback)
+        target = callback.__func__ if type(callback) is types.MethodType else callback
         code = target.__code__
         normalized = cls._normalize_loaded_code_value(code)
         encoded = json.dumps(
@@ -102,6 +102,7 @@ class GatewayStartupMixin:
         from agent import estop
         from cron.scheduler_provider import InProcessCronScheduler
         from gateway import run as gateway_run
+        from hermes_cli.plugins_runtime import snapshot_registered_hooks
 
         callables = {
             "hold.is_background_held": estop.is_background_held,
@@ -126,6 +127,7 @@ class GatewayStartupMixin:
                 getattr(self, "_startup_restore_in_progress", None) is False
             ),
             "fingerprint_scheme": self._HELD_STATUS_FINGERPRINT_SCHEME,
+            "plugin_hooks": snapshot_registered_hooks(self._fingerprint_loaded_callable),
             "callables": {
                 name: self._fingerprint_loaded_callable(callback)
                 for name, callback in callables.items()
