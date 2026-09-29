@@ -1,6 +1,8 @@
 """Tests for cmd_update — branch fallback when remote branch doesn't exist."""
 
 import hashlib
+import io
+import os
 import subprocess
 from types import SimpleNamespace
 from unittest.mock import ANY, patch
@@ -760,10 +762,11 @@ class TestCmdUpdateProfileSkillSync:
             f"All profiles must be synced; got: {synced_paths}"
         )
 
+    @pytest.mark.linux_only
     @patch("shutil.which", return_value=None)
     @patch("subprocess.run")
     def test_single_profile_default_is_synced(
-        self, mock_run, _mock_which, mock_args, capsys
+        self, mock_run, _mock_which, mock_args, capsys, tmp_path
     ):
         from pathlib import Path
 
@@ -780,13 +783,42 @@ class TestCmdUpdateProfileSkillSync:
 
         empty_sync = {"copied": [], "updated": [], "user_modified": [], "cleaned": []}
 
+        # Give real gateway discovery one unrelated, synthetic process. If it
+        # mistakenly classifies that process as a gateway, the command must not
+        # be able to deliver a signal to its made-up PID.
+        unrelated_pid = 987654321
+        unrelated_cmdline = b"python\x00-m\x00http.server\x00"
+        inspected_pid = []
+        guarded_kill = os.kill  # conftest's live-system guard stays installed
+        original_listdir = os.listdir
+        original_open = open
+
+        def synthetic_listdir(path):
+            return [str(unrelated_pid)] if path == "/proc" else original_listdir(path)
+
+        def synthetic_open(path, *args, **kwargs):
+            if path == f"/proc/{unrelated_pid}/cmdline":
+                inspected_pid.append(unrelated_pid)
+                return io.BytesIO(unrelated_cmdline)
+            return original_open(path, *args, **kwargs)
+
+        def reject_unrelated_signal(pid, sig, *args, **kwargs):
+            assert pid != unrelated_pid, f"unrelated PID {pid} was signalled"
+            return guarded_kill(pid, sig, *args, **kwargs)
+
         with (
+            patch.object(Path, "home", return_value=tmp_path),
+            patch("hermes_cli.gateway.os.listdir", side_effect=synthetic_listdir),
+            patch("builtins.open", side_effect=synthetic_open),
+            patch("hermes_cli.update_cmd_fleet.os.kill", side_effect=reject_unrelated_signal) as signal_attempts,
             patch("hermes_cli.profiles.list_profiles", return_value=[default_p]),
             patch("hermes_cli.profiles.seed_profile_skills", side_effect=fake_seed),
             patch("tools.skills_sync.sync_skills", return_value=empty_sync),
         ):
             cmd_update(mock_args)
 
+        assert unrelated_pid in inspected_pid, "update did not inspect the synthetic process"
+        signal_attempts.assert_not_called()
         assert default_p.path in synced_paths
 
 
