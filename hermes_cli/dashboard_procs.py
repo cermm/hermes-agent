@@ -6,16 +6,46 @@ call time so imports stay one-way (both of those modules import this one lazily)
 
 import contextlib
 import os
+import re
+import shlex
 import subprocess
 import sys
 from pathlib import Path
 
-# Cmdline substrings identifying the long-lived server (``serve`` = the headless name Desktop
-# spawns; reaped on update for the same reason).
-_DASHBOARD_PATTERNS = tuple(
-    f"{launcher} {cmd}"
-    for cmd in ("dashboard", "serve")
-    for launcher in ("hermes", "hermes_cli.main", "hermes_cli/main.py"))
+
+def _is_dashboard_launch(command: str) -> bool:
+    """Accept only a Hermes entry point running ``serve`` or ``dashboard``.
+
+    ``ps`` flattens argv; a tmux/shell/editor argument may quote a complete
+    Hermes command. Requiring the entry point at the executable position keeps
+    those launchers out of the stop target set.
+    """
+    from hermes_cli.update_cmd_windows import _hermes_holder_subcommand
+
+    try:
+        tokens = shlex.split(command, posix=False)
+    except ValueError:
+        return False
+    if not tokens:
+        return False
+    first = tokens[0].strip("\"'").replace("\\", "/").rsplit("/", 1)[-1].lower()
+    if first in ("hermes", "hermes.exe"):
+        return _hermes_holder_subcommand(command) in ("serve", "dashboard")
+
+    python = bool(re.fullmatch(r"(?:pythonw?|pythonw?\d+(?:\.\d+)*|pypy\d*(?:\.\d+)*)(?:\.exe)?", first))
+    if python and len(tokens) >= 3 and tokens[1] == "-m" and tokens[2].strip("\"'") == "hermes_cli.main":
+        return _hermes_holder_subcommand(command) in ("serve", "dashboard")
+
+    script_index = 1 if python else 0
+    if len(tokens) <= script_index:
+        return False
+    script = tokens[script_index].strip("\"'").replace("\\", "/").lower()
+    if (script == "hermes_cli/main.py" or script.endswith("/hermes_cli/main.py")
+            or (python and script.rsplit("/", 1)[-1] in ("hermes", "hermes.exe"))):
+        return _hermes_holder_subcommand("hermes " + " ".join(tokens[script_index + 1:])) in ("serve", "dashboard")
+    return False
+
+
 _PS_RUN_KWARGS = dict(capture_output=True, text=True, encoding="utf-8", errors="replace")
 
 
@@ -70,7 +100,7 @@ def _iter_process_table() -> list[tuple[int, str]]:
     return rows
 
 
-def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[tuple[int, str]]:
+def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None, with_identity: bool = False) -> list[tuple]:
     """``(pid, cmdline)`` of running ``dashboard``/``serve`` processes; empty on any scan error.
 
     A forgotten dashboard keeps the old Python backend against the new JS bundle after
@@ -86,7 +116,7 @@ def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[t
     skip = {os.getpid(), *(exclude_pids or ())}
     try:
         found = [(pid, cmd) for pid, cmd in _iter_process_table()
-                 if pid not in skip and any(p in cmd for p in _DASHBOARD_PATTERNS)]
+                 if pid not in skip and _is_dashboard_launch(cmd)]
     except (FileNotFoundError, subprocess.TimeoutExpired, OSError):
         return []
     # Spawn-ledger augmentation: substring patterns miss profiled launches (`hermes --profile p
@@ -103,6 +133,14 @@ def _scan_dashboard_processes(*, exclude_pids: set[int] | None = None) -> list[t
             if (entry.get("purpose") in ("serve", "dashboard") and isinstance(pid, int)
                     and pid not in seen):
                 found.append((pid, str(entry.get("argv") or "")))
+    if with_identity:
+        from gateway.status import get_process_start_time
+        def snapshot(pid):
+            try:
+                return get_process_start_time(pid)
+            except Exception:
+                return None
+        return [(pid, cmd, snapshot(pid)) for pid, cmd in found]
     return found
 
 
@@ -252,46 +290,72 @@ def _exclude_pids_from_env() -> set[int]:
     return out
 
 
-def _kill_pids_windows(pids: list[int], killed: list[int], failed: list[tuple[int, str]]) -> None:
-    """``taskkill /F`` each PID after re-verifying its identity."""
-    from gateway.status import get_process_start_time
+def _live_dashboard_identity(pid: int, expected_start_time: int | None) -> bool:
+    """Confirm both incarnation and server argv immediately before a signal."""
+    if expected_start_time is None:
+        return False
+    from gateway.status import get_process_start_time, _read_process_cmdline
+    try:
+        if get_process_start_time(pid) != expected_start_time:
+            return False
+        if _is_dashboard_launch(_read_process_cmdline(pid) or ""):
+            return get_process_start_time(pid) == expected_start_time
+        # Some verified spawn-ledger backends have a truncated or wrapped OS
+        # command line. Ledger enumeration tolerates two seconds of drift;
+        # destructive dispatch requires the exact recorded create time.
+        from hermes_cli.process_identity import ledger_entries, _process_create_time
+        verified = any(
+            entry.get("pid") == pid and entry.get("purpose") in ("serve", "dashboard")
+            and isinstance(entry.get("create_time"), (int, float))
+            and _process_create_time(pid) == entry["create_time"]
+            for entry in ledger_entries()
+        )
+        # argv/ledger reads can block across PID reuse. Keep the original
+        # discovery fingerprint as the last observation before dispatch.
+        return verified and get_process_start_time(pid) == expected_start_time
+    except Exception:
+        return False
+
+
+def _kill_pids_windows(pids: list[int], killed: list[int], failed: list[tuple[int, str]],
+                       start_times: dict[int, int | None]) -> None:
+    """``taskkill /F`` each PID only while the discovered server identity holds."""
     from hermes_cli._subprocess_compat import pid_is_hermes, windows_hide_flags
-    # Identity captured right after discovery: a PID reused before the kill fails the check.
-    pid_start_times = {pid: get_process_start_time(pid) for pid in pids}
     for pid in pids:
         try:
-            expected_start_time = pid_start_times.get(pid)
-            if expected_start_time is None:
-                failed.append((pid, "could not verify process identity"))
-            elif not pid_is_hermes(pid, expected_start_time=expected_start_time):
-                failed.append((pid, "not hermes-owned or process identity changed"))
+            expected = start_times.get(pid)
+            if not pid_is_hermes(pid, expected_start_time=expected) or not _live_dashboard_identity(pid, expected):
+                failed.append((pid, "could not verify dashboard process identity"))
+                continue
+            result = subprocess.run(
+                ["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
+                errors="replace", timeout=10, creationflags=windows_hide_flags())
+            if result.returncode == 0:
+                killed.append(pid)
             else:
-                result = subprocess.run(
-                    ["taskkill", "/PID", str(pid), "/F"], stdout=subprocess.PIPE,
-                    stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True, encoding="utf-8",
-                    errors="replace", timeout=10, creationflags=windows_hide_flags())
-                if result.returncode == 0:
-                    killed.append(pid)
-                else:
-                    failed.append((pid, (result.stderr or result.stdout or "").strip()))
+                failed.append((pid, (result.stderr or result.stdout or "").strip()))
         except (FileNotFoundError, subprocess.TimeoutExpired, OSError) as e:
             failed.append((pid, str(e)))
 
 
-def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int, str]]) -> None:
-    """SIGTERM, wait up to ~3s for graceful exit, SIGKILL survivors."""
+def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int, str]],
+                     start_times: dict[int, int | None]) -> None:
+    """SIGTERM, wait up to ~3s, and revalidate before SIGKILL escalation."""
     import signal as _signal
     import time as _time
-
     from gateway.status import _pid_exists
 
     def _send(pid: int, sig) -> None:
+        if not _live_dashboard_identity(pid, start_times.get(pid)):
+            failed.append((pid, "could not verify dashboard process identity"))
+            return
         try:
             os.kill(pid, sig)
             if sig == _signal.SIGKILL:
                 killed.append(pid)
         except ProcessLookupError:
-            killed.append(pid)  # already gone — count as killed
+            killed.append(pid)
         except (PermissionError, OSError) as e:
             failed.append((pid, str(e)))
 
@@ -301,7 +365,7 @@ def _kill_pids_posix(pids: list[int], killed: list[int], failed: list[tuple[int,
     pending = [p for p in pids if p not in killed and p not in {f[0] for f in failed}]
     while pending and _time.monotonic() < deadline:
         _time.sleep(0.1)
-        alive = [p for p in pending if _pid_exists(p)]  # os.kill(pid, 0) breaks on Windows
+        alive = [p for p in pending if _pid_exists(p)]
         killed.extend(p for p in pending if p not in alive)
         pending = alive
     for pid in pending:
@@ -339,9 +403,11 @@ def _kill_stale_dashboard_processes(
         # An SSH-owned backend belongs to an attached Desktop client; killing it strands that
         # client's fixed SSH port-forward. Same ownership records as the reaper.
         exclude |= _lock_owned_serve_pids()
-    pids = _dash._find_stale_dashboard_pids(exclude_pids=exclude or None)
-    if not pids:
+    targets = _dash._find_stale_dashboard_pids(exclude_pids=exclude or None, with_identity=True)
+    if not targets:
         return _empty_result()
+    pids = [pid for pid, _cmd, _start in targets]
+    start_times = {pid: start for pid, _cmd, start in targets}
     # Snapshot systemd unit/cgroup and argv BEFORE killing (the cgroup dies with the process).
     pid_cgroup: dict[int, str | None] = {}
     pid_service: dict[int, str | None] = {}
@@ -366,7 +432,7 @@ def _kill_stale_dashboard_processes(
     print(f"\n⟲ Stopping {len(pids)} dashboard process(es) ({reason})")
     killed: list[int] = []
     failed: list[tuple[int, str]] = []
-    (_kill_pids_windows if sys.platform == "win32" else _kill_pids_posix)(pids, killed, failed)
+    (_kill_pids_windows if sys.platform == "win32" else _kill_pids_posix)(pids, killed, failed, start_times)
     for pid in killed:
         print(f"    ✓ stopped PID {pid}")
     for pid, err_msg in failed:
