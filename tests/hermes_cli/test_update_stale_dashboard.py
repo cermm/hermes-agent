@@ -56,6 +56,18 @@ def _refresh_bindings_against_live_module():
     yield
 
 
+def _targets(*pids: int) -> list[tuple[int, str, int]]:
+    return [(pid, "hermes dashboard", 123) for pid in pids]
+
+
+@pytest.fixture(autouse=True)
+def _synthetic_stop_identity():
+    """No stop test resolves or signals a host PID."""
+    with patch("gateway.status.get_process_start_time", return_value=123), \
+         patch("gateway.status._read_process_cmdline", return_value="hermes dashboard"):
+        yield
+
+
 def _ps_line(pid: int, cmd: str) -> str:
     """Format a line as it would appear in ``ps -A -o pid=,command=`` output."""
     return f"{pid:>7} {cmd}"
@@ -105,7 +117,7 @@ def _write_valid_ssh_backend_lock(tmp_path, monkeypatch) -> int:
 def test_update_cleanup_spares_backend_owned_by_valid_ssh_lock(tmp_path, monkeypatch):
     pid = _write_valid_ssh_backend_lock(tmp_path, monkeypatch)
 
-    def assert_owned_pid_is_excluded(*, exclude_pids=None):
+    def assert_owned_pid_is_excluded(*, exclude_pids=None, with_identity=False):
         assert exclude_pids is not None
         assert pid in exclude_pids
         return []
@@ -125,7 +137,7 @@ def test_explicit_stop_does_not_spare_backend_owned_by_valid_ssh_lock(
 ):
     pid = _write_valid_ssh_backend_lock(tmp_path, monkeypatch)
 
-    def assert_owned_pid_is_not_excluded(*, exclude_pids=None):
+    def assert_owned_pid_is_not_excluded(*, exclude_pids=None, with_identity=False):
         assert exclude_pids is None or pid not in exclude_pids
         return []
 
@@ -195,7 +207,7 @@ class TestKillStaleDashboardPosix:
             # SIGTERM itself: succeed silently.
 
         with patch("hermes_cli.main_dashboard._find_stale_dashboard_pids",
-                   return_value=[12345, 12346]), \
+                   return_value=_targets(12345, 12346)), \
              patch("os.kill", side_effect=fake_kill), \
              patch("time.sleep"):
             result = _kill_stale_dashboard_processes()
@@ -279,7 +291,7 @@ class TestKillStaleDashboardWindows:
             return MagicMock(returncode=0, stdout="", stderr="")
 
         with patch("hermes_cli.main_dashboard._find_stale_dashboard_pids",
-                   return_value=[12345, 12346]), \
+                   return_value=_targets(12345, 12346)), \
              patch("gateway.status.get_process_start_time", return_value=123), \
              patch("hermes_cli._subprocess_compat.pid_is_hermes", return_value=True), \
              patch("subprocess.run", side_effect=fake_run) as mock_run:
@@ -391,7 +403,7 @@ class TestSupervisedBackendRestart:
                 raise ProcessLookupError
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
-             patch.object(live, "_find_stale_dashboard_pids", return_value=[4321]), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=_targets(4321)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path",
                           return_value="/system.slice/hermes-serve.service"), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid",
@@ -417,7 +429,7 @@ class TestSupervisedBackendRestart:
         live = self._live()
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
-             patch.object(live, "_find_stale_dashboard_pids", return_value=[4321]), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=_targets(4321)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path",
                           return_value="/system.slice/hermes-serve.service"), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid",
@@ -451,7 +463,7 @@ class TestManualBackendRespawn:
                 raise ProcessLookupError
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
-             patch.object(live, "_find_stale_dashboard_pids", return_value=[5555]), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=_targets(5555)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
              patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=None), \
@@ -475,7 +487,7 @@ class TestManualBackendRespawn:
                 raise ProcessLookupError
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
-             patch.object(live, "_find_stale_dashboard_pids", return_value=[6001]), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=_targets(6001)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
              patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=argv), \
@@ -503,7 +515,7 @@ class TestManualBackendRespawn:
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
              patch.object(live, "_find_stale_dashboard_pids",
-                          return_value=[7001, 7002, 7003]), \
+                          return_value=_targets(7001, 7002, 7003)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
              patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=argv), \
@@ -530,7 +542,7 @@ class TestManualBackendRespawn:
                 raise ProcessLookupError
 
         with patch.object(main_dashboard, "_restart_managed_dashboard_service", return_value=False), \
-             patch.object(live, "_find_stale_dashboard_pids", return_value=[8001]), \
+             patch.object(live, "_find_stale_dashboard_pids", return_value=_targets(8001)), \
              patch.object(main_dashboard, "_get_pid_cgroup_path", return_value=None), \
              patch.object(main_dashboard, "_get_systemd_service_for_pid", return_value=None), \
              patch.object(main_dashboard, "_dashboard_cmdline_for_pid", return_value=argv), \

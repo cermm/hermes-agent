@@ -18,10 +18,12 @@ from hermes_cli.cli_output import line_input
 _PRE_BUILD_HINT = "  Pre-build first:  npm install --workspace web && npm run build -w web"
 
 
-def _find_stale_dashboard_pids(*, exclude_pids: set[int] | None = None) -> list[int]:
-    """Return PIDs of stale ``dashboard``/``serve`` processes for update cleanup."""
+def _find_stale_dashboard_pids(*, exclude_pids: set[int] | None = None,
+                               with_identity: bool = False) -> list:
+    """Return dashboard PIDs, or discovered ``(pid, argv, start)`` stop targets."""
     from hermes_cli.dashboard_procs import _scan_dashboard_processes
-    return [pid for pid, _cmd in _scan_dashboard_processes(exclude_pids=exclude_pids)]
+    rows = _scan_dashboard_processes(exclude_pids=exclude_pids, with_identity=with_identity)
+    return rows if with_identity else [pid for pid, _cmd in rows]
 
 
 def _parse_dashboard_runtime(command: str) -> tuple[str, str, int] | None:
