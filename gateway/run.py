@@ -4890,7 +4890,13 @@ def _start_gateway_configure_logging(verbosity: Optional[int]) -> None:
 
 def _start_gateway_make_shutdown_signal_handler(runner, _signal_initiated_shutdown: list):
     """Build the SIGINT/SIGTERM handler; ``_signal_initiated_shutdown[0]`` records an unplanned signal."""
+    shutdown_started = False
+
     def shutdown_signal_handler(received_signal=None):
+        nonlocal shutdown_started
+        if shutdown_started:
+            return
+        shutdown_started = True
         # Planned --replace takeover (sibling marked this PID): exit 0 so systemd won't revive us.
         def _takeover() -> bool:
             from gateway.status import consume_takeover_marker_for_self

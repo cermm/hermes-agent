@@ -1,10 +1,15 @@
 import asyncio
+import json
+import os
+import signal
 import subprocess
+import threading
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
 import gateway.run as gateway_run
+from gateway import status as status_mod
 from gateway.config import HomeChannel, Platform
 from gateway.platforms.base import MessageEvent
 from gateway.restart import DEFAULT_GATEWAY_POST_INTERRUPT_GRACE_TIMEOUT, GATEWAY_SERVICE_RESTART_EXIT_CODE
@@ -353,6 +358,128 @@ async def test_signal_initiated_shutdown_persists_running_not_stopped(tmp_path, 
     assert _persisted_states(runner)[-1] == "running", (
         f"final state must be 'running', got: {_persisted_states(runner)}"
     )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("first_callback", ["watcher", "sigterm"])
+async def test_planned_stop_callback_race_remains_stopped_and_exits_cleanly(
+    tmp_path, monkeypatch, first_callback
+):
+    """A second callback cannot turn an accepted operator stop into a crash."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, _adapter = make_restart_runner()
+    runner._exit_with_failure = False
+    signal_initiated = [False]
+    handler = gateway_run._start_gateway_make_shutdown_signal_handler(
+        runner, signal_initiated
+    )
+    assert status_mod.write_planned_stop_marker(os.getpid())
+
+    # Drive the real watcher through its marker probe; keep its loop callback
+    # queued so both orders are deterministic and no process signal is sent.
+    callback_loop = MagicMock()
+    gateway_run._run_planned_stop_watcher(
+        threading.Event(), runner, callback_loop, handler, poll_interval=0
+    )
+    callback_loop.call_soon_threadsafe.assert_called_once_with(handler, None)
+    queued_handler, queued_signal = callback_loop.call_soon_threadsafe.call_args.args
+    callbacks = [
+        lambda: queued_handler(queued_signal),
+        lambda: handler(signal.SIGTERM),
+    ]
+    if first_callback == "sigterm":
+        callbacks.reverse()
+
+    stop_calls = []
+    actual_stop = runner.stop
+
+    async def counted_stop():
+        stop_calls.append(True)
+        return await actual_stop()
+
+    monkeypatch.setattr(runner, "stop", counted_stop)
+    current_task = asyncio.current_task()
+    with patch("gateway.shutdown_forensics.snapshot_shutdown_context", return_value=None), \
+         patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"), \
+         patch.object(gateway_run, "_shutdown_mcp_servers_nonblocking", new_callable=AsyncMock):
+        for callback in callbacks:
+            callback()
+        shutdown_tasks = asyncio.all_tasks() - {current_task}
+        await asyncio.gather(*shutdown_tasks)
+        verdict = await gateway_run._start_gateway_shutdown_tail(
+            runner, None, threading.Event(), None, None, None,
+            threading.Event(), MagicMock(), signal_initiated,
+        )
+
+    assert verdict is True, "planned stop must select process exit 0"
+    assert _persisted_states(runner)[-1] == "stopped"
+    assert signal_initiated == [False]
+    assert runner._signal_initiated_shutdown is False
+    assert len(stop_calls) == 1, "shutdown must be scheduled once"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("marker_case", ["late_valid", "missing", "foreign", "stale"])
+async def test_unplanned_first_callback_keeps_failure_after_later_callback(
+    tmp_path, monkeypatch, marker_case
+):
+    """Only a live self-marker present at the first callback authorizes a clean stop."""
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    runner, adapter = make_restart_runner()
+    adapter.disconnect = AsyncMock()
+    runner._exit_with_failure = False
+    signal_initiated = [False]
+    handler = gateway_run._start_gateway_make_shutdown_signal_handler(
+        runner, signal_initiated
+    )
+
+    if marker_case in ("foreign", "stale"):
+        marker = status_mod._get_planned_stop_marker_path()
+        marker.write_text(json.dumps({
+            "target_pid": os.getpid() + (marker_case == "foreign"),
+            "target_start_time": (
+                -1 if marker_case == "foreign"
+                else status_mod._get_process_start_time(os.getpid())
+            ),
+            "stopper_pid": os.getpid(),
+            "written_at": (
+                status_mod._utc_now_iso() if marker_case == "foreign"
+                else "2000-01-01T00:00:00+00:00"
+            ),
+        }), encoding="utf-8")
+
+    stop_calls = []
+    actual_stop = runner.stop
+
+    async def counted_stop():
+        stop_calls.append(True)
+        return await actual_stop()
+
+    monkeypatch.setattr(runner, "stop", counted_stop)
+    first_signal = signal.SIGTERM if marker_case == "late_valid" else None
+    with patch("gateway.shutdown_forensics.snapshot_shutdown_context", return_value=None), \
+         patch("gateway.status.remove_pid_file"), \
+         patch("gateway.status.write_runtime_status"), \
+         patch.object(gateway_run, "_shutdown_mcp_servers_nonblocking", new_callable=AsyncMock):
+        handler(first_signal)
+        if marker_case == "late_valid":
+            assert status_mod.write_planned_stop_marker(os.getpid())
+        handler(None if marker_case == "late_valid" else signal.SIGTERM)
+        shutdown_tasks = asyncio.all_tasks() - {asyncio.current_task()}
+        await asyncio.gather(*shutdown_tasks)
+        verdict = await gateway_run._start_gateway_shutdown_tail(
+            runner, None, threading.Event(), None, None, None,
+            threading.Event(), MagicMock(), signal_initiated,
+        )
+
+    assert verdict is False
+    assert _persisted_states(runner)[-1] == "running"
+    assert signal_initiated == [True]
+    assert runner._signal_initiated_shutdown is True
+    assert len(stop_calls) == 1
 
 
 # ── #42126: zombie PID must be treated as dead in _pid_exists ────────────────
