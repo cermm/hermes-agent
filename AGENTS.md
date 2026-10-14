@@ -170,6 +170,23 @@ is "inside the Hermes desktop app". The pattern:
 Test: if the capability still makes sense with the client on another machine, it is
 session-scoped. Assert the GUI session gets the tool **with the env var absent**.
 
+## Agent skills
+
+### Issue tracker
+
+Campaign core-source work uses GitHub Issues in cermm/hermes-agent. Read
+`docs/agents/issue-tracker.md` before issue, spec, publication or review work.
+
+### Triage labels
+
+Use the existing category labels and configured state vocabulary in
+`docs/agents/triage-labels.md` when classifying incoming work.
+
+### Domain docs
+
+Retain this guide's area owners and the existing ADR/documentation layout. Read
+`docs/agents/domain.md` before domain exploration or interface design.
+
 ## Development Environment
 
 ```bash
