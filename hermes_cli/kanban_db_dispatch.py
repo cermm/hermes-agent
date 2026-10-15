@@ -15,6 +15,7 @@ import sqlite3
 import subprocess
 import sys
 import time
+from .kanban_db_effects import pending_dispatch_effect
 from dataclasses import dataclass
 from dataclasses import field
 from pathlib import Path
@@ -431,7 +432,7 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
     host_prefix = _kb._host_prefix()
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, "
+        "SELECT t.id, t.worker_pid, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at, "
         "       t.max_runtime_seconds, t.claim_lock "
         "FROM tasks t "
@@ -441,6 +442,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
         "  AND t.worker_pid IS NOT NULL"
     ).fetchall()
     for row in rows:
+        if pending_dispatch_effect(conn, row["id"], row["current_run_id"]):
+            continue
         lock = row["claim_lock"] or ""
         if not lock.startswith(host_prefix):
             continue
@@ -467,6 +470,8 @@ def enforce_max_runtime(conn: sqlite3.Connection, *, signal_fn=None) -> list[str
 
         error = f"elapsed {int(elapsed)}s > limit {limit}s"
         with _kb.write_txn(conn):
+            if pending_dispatch_effect(conn, tid, row["current_run_id"]):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -533,7 +538,7 @@ def detect_stale_running(
     reclaimed: list[str] = []
 
     rows = conn.execute(
-        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, "
+        "SELECT t.id, t.worker_pid, t.last_heartbeat_at, t.claim_lock, t.current_run_id, "
         "       COALESCE(r.started_at, t.started_at) AS active_started_at "
         "FROM tasks t "
         "LEFT JOIN task_runs r ON r.id = t.current_run_id "
@@ -541,6 +546,8 @@ def detect_stale_running(
     ).fetchall()
 
     for row in rows:
+        if pending_dispatch_effect(conn, row["id"], row["current_run_id"]):
+            continue
         if row["active_started_at"] is None:
             continue
         elapsed = now - int(row["active_started_at"])
@@ -568,6 +575,8 @@ def detect_stale_running(
             continue
 
         with _kb.write_txn(conn):
+            if pending_dispatch_effect(conn, tid, row["current_run_id"]):
+                continue
             retry_status = _kb._retry_status_for_run(conn, tid)
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -619,12 +628,14 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
     now = int(time.time())
     reconciled: list[str] = []
     rows = conn.execute(
-        "SELECT id, claim_lock, claim_expires, worker_pid FROM tasks "
+        "SELECT id, claim_lock, claim_expires, worker_pid, current_run_id FROM tasks "
         "WHERE status = 'running' "
         "  AND (claim_lock IS NULL OR claim_expires IS NULL)"
     ).fetchall()
     for row in rows:
         tid = row["id"]
+        if pending_dispatch_effect(conn, tid, row["current_run_id"]):
+            continue
         pid = row["worker_pid"]
         if pid and _kb._pid_alive(pid):
             # Never requeue beside a live process. Retry next tick.
@@ -634,6 +645,8 @@ def reconcile_orphaned_running(conn: sqlite3.Connection) -> list[str]:
             )
             continue
         with _kb.write_txn(conn):
+            if pending_dispatch_effect(conn, tid, row["current_run_id"]):
+                continue
             cur = conn.execute(
                 "UPDATE tasks SET status = 'ready', claim_lock = NULL, "
                 "claim_expires = NULL, worker_pid = NULL, "
@@ -811,12 +824,14 @@ def _reclaim_dead_workers(conn: sqlite3.Connection) -> _CrashSweep:
     sweep = _CrashSweep()
     with _kb.write_txn(conn):
         rows = conn.execute(
-            "SELECT id, worker_pid, claim_lock, started_at, assignee "
+            "SELECT id, worker_pid, claim_lock, started_at, assignee, current_run_id "
             "FROM tasks "
             "WHERE status = 'running' AND worker_pid IS NOT NULL"
         ).fetchall()
         host_prefix = _kb._host_prefix()
         for row in rows:
+            if pending_dispatch_effect(conn, row["id"], row["current_run_id"]):
+                continue
             lock = row["claim_lock"] or ""
             if not lock.startswith(host_prefix):
                 continue
@@ -1022,6 +1037,8 @@ def _record_task_failure(
         ).fetchone()
         if row is None or (expected_run_id is not None and row["current_run_id"] != expected_run_id):
             return False
+        if row["status"] == "running" and pending_dispatch_effect(conn, task_id, row["current_run_id"]):
+            return False
         retry_status = (
             _kb._retry_status_for_run(conn, task_id, row["current_run_id"])
             if release_claim
@@ -1102,13 +1119,21 @@ def _record_task_failure(
         return True
 
 
-def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, expected_run_id: Optional[int] = None) -> None:
+def _set_worker_pid(conn: sqlite3.Connection, task_id: str, pid: int, *, expected_run_id: Optional[int] = None,
+                    expected_claim_lock: Optional[str] = None) -> None:
     """Record the spawned child's pid + emit a ``spawned`` event carrying it."""
     with _kb.write_txn(conn):
-        run_id = _kb._current_run_id(conn, task_id)
-        if expected_run_id is not None and run_id != expected_run_id:
-            conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ? AND task_id = ?", (int(pid), expected_run_id, task_id))
-            return
+        row = conn.execute(
+            "SELECT t.current_run_id,t.claim_lock,t.status,r.status AS run_status,"
+            "r.claim_lock AS run_claim_lock FROM tasks t LEFT JOIN task_runs r "
+            "ON r.id=t.current_run_id AND r.task_id=t.id WHERE t.id=?", (task_id,),
+        ).fetchone()
+        run_id = row["current_run_id"] if row else None
+        if (expected_run_id is not None and (row is None or row["status"] != "running"
+                or run_id != expected_run_id or row["run_status"] != "running"
+                or (expected_claim_lock is not None and (row["claim_lock"] != expected_claim_lock
+                    or row["run_claim_lock"] != expected_claim_lock)))):
+            raise RuntimeError("spawn_pid_owner_changed")
         conn.execute("UPDATE tasks SET worker_pid = ? WHERE id = ?", (int(pid), task_id))
         if run_id is not None:
             conn.execute("UPDATE task_runs SET worker_pid = ? WHERE id = ?", (int(pid), run_id))
@@ -1132,6 +1157,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    skip_recent_success: bool = False,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1199,7 +1225,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
-    if recent_completed:
+    if recent_completed and not skip_recent_success:
         completed_at = int(recent_completed["ended_at"] or 0)
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
@@ -1442,6 +1468,7 @@ def dispatch_once(
     expected_task_event_id: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
     expected_assignee: Optional[str] = None,
+    recent_success_override=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1467,6 +1494,7 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
             task_id=task_id, lane=lane, expected_task_event_id=expected_task_event_id,
             expected_board_identity=expected_board_identity, expected_assignee=expected_assignee,
+            recent_success_override=recent_success_override,
         )
 
     try:
@@ -1527,6 +1555,7 @@ def _dispatch_lane_task(
     expected_assignee: Optional[str] = None,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    recent_success_override=None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1548,9 +1577,13 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    from .kanban_db_targeted import guarded_target_reason
+    guard_reason = guarded_target_reason(conn, task_id, lane, recent_success_override,
+                                         expected_task_event_id)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
+        if expected_task_event_id is not None:
+            result.no_spawn_reason = guard_reason
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
         # operator-configured fallback exists, persist the assignment and proceed. This removes the
@@ -1617,10 +1650,15 @@ def _dispatch_lane_task(
 
     try:
         if snapshot is not None:
+            from .kanban_db_effects import set_dispatch_phase
+            if not set_dispatch_phase(conn, claimed.id, claimed.current_run_id, claimed.claim_lock, "entering"):
+                from .kanban_db_targeted import TargetAdmissionHeld
+                raise TargetAdmissionHeld("spawn_journal_unavailable")
             from hermes_cli.kanban_db_targeted import spawn_targeted
             pid = spawn_targeted(conn, claimed, snapshot, str(workspace), board, lane,
                                  expected_board_identity, invoke_spawn, target_branch,
-                                 max_spawn=max_spawn, max_in_progress=max_in_progress, per_profile_cap=per_profile_cap)
+                                 max_spawn=max_spawn, max_in_progress=max_in_progress, per_profile_cap=per_profile_cap,
+                                 recent_success_override=recent_success_override, expected_event_id=expected_task_event_id)
         else:
             from hermes_cli.kanban_db_targeted import require_live_claim
             # Legacy callbacks may perform their own lifecycle transactions.
@@ -1635,9 +1673,13 @@ def _dispatch_lane_task(
                 claimed.branch_name = target_branch
             pid = invoke_spawn(claimed, str(workspace), board)
         if pid:
-            _set_worker_pid(conn, claimed.id, int(pid), expected_run_id=claimed.current_run_id)
+            _set_worker_pid(conn, claimed.id, int(pid), expected_run_id=claimed.current_run_id,
+                            expected_claim_lock=claimed.claim_lock)
         # Fires AFTER the PID (when reported) is durably persisted. Best-effort.
         _kb._fire_worker_spawned_hook(conn, claimed, str(workspace), pid, board=board)
+        if snapshot is not None and not set_dispatch_phase(conn, claimed.id, claimed.current_run_id,
+                claimed.claim_lock, "settled", prior="entering"):
+            raise RuntimeError("spawn_settlement_owner_changed")
         if snapshot is None:
             _kbw._maybe_emit_scratch_tip(conn, claimed.id, claimed.workspace_kind)
         # consecutive_failures is deliberately NOT reset here: resetting on
@@ -1651,10 +1693,17 @@ def _dispatch_lane_task(
         from hermes_cli.kanban_db_targeted import TargetAdmissionHeld
         if isinstance(exc, TargetAdmissionHeld) and not callback_entered:
             result.no_spawn_reason = str(exc)
+            if snapshot is not None:
+                set_dispatch_phase(conn, claimed.id, claimed.current_run_id,
+                                   claimed.claim_lock, "not_entered", prior="entering")
         else:
             # Both exact actions and board wakes may have started a worker
             # before the callback or post-spawn bookkeeping raised.
             result.effect_unknown = type(exc).__name__
+            from .kanban_db_effects import mark_dispatch_unknown
+            mark_dispatch_unknown(conn, claimed.id, claimed.current_run_id, claimed.claim_lock,
+                                  result.effect_unknown, prior="entering" if snapshot is not None else None)
+            return True
         if _kb.block_task(conn, claimed.id, kind="needs_input",
                           reason="protected: dispatch requires effect reconciliation",
                           expected_run_id=claimed.current_run_id):
@@ -1835,6 +1884,7 @@ def _dispatch_once_locked(
     expected_task_event_id: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
     expected_assignee: Optional[str] = None,
+    recent_success_override=None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -1903,6 +1953,7 @@ def _dispatch_once_locked(
         expected_task_event_id=expected_task_event_id,
         expected_board_identity=expected_board_identity, expected_assignee=expected_assignee,
         max_spawn=max_spawn, max_in_progress=max_in_progress,
+        recent_success_override=recent_success_override if targeted else None,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
