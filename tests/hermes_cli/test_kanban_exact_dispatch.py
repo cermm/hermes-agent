@@ -182,7 +182,9 @@ def test_spawn_callback_exception_is_once_and_requires_reconciliation(board, fai
         expected_assignee="qa", spawn_fn=started_then_failed)
     assert calls == [target]
     assert result.effect_unknown == failure.__name__
-    assert kb.get_task(board, target).status == "blocked"
+    held = kb.get_task(board, target)
+    assert held.status == "running"
+    assert held.claim_lock and held.current_run_id
     retry = dispatch.dispatch_once(board, spawn_fn=lambda *a: pytest.fail("ambiguous run retried"),
                                    reconcile_orphans=False)
     assert retry.spawned == []
@@ -239,15 +241,18 @@ def test_board_wake_unknown_effect_never_requeues_or_continues_tick(board, monke
     result = dispatch.dispatch_once(board, spawn_fn=started, max_spawn=2, reconcile_orphans=False)
     assert result.effect_unknown == "RuntimeError"
     assert calls == [target]
-    assert kb.get_task(board, target).status == "blocked"
-    assert kb.get_task(board, target).block_kind == "needs_input"
+    held = kb.get_task(board, target)
+    assert held.status == "running"
+    assert held.claim_lock and held.current_run_id
     assert kb.get_task(board, competitor).status == "ready"
     # Remove unrelated ready work from the fixture; the ambiguous target alone
     # must remain parked through the real legacy reclaim/promote pass.
     kb.block_task(board, competitor, kind="needs_input", reason="fixture hold")
     again = dispatch.dispatch_once(board, spawn_fn=lambda *a: pytest.fail("unknown effect retried"))
     assert again.spawned == []
-    assert kb.get_task(board, target).status == "blocked"
+    current = kb.get_task(board, target)
+    assert (current.status, current.current_run_id, current.claim_lock) == (
+        "running", held.current_run_id, held.claim_lock)
 
 
 @pytest.mark.parametrize("field", ["workspace_path", "branch_name"])
