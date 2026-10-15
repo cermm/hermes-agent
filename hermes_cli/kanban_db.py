@@ -2336,12 +2336,15 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
     host_prefix = _host_prefix()
     stale = conn.execute(
         "SELECT id, claim_lock, worker_pid, claim_expires, last_heartbeat_at, "
-        "       assignee "
+        "       assignee, current_run_id "
         "FROM tasks "
         "WHERE status = 'running' AND claim_expires IS NOT NULL "
         "  AND claim_expires < ?", (now,),
     ).fetchall()
     for row in stale:
+        from .kanban_db_effects import pending_dispatch_effect
+        if pending_dispatch_effect(conn, row["id"], row["current_run_id"]):
+            continue
         host_local = (row["claim_lock"] or "").startswith(host_prefix)
         hb = row["last_heartbeat_at"]
         # Backstop: a heartbeat older than the max-stale threshold means no
@@ -2362,6 +2365,8 @@ def release_stale_claims(conn: sqlite3.Connection, *, signal_fn=None) -> int:
             )
             continue
         with write_txn(conn):
+            if pending_dispatch_effect(conn, row["id"], row["current_run_id"]):
+                continue
             retry_status = _retry_status_for_run(conn, row["id"])
             cur = conn.execute(
                 "UPDATE tasks SET status = ?, claim_lock = NULL, "
@@ -2446,7 +2451,7 @@ def reclaim_task(
     """Operator reclaim regardless of TTL: release the claim, restore the source
     phase, reset the failure counter. False when not running."""
     row = conn.execute(
-        "SELECT status, claim_lock, worker_pid FROM tasks WHERE id = ?", (task_id,),
+        "SELECT status, claim_lock, worker_pid, current_run_id FROM tasks WHERE id = ?", (task_id,),
     ).fetchone()
     if not row:
         return False
@@ -2454,8 +2459,13 @@ def reclaim_task(
         # Nothing to reclaim — already ready / blocked / done.
         return False
     prev_lock = row["claim_lock"]
+    from .kanban_db_effects import pending_dispatch_effect
+    if pending_dispatch_effect(conn, task_id, row["current_run_id"]):
+        return False
     termination = _terminate_reclaimed_worker(row["worker_pid"], prev_lock, signal_fn=signal_fn)
     with write_txn(conn):
+        if pending_dispatch_effect(conn, task_id, row["current_run_id"]):
+            return False
         retry_status = _retry_status_for_run(conn, task_id)
         cur = conn.execute(
             "UPDATE tasks SET status = ?, claim_lock = NULL, "
