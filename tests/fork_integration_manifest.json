@@ -96,6 +96,7 @@
     "tests/hermes_cli/test_result_metadata_current_paths.py",
     "tests/hermes_cli/test_result_metadata_runtime_edges.py",
     "tests/hermes_cli/test_top_level_value_flags_parity.py",
+    "tests/hermes_cli/test_worker_finalization.py",
     "tests/hermes_cli/test_xai_oauth_profile_auth.py",
     "tests/plugins/platforms/photon/test_auth.py",
     "tests/plugins/platforms/photon/test_runtime_record.py",

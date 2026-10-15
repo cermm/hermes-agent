@@ -60,9 +60,9 @@ def _worker_scope_matches(conn, task_id, expected_run_id, expected_worker_pid):
     if (type(expected_worker_pid) is not int or expected_worker_pid <= 0
             or expected_run_id is None):
         return False
-    task = conn.execute("SELECT status,current_run_id,worker_pid FROM tasks WHERE id=?", (task_id,)).fetchone()
-    if (task is None or task["status"] != "running" or task["current_run_id"] != int(expected_run_id)
-            or task["worker_pid"] != expected_worker_pid):
+    # The run owns the finalization PID; the task's duplicate field may be unset.
+    task = conn.execute("SELECT status,current_run_id FROM tasks WHERE id=?", (task_id,)).fetchone()
+    if task is None or task["status"] != "running" or task["current_run_id"] != int(expected_run_id):
         return False
     run = conn.execute("SELECT worker_pid,status FROM task_runs WHERE id=? AND task_id=?",
                        (int(expected_run_id), task_id)).fetchone()
