@@ -22,7 +22,25 @@ def require_live_claim(conn, claimed):
         raise TargetAdmissionHeld("target_claim_expired")
 
 
-def spawn_targeted(conn, claimed, snapshot, workspace, board, lane, expected_identity, spawn_fn, branch_name=None, *, max_spawn=None, max_in_progress=None, per_profile_cap=None):
+def guarded_target_reason(conn, task_id, lane, recent_success_override, expected_event_id, claimed_run_id=None):
+    """Only a witnessed RETURN skips the success timer; later guards still run."""
+    from hermes_cli import kanban_db_dispatch as dispatch
+
+    reason = dispatch.check_respawn_guard(conn, task_id, lane=lane)
+    if (reason != "recent_success" or lane != "ready"
+            or recent_success_override is None or expected_event_id is None):
+        return reason
+    try:
+        allowed = recent_success_override(conn, task_id, expected_event_id=expected_event_id,
+                                          claimed_run_id=claimed_run_id)
+        if allowed is True:
+            return dispatch.check_respawn_guard(conn, task_id, lane=lane, skip_recent_success=True)
+    except Exception:
+        dispatch._kb._log.debug("kanban RETURN admission reader failed", exc_info=True)
+    return reason
+
+
+def spawn_targeted(conn, claimed, snapshot, workspace, board, lane, expected_identity, spawn_fn, branch_name=None, *, max_spawn=None, max_in_progress=None, per_profile_cap=None, recent_success_override=None, expected_event_id=None):
     from hermes_cli import kanban_db as kb
     from hermes_cli import kanban_db_dispatch as dispatch
 
@@ -56,7 +74,8 @@ def spawn_targeted(conn, claimed, snapshot, workspace, board, lane, expected_ide
                 raise TargetAdmissionHeld("profile_capacity_changed_after_claim")
         if dispatch._memory_pressure_level() == "critical":
             raise TargetAdmissionHeld("memory_pressure_after_claim")
-        reason = dispatch.check_respawn_guard(conn, claimed.id, lane=lane)
+        reason = guarded_target_reason(conn, claimed.id, lane, recent_success_override,
+                                       expected_event_id, claimed_run_id=claimed.current_run_id)
         if reason:
             raise TargetAdmissionHeld(reason)
         # A new comment or task mutation also invalidates the claimed packet.

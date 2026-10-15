@@ -2570,6 +2570,8 @@ def complete_task(
     fire_lifecycle_hook: bool = True,
     expected_worker_pid: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
+    expected_parent_handoffs: Optional[list[dict]] = None,
+    expected_task_intent: Optional[dict] = None,
 ) -> bool:
     """``running|ready|blocked|review -> done``; records ``result``.
 
@@ -2583,10 +2585,6 @@ def complete_task(
     """
     if expected_worker_pid is not None and (type(expected_worker_pid) is not int or expected_worker_pid <= 0 or expected_run_id is None):
         raise ValueError("worker finalization requires an exact run and positive worker PID")
-    if expected_board_identity is not None:
-        from hermes_cli.kanban_db_identity import board_identity
-        if board_identity(conn) != expected_board_identity:
-            return False
     now = int(time.time())
     # Cheap pre-check; re-checked inside the txn to close the parent-reopen race.
     if not _parents_satisfied(conn, task_id):
@@ -2597,7 +2595,10 @@ def complete_task(
     )
     handoff_summary = summary if summary is not None else result
     with write_txn(conn):
-        if expected_board_identity is not None and board_identity(conn) != expected_board_identity:
+        from .kanban_db_identity import terminal_scope_matches
+        if not terminal_scope_matches(conn, task_id, expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid, expected_board_identity=expected_board_identity,
+                expected_parent_handoffs=expected_parent_handoffs, expected_task_intent=expected_task_intent):
             return False
         # Hard invariant even for human review approval: a parent may have
         # reopened while this task waited.
@@ -2952,6 +2953,9 @@ def block_task(
     kind: Optional[str] = None, expected_run_id: Optional[int] = None,
     expected_worker_pid: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
+    metadata: Optional[dict] = None,
+    expected_parent_handoffs: Optional[list[dict]] = None,
+    expected_task_intent: Optional[dict] = None,
 ) -> bool:
     """``running``/``ready`` -> ``blocked`` (or ``todo`` / ``triage``, see
     :func:`_route_block`). ``transient`` still counts toward the loop breaker
@@ -2961,10 +2965,11 @@ def block_task(
     if kind is not None and kind not in VALID_BLOCK_KINDS:
         raise ValueError(f"block kind must be one of {sorted(VALID_BLOCK_KINDS)} or None")
     with write_txn(conn):
-        if expected_board_identity is not None:
-            from hermes_cli.kanban_db_identity import board_identity
-            if board_identity(conn) != expected_board_identity:
-                return False
+        from .kanban_db_identity import terminal_scope_matches
+        if not terminal_scope_matches(conn, task_id, expected_run_id=expected_run_id,
+                expected_worker_pid=expected_worker_pid, expected_board_identity=expected_board_identity,
+                expected_parent_handoffs=expected_parent_handoffs, expected_task_intent=expected_task_intent):
+            return False
         cur_row = conn.execute(
             "SELECT status, block_kind, block_recurrences FROM tasks WHERE id = ?", (task_id,),
         ).fetchone()
@@ -2995,7 +3000,8 @@ def block_task(
         if conn.execute(sql, params).rowcount != 1:
             return False
         run_id = _end_or_synthesize_run(
-            conn, task_id, outcome="blocked", status="blocked", summary=reason, synthesize=bool(reason),
+            conn, task_id, outcome="blocked", status="blocked", summary=reason,
+            metadata=metadata, synthesize=bool(reason),
         )
         _append_event(conn, task_id, event_kind, payload, run_id=run_id)
         blocked_task = get_task(conn, task_id)

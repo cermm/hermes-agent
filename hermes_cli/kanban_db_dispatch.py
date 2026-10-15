@@ -1132,6 +1132,7 @@ def _clear_failure_counter(conn: sqlite3.Connection, task_id: str) -> None:
 
 def check_respawn_guard(
     conn: sqlite3.Connection, task_id: str, *, lane: str = "ready",
+    skip_recent_success: bool = False,
 ) -> Optional[str]:
     """Return a guard reason if ``task_id`` should NOT be re-spawned, else None.
 
@@ -1199,7 +1200,7 @@ def check_respawn_guard(
         "ORDER BY ended_at DESC LIMIT 1",
         (task_id, cutoff),
     ).fetchone()
-    if recent_completed:
+    if recent_completed and not skip_recent_success:
         completed_at = int(recent_completed["ended_at"] or 0)
         requeued_after = conn.execute(
             "SELECT 1 FROM task_events "
@@ -1442,6 +1443,7 @@ def dispatch_once(
     expected_task_event_id: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
     expected_assignee: Optional[str] = None,
+    recent_success_override=None,
 ) -> DispatchResult:
     """Run one dispatcher tick under the board's single-writer lock.
 
@@ -1467,6 +1469,7 @@ def dispatch_once(
             reconcile_orphans=reconcile_orphans,
             task_id=task_id, lane=lane, expected_task_event_id=expected_task_event_id,
             expected_board_identity=expected_board_identity, expected_assignee=expected_assignee,
+            recent_success_override=recent_success_override,
         )
 
     try:
@@ -1527,6 +1530,7 @@ def _dispatch_lane_task(
     expected_assignee: Optional[str] = None,
     max_spawn: Optional[int] = None,
     max_in_progress: Optional[int] = None,
+    recent_success_override=None,
 ) -> bool:
     """Guard, claim, resolve the workspace and spawn one ready/review row.
     Returns True when a spawn slot was consumed (real or ``dry_run``); every
@@ -1548,7 +1552,9 @@ def _dispatch_lane_task(
         if current >= per_profile_cap:
             result.skipped_per_profile_capped.append((task_id, assignee, current))
             return False
-    guard_reason = check_respawn_guard(conn, task_id, lane=lane)
+    from .kanban_db_targeted import guarded_target_reason
+    guard_reason = guarded_target_reason(conn, task_id, lane, recent_success_override,
+                                         expected_task_event_id)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
@@ -1620,7 +1626,8 @@ def _dispatch_lane_task(
             from hermes_cli.kanban_db_targeted import spawn_targeted
             pid = spawn_targeted(conn, claimed, snapshot, str(workspace), board, lane,
                                  expected_board_identity, invoke_spawn, target_branch,
-                                 max_spawn=max_spawn, max_in_progress=max_in_progress, per_profile_cap=per_profile_cap)
+                                 max_spawn=max_spawn, max_in_progress=max_in_progress, per_profile_cap=per_profile_cap,
+                                 recent_success_override=recent_success_override, expected_event_id=expected_task_event_id)
         else:
             from hermes_cli.kanban_db_targeted import require_live_claim
             # Legacy callbacks may perform their own lifecycle transactions.
@@ -1835,6 +1842,7 @@ def _dispatch_once_locked(
     expected_task_event_id: Optional[int] = None,
     expected_board_identity: Optional[str] = None,
     expected_assignee: Optional[str] = None,
+    recent_success_override=None,
 ) -> DispatchResult:
     """One dispatcher tick: reclaim stale/crashed running tasks, promote
     todo -> ready, then atomically claim each spawnable ready/review row and
@@ -1903,6 +1911,7 @@ def _dispatch_once_locked(
         expected_task_event_id=expected_task_event_id,
         expected_board_identity=expected_board_identity, expected_assignee=expected_assignee,
         max_spawn=max_spawn, max_in_progress=max_in_progress,
+        recent_success_override=recent_success_override if targeted else None,
     )
     default_assignee = _resolve_default_assignee(default_assignee)
     spawned = 0
