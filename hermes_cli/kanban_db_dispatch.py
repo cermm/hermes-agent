@@ -1582,6 +1582,8 @@ def _dispatch_lane_task(
                                          expected_task_event_id)
     if guard_reason is not None:
         result.respawn_guarded.append((task_id, guard_reason))
+        if expected_task_event_id is not None:
+            result.no_spawn_reason = guard_reason
         # Event so ``hermes kanban tail`` shows why the task looks stuck.
         # Honour kanban.default_assignee: when the dispatcher hits an unassigned ready task and an
         # operator-configured fallback exists, persist the assignment and proceed. This removes the
