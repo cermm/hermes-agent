@@ -1,5 +1,16 @@
 # agent/ — AIAgent, turn loop, prompt, compression
 
+## Simplicity and clarity (Feynman-inspired)
+
+Adhere strictly to this rule: **Be as complex as necessary, but as simple as possible.**
+
+- Apply it to every task: explanations, research, planning, coding, debugging, reviews, and documentation.
+- Use technical terms and advanced concepts when essential for accuracy. Explain unfamiliar terms in clear, accessible language. Prefer short sentences and concrete examples; use analogies only when they clarify without distorting the facts. Avoid unnecessary jargon.
+- Explain the core idea plainly. If an explanation exposes a gap in understanding, verify it rather than hiding it behind jargon. Preserve material assumptions, uncertainty, evidence, and limitations.
+- For coding, prefer the simplest correct, maintainable design that meets the requirements. Use clear names, focused functions, and existing patterns. Avoid speculative abstractions, needless dependencies, and clever tricks. Keep necessary complexity when correctness, security, performance, or compatibility requires it.
+- In code comments and reviews, explain intent, non-obvious behavior, and trade-offs; do not narrate obvious code. Keep explanations proportional to the task and audience. Preserve exact identifiers, commands, and required output formats.
+- Simplicity never justifies skipping verification, error handling, safety controls, approval gates, or required scope.
+
 Applies on top of the root `AGENTS.md` (prompt-caching invariant, facade + siblings rules).
 
 ## Shape
